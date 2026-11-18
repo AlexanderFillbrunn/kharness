@@ -3,344 +3,277 @@ Async tasks
 
 Status
 --------------------
-A proposal, not a specification, and the starting point for the
-implementation work. [PROJECTION.md](PROJECTION.md) and
-[ENCODING.md](ENCODING.md) describe what the code does today; nothing here is
-binding until it is folded into those two. The code follows neither this
-document nor [COMPACTION.md](COMPACTION.md) yet.
+A specification for implementation, not only a proposal. Current state
+below is the code as it stands; desired state, requirements, acceptance
+criteria and tasks define the change to make.
+[PROJECTION.md](PROJECTION.md) and [ENCODING.md](ENCODING.md) stay binding
+for what the code does today; this document amends them where it says so.
+The interaction with [COMPACTION.md](COMPACTION.md) is noted where it
+matters. No code follows this document yet.
 
-It concerns one decision: whether an async task is owned by an arc or is an
-object of the session. Today it is the first. This document specifies the
-second.
-
-The shape today
+Decision
 --------------------
-A task is invoked inside an arc and belongs to it. The arc stays open for as
-long as the task runs, because the agent records `KX` only once nothing under
-the arc is still running, and a cancel on the arc is what stops the task.
-Disclosure of in-flight work is derived from the arc's status, and a task
-that asks for input is disclosed as a note inside the arc that started it.
+One decision: an async task belongs to the arc that started it (today) or
+is an object of the session (this spec). This spec chooses the second.
 
-Two problems follow from that shape.
-
-A task asks for input, the agent puts the question to the user, and the user
-answers. The answer is a new user message, so it opens an arc of its own.
-The projection's cutoff gives an arc everything up to its own opening plus
-everything correlated to it, so the answer is never visible to the arc that
-asked:
-
-    U1, R1.1, A1.1, AQ1.1.1, R1.2, U2, R2.1, T2.1.1, AP1.1.2, K2x, AR1.1
-
-`R1.2` asks the question. `U2` answers it. `U2` is not in arc 1's projection
-at any cutoff, so arc 1 learns what the user said only from the note
-`n{task auditor was given input: …}`.
-
-Second, an arc held open by a running task is an arc the compaction
-watermark cannot pass, so one background task blocks compaction of the whole
-session for as long as it runs, while the task's own events accumulate in
-the model's transcript. See [COMPACTION.md](COMPACTION.md), Async tasks.
-
-The design
+Current state
 --------------------
-An arc closes when the agent has nothing synchronous left to do. A response
-with no tool calls closes the arc; a running task does not hold it open. When
-the task next speaks, what happens is decided by the event's declared
-visibility, specified below.
+- An arc is opened only by `USER_MESSAGE`: `applyUserMessage`
+  (pkg/history/history.go). The store's cutoff, `GetEventsForArc`
+  (devchat/filestore/store.go), finds an arc by scanning for a
+  `USER_MESSAGE` with the arc's correlation ID.
+- A task is nested in its origin arc: `Arc.AsyncTasks`, keyed by the invoke
+  event's ID, with `AsyncTask.CorrelationID` naming the origin arc. Every
+  task event carries the task ID in its payload as `CausationID`, and the
+  event itself is correlated to the arc (`reportEvent`,
+  pkg/agent/reports.go).
+- A running task holds its arc open: `deriveArcState` (pkg/agent/agent.go)
+  refuses to close while any task has `FinishedSeq == nil`, and takes an
+  LLM turn on `unreportedTaskNews`; `closeArc` then writes `ARC_CLOSED`
+  (`KX`) naming the last response.
+- The ingress re-works the origin arc: `TaskReports.Report` validates
+  `holdsTask` (the named arc owns the task), persists the event correlated
+  to that arc, then calls `ArcWorker.Work` on it. When the lease is held
+  it returns false, and devchat queues the turn itself: `taskOwedMsg`,
+  `m.owed`, `settleOwed` (devchat/tui.go), fed by the `deferred` callback in
+  devchat/tasks.go.
+- An ask is answered from outside the asking arc:
+  `ASYNC_TASK_INPUT_REQUESTED` parks the task (`WAITING`); the human's
+  answer is a new user message, which opens a new arc. The cutoff gives an
+  arc everything up to its own opening plus what correlates to it, so the
+  answer is never in the asking arc's transcript; only the
+  `[task … was given input: …]` note reaches it (mode `async_input`).
+- Projection: fixed rule 4 of PROJECTION.md — a task is always two notes,
+  at invocation and completion. Notifications and input asks are governed
+  by the modes `async_events` / `async_input` (note | elide) in
+  `projectAsyncTasks` (pkg/history/projection.go).
+- Cancel is arc-scoped only: `applyCancel` settles pending calls and
+  interrupts, and for tasks only records `TerminatedWork` — the task itself
+  is not settled. The guard refuses writes that start work on a cancelled
+  arc: `startsWork` covers `TOOL_DISPATCHED` and `ASYNC_TASK_INVOKE`
+  (pkg/agent/cancellation.go).
+- Actor: `events.Event.Actor` exists and `UserMessagePayload` duplicates it
+  into the payload; `AsyncTaskInvokePayload` carries no actor. Reaching a
+  running task needs its origin arc: `TaskRef{ArcRef, ID, Name}`.
+- Rendering: `RenderChat` (pkg/history/chat.go) and devchat's transcript
+  draw each arc as a user bubble plus replies; `Arc.Content` is the user's
+  words.
 
-    U1, R1.1, A1.1, K1x, AQ1.1.1, R2.1, K2x, U3, R3.1, T3.1.1, AP1.1.2,
-    K3x, AR1.1, R4.1, K4x
-
-`AQ1.1.1` and `AR1.1` are the openings of arc 2 and arc 4. Arc 2 asks the
-user the task's question and closes. Arc 3 is the user's answer, handed to
-the task. Arc 4 reports what came of it, and its cutoff includes `U3`, so the
-model reads the user's own words.
-
-An arc is one unit of agent work, and what opens one is a kind rather than
-always a user message.
-
-*A task is an object of the session.* The invocation is recorded inside the
-arc that ran the tool call, as today. Every event the task emits afterwards
-names the task by an ID in its payload, and the fold keeps a table of tasks
-at the level of the session, keyed by task ID, holding status, events, the
-actor that started the task and the arc that invoked it. A report is
-validated by whether the task exists in the session, not by whether an arc
-holds it.
-
-*Where each record lives.* Correlation names the arc or the stream a record
-belongs to, by one rule: an event that opens an arc correlates to the arc it
-opens and is that arc's opening record, carrying its own content, exactly as
-a user message does; everything else a task says correlates to the task.
-There is no separate arc-opening record. The actor rides the event's own
-`Actor` field, and the task ID is in the payload, so the opening event needs
-no pointer to its content and no record of who triggered it.
-
-Visibility
+Desired state
 --------------------
-What a task event does is not the dispatcher's decision and not a projection
-setting. Each kind of task declares, where it is registered, what each of its
-event classes does, and the declaration is expressed by the event's
-correlation, as above. There are two values.
+- D1  An arc closes when the agent has nothing synchronous left to do. A
+  response with no tool calls closes the arc; a running task does not hold
+  it open.
+- D2  A task is an object of the session. The invoke is recorded inside the
+  invoking arc, as today. Every later task event names the task by ID in
+  its payload, and the fold keeps a session-level task table keyed by task
+  ID: status, events, actor, origin arc. A report names the session and the
+  task ID; the origin arc is read from the task table. A report is
+  validated by whether the task exists in the session, not by whether an
+  arc holds it.
+- D3  Correlation is the visibility. An event that opens an arc correlates
+  to the arc it opens and is that arc's opening record, carrying its own
+  content and actor, exactly as a user message does; every other task event
+  correlates to the task. There is no separate arc-opening record, no
+  visibility field and no new event type. Placement in a transcript is
+  decided from correlation and sequence number, as for every record.
+- D4  What each event class does is declared in the registry where the task
+  kind is registered, keyed by the three classes a report carries —
+  notification, ask, result — as: opens an arc, or silent. A silent event
+  is invisible to the model in every projection; it is in the log for the
+  frontend and for replay. The declaration is resolved once, on the write
+  path; a report naming an unregistered kind is refused, not defaulted.
+- D5  The controller coalesces what its task emits into at most one report
+  per group window for the arc-opening classes. The window is declared per
+  task kind and handed over at registration. Coalescing happens before the
+  log; nothing about it is recorded. Silent events flow as they are.
+- D6  The actor is copied forward. The invoke records the actor that started
+  the task; every event the task emits carries the same one, so every arc
+  one of them opens inherits it. The actor is not the correlation ID and
+  not a live grant of authority: it records who started the work.
+- D7  An ask may be relayed to a person or answered by the model in the arc
+  the ask opened, through the input tool, under the invocation's actor; the
+  answer is written correlated to the ask's arc, so the cutoff includes it.
+  Whether an ask is user-facing or agent-answerable is declared with the
+  task kind, and an ask may override. A loop budget bounds agent-answered
+  asks: after a fixed number of consecutive ones without a human turn, the
+  next ask is relayed or the task is settled.
+- D8  Cancellation gains a second axis addressed to the task. A cancel naming
+  a task ID reaches the runner through the controller and settles the task
+  in the log, with who cancelled it and when. The guard follows the same
+  axis: a write whose causation reaches a cancelled task is refused. The
+  arc-scoped cancel and guard are unchanged. "Cancel every task this arc
+  started" is a loop over the task table in the harness, not a mechanism;
+  there is no batch-cancel event.
+- D9  A task-triggered arc has no user words. `Arc.Content` is the ask's
+  message for an ask-opened arc, and the task's name (and result summary)
+  for a result-opened arc. Where the task kind declares it, the
+  result-opened arc carries the task's events as a field of its own,
+  rendered from the task table. Silent events are the frontend's alone.
+- D10 A running task does not pin the compaction watermark; a report is
+  written when it arrives and its run is deferred like any other run. See
+  [COMPACTION.md](COMPACTION.md), sections Async tasks, Compaction and the
+  fold, and Where a run waits.
 
-*It opens an arc.* The event correlates to the arc it opens and the arc is
-worked. This is the value an ask and a result normally carry.
-
-*It is silent.* The event correlates to the task. It is invisible to the
-model in every projection; it is in the log for the frontend and for replay,
-and the model can read it only through a tool that returns a task's events.
-
-The visibility is the correlation and not a payload field, for a concrete
-reason: placing an event in a transcript is decided from correlation and
-sequence number for every record the projection handles, and a visibility in
-the payload would make it a per-event payload decode. The declaration is
-resolved once, on the write path, and the log records its outcome.
-
-The classes are the three a report already carries — notification, ask,
-result — and the declaration is keyed by them. The invoke and the provided
-input are not classes: the agent wrote both, so there is nothing to declare.
-A task kind that needs finer classes extends the report with a class name the
-registry can declare for; that is a naming change, not a new mechanism.
-
-*The result may carry the trail.* A task kind declares, beside its event
-visibilities, whether its result opens its arc carrying the events that led
-to it, rendered in that arc's transcript as a field of its own beside the
-result. The events stay silent; the projection gathers them from the fold's
-task table when the result is rendered, so nothing about the carrying is
-recorded and a different declaration at replay time changes nothing logged.
-
-Coalescing
+Requirements
 --------------------
-A task that reports often must not cause a run per report. The controller
-batches what its task emits and calls in at most one report per group window
-for the classes that would open an arc. The window is declared in the
-registry, per task kind, and handed to the controller at registration. What
-the coalesced report says is the runner's decision — the latest notification,
-or a summary of the ones it stands for. Events that are silent flow as they
-are: they cost the model nothing and the frontend wants their resolution.
+Events — pkg/events
+- R1  `AsyncTaskInvokePayload` gains `Actor users.Actor`. Task event
+  payloads keep naming the task: the `CausationID` field already holds the
+  invoke event's ID, which is the task ID. No event gains a visibility
+  field; no new event types; the codec gains nothing.
+- R2  `CancelPayload` gains an optional task ID. Set, the cancel is
+  task-addressed; unset, arc-addressed exactly as today.
 
-Coalescing happens before the log. Nothing about the window or the grouping
-is recorded, because nothing of it reaches the log.
+Fold — pkg/history
+- R3  `History` gains a session-level task table: every task in the session,
+  keyed by task ID, in log order. `FoldStateFromHistory` rebuilds it. The
+  task record keeps status, events, actor and origin arc
+  (`AsyncTask.CorrelationID`).
+- R4  Arc opening becomes a kind: `applyUserMessage` and an opening task
+  event are its two instances; both mint an arc with ID, seq, content and
+  actor taken from the event.
+- R5  Task events validate against the session task table: a report naming
+  an unknown task ID is rejected by the fold.
+- R6  Correlation routes the fold: an arc-correlated event attaches to that
+  arc; a task-correlated event attaches to the task's transcript.
+- R7  The read model for a run includes the session's task-correlated
+  events, so the fold builds the task table; they enter no arc's
+  transcript. Implementation choice: load the whole log, or extend the arc
+  query with task-correlated events.
 
-How a report becomes a turn
+Store — EventSource, devchat/filestore
+- R8  `GetEventsForArc` finds an arc by its opening event of any
+  arc-opening kind, not only `USER_MESSAGE`. The cutoff rule is unchanged:
+  everything up to and including the opening event, plus everything
+  correlated to the arc.
+
+Registry — pkg/agent/tasks.go
+- R9  `TaskDefinition` gains: the visibility declaration per event class
+  (opens | silent); the ask answerability (user-facing | agent-answerable);
+  whether the result carries the task's event trail; the coalescing group
+  window.
+
+Ingress — pkg/agent/reports.go
+- R10 `TaskReports.Report` resolves the event's visibility from the
+  registry on the write path: an opening event gets a fresh arc ID as its
+  correlation, a silent event correlates to the task. The event carries
+  content, task ID and actor; that is the whole write.
+- R11 After an opening event is persisted, the new arc becomes a work item
+  in the same queue user arcs are served from; the origin arc is not
+  re-worked, and the caller does not retry when the arc's lease is held.
+- R12 Coalescing lives in the controller: at most one report per group
+  window per task for the arc-opening classes, using the window declared
+  at registration. Silent events are written as they arrive.
+
+Agent loop — pkg/agent/agent.go
+- R13 `deriveArcState` closes the arc when the last response requested no
+  tool calls, whatever tasks are unfinished. `unreportedTaskNews` and the
+  finished-sequence wait go. `closeArc` is unchanged.
+- R14 The loop budget for agent-answered asks lives with the dispatcher,
+  configurable on `AgentConfig` with a default; past the budget the next
+  ask is relayed or the task settled (D7).
+
+Guard and cancel — pkg/agent/cancellation.go, pkg/history
+- R15 A task-addressed cancel is folded by `applyCancel`: the task is
+  validated against the session table and settled (`CANCELLED`, actor,
+  seq), and the runner is reached through `TaskController.Cancel`.
+- R16 `GuardCancellation` refuses a write whose causation reaches a
+  cancelled task (a report or invocation naming it), in addition to the
+  arc-scoped `startsWork` check, which stays.
+
+Projection — pkg/history/projection.go, docs/PROJECTION.md
+- R17 Placement is decided from correlation and seq for every record. A
+  task-correlated event appears in no arc's transcript under any modes;
+  the `async_events` and `async_input` modes go. PROJECTION.md's fixed
+  rule 4 is amended: the invocation note stays in the origin arc; the
+  completion is an arc of its own.
+- R18 `foreign_arc` notes quote `Arc.Content`, which is set for
+  task-opened arcs as D9 says.
+- R19 Where a task kind declares the trail, the result-opened arc's
+  transcript carries the task's events as a field of the result, gathered
+  from the task table at render time.
+
+Rendering — pkg/history/chat.go, devchat
+- R20 `RenderChat` and devchat's transcript draw a session as a sequence of
+  arcs; a task-triggered arc renders its `Content` as its opening bubble.
+  Silent events render in the frontend only.
+
+Harness — devchat
+- R21 The owed-turn mechanism is deleted: `taskOwedMsg`, `m.owed`,
+  `settleOwed`, and the `deferred` callback. `taskUnfiledMsg` stays.
+- R22 `/cancel` keeps stopping the run. A command naming a task ID cancels
+  that task through the task axis. A status line or task list is built from
+  the fold's task table. `SettleAbandonedTasks` on start-up is unchanged.
+- R23 `localTasks` keeps start, cancel and input, minus the deferred-turn
+  callback.
+
+Acceptance criteria
 --------------------
-The path from a runner calling in to an arc being worked:
+- AC1  Fold: a log with an invoke in arc A and a later notification
+  correlates the notification to the task, not to arc A; replay succeeds;
+  the session task table holds the task with its events and origin arc.
+- AC2  Opening report after arc A closed: `TaskReports.Report` persists the
+  event with a fresh arc ID as correlation, the fold mints the arc, and the
+  new arc goes to the worker as a work item. The owed list is not involved.
+- AC3  An arc whose last response requested no tool calls is closed (`KX`
+  written, status `DONE`) while a task it started is still running.
+- AC4  An agent-answerable ask opens an arc; `provide_task_input` in that
+  arc executes under the invoke's actor, and the answer is in the ask arc's
+  own transcript at any cutoff.
+- AC5  Past the configured budget of consecutive agent-answered asks, the
+  next ask is relayed (user-facing) or the task is settled.
+- AC6  A cancel naming a task ID settles the task in the log with actor and
+  seq, reaches `TaskController.Cancel`, and a late report naming that task
+  is refused.
+- AC7  A silent task event appears in no arc's `ModelTranscript` under any
+  modes; `Modes` has no `async_events` / `async_input`; a `foreign_arc`
+  note for a task-opened arc quotes its `Content`.
+- AC8  `GetEventsForArc` on a task-opened arc returns its opening event and
+  everything correlated to it; replay folds the arc and `RenderChat` shows
+  it.
+- AC9  A task kind with an arc-opening notification class emits one report
+  per group window: three events inside one window produce one log record;
+  silent-class events are each logged.
+- AC10 devchat: no `taskOwedMsg` path remains; a report arriving while the
+  origin arc is being worked opens a new arc served by the worker; an
+  unwritable report still shows `taskUnfiledMsg`.
+- AC11 With compaction (COMPACTION.md): a running task does not hold the
+  watermark, and a task whose invoke is below the watermark is still in the
+  task table, its invocation note synthesized from the table.
 
-*The write path is one event.* The inbound half resolves the event's
-visibility from the registry: the task's kind is read from the task record,
-the declaration for that class decides the correlation, and a report naming a
-kind that is not registered is refused rather than defaulted, since a silent
-default would hide a configuration fault. An event that opens an arc
-correlates to a freshly minted arc ID; a silent event correlates to the task.
-The event carries the content, the task ID and the actor, and it is the whole
-write. There is no second record and no gap to recover: an event is in the
-log with its arc, or not in the log at all.
-
-*The fold mints deterministically.* An opening task event mints its arc the
-way `applyUserMessage` mints one. `applyUserMessage` and an opening task
-event are the two instances of "the event that opens an arc", and
-`Store.GetEventsForArc`, which finds an arc by scanning for a `USER_MESSAGE`
-with the correlation ID, needs the same generalisation. Two events arriving
-together mint two arcs, which is correct: the controller's coalescing is what
-keeps a talkative task from sending them together, and the log records what
-was sent.
-
-*The dispatcher only schedules.* Once the event is written, the arc it opened
-is a work item like any other. When the run starts is not recorded in the
-log; a run deferred for a compaction window defers the run, never the
-event, by the same rule as a user message's. See
-[COMPACTION.md](COMPACTION.md), Where a run waits.
-
-Ownership
+Tasks
 --------------------
-A task-triggered arc has no human in it, and the agent cannot run without
-knowing whose it is. Four things need the owner: who may cancel the task,
-which tenant's data the run may read, who an ask is put to, and who the work
-is attributed to when rendered.
-
-The owner is not derived by walking a chain from the arc through the task to
-the invocation. Ownership is read on the write path, and a walk has
-unbounded length: a task started by an agent turn in a task-triggered arc is
-one more link, with no limit on composition.
-
-Instead the actor is copied forward. The invocation records the actor it was
-started by, and every event the task emits carries the same one, so every arc
-one of them opens inherits it. A chain of any length costs one field.
-`events.Event` already carries `Actor`, and `UserMessagePayload` already
-duplicates it into the payload.
-
-Two things this actor is not. It is not the correlation ID: correlation names
-the stream a record belongs to, and the link to the origin is the task ID in
-the payload. And it is not a live grant of authority: it records who started
-the work, a fact that never changes. Whether a task may still act on that
-person's behalf an hour after they logged out is a policy question the log
-does not answer.
-
-Asks: relayed or answered
---------------------
-An ask is not necessarily put to a person. A task asking for input may be
-answered by the model alone: the arc opened by the ask runs, the model reads
-the question with the task's context in its cutoff, and answers through the
-input tool without a person involved. The ask/answer loop that the cutoff
-makes impossible today — the answer living in an arc the asking arc cannot
-see — closes inside one arc.
-
-*Who may answer is declared.* An ask is either user-facing or
-agent-answerable, declared where the task is registered or on the ask itself.
-A user-facing ask must be relayed; an agent-answerable one may be answered in
-place. Answering through the input tool executes under the actor copied
-forward from the invocation, so the model answers as the person who started
-the work. The log records the actor and that an agent turn answered, so an
-audit can distinguish the user's words from the agent's.
-
-*A loop budget.* A task that asks, is answered by the model, and asks again
-is a loop with no human in it, running on authority granted for something
-else. A budget bounds it: after a fixed number of consecutive agent-answered
-asks without a human turn, the next ask is relayed rather than answered, or
-the task is settled. This failure mode does not exist in the current design,
-because there the answer had to come from outside.
-
-Cancellation
---------------------
-Cancel is arc-scoped today, and cancelling a task means cancelling the arc
-that owns it. With the origin arc closed as soon as the task starts, that
-cancel stops nothing (`TerminatedWork: false`) and the task runs on.
-
-Cancellation therefore gains a second axis, addressed to the task. A cancel
-naming a task ID reaches the runner through the controller and settles the
-task in the log with who cancelled it and when. The guard follows the same
-axis: a write whose causation reaches a cancelled task is refused, so a late
-report does not open an arc for work the user stopped. The arc-scoped guard
-keeps its job for synchronous work. Two axes, each named in the log.
-
-*Compositions are not the agent's to build.* "Cancel every task this arc
-started" is a loop, not a mechanism: read the session's task table, keep the
-tasks whose origin arc is the one named and that are not settled, and cancel
-each by ID. The task record carries its origin arc for this. The loop lives
-in the harness that owns the process, which is also where the person is shown
-what will be stopped and asked first. A task that finishes between the read
-and the cancel is skipped; the controller already returns "cannot find task",
-and the loop takes that as success. Cancelling a whole causation chain —
-everything a request led to, not only what it started — is a walk and is not
-built until the direct form proves too narrow. There is no batch-cancel
-event, because N task cancels record everything it would.
-
-What it costs
---------------------
-*The dispatcher owns scheduling, visibly.* A result arriving while the user
-is mid-conversation opens a second arc for the same person, and whether to
-queue or interleave is a policy the log does not supply.
-
-*`Arc.Content` loses its assumption.* `RenderChat` draws an arc as a user
-bubble followed by replies, and `foreign_arc: note` quotes an arc's content to
-say what the other request was about. A task-triggered arc has no user words.
-The ask's message is the candidate for an arc opened by an ask; an arc opened
-by a result has the task's name and nothing else.
-
-*Delivery guarantees move into the runner.* `TaskController.ProvideInput`
-refuses a second answer to one request, backed by the `WAITING` state in the
-log, and `holdsTask` refuses a report naming an arc that does not own the
-task. With tasks validated by existence in the session and asks answerable by
-the model, duplicate answers are two records in a task's stream rather than a
-refusal, and only the runner can tell them apart.
-
-*Compaction.* A compaction may summarise the origin arc — the invocation
-included — while the task still runs. The reference stays resolvable
-because the fold reads the whole log, and the invocation note is
-synthesised from the task table; see
-[COMPACTION.md](COMPACTION.md), Compaction and the fold.
-
-What would have to change
---------------------
-*The events.* `ASYNC_TASK_INVOKE` gains the actor. `ASYNC_TASK_EVENT`,
-`ASYNC_TASK_INPUT_REQUESTED`, `ASYNC_TASK_RESULT` gain the task ID in their
-payloads and carry the actor. No event gains a visibility field: the
-correlation is the visibility. An event that opens an arc correlates to the
-arc it opens; otherwise it correlates to the task. No new event type.
-
-*The fold.* Arc opening becomes a kind, with an opening task event the
-second instance of it. The task table moves from the arc to the session,
-keyed by the task ID the events carry. `Store.GetEventsForArc` finds an arc
-by scanning for a `USER_MESSAGE` with the correlation ID and needs the same
-generalisation.
-
-*The registry.* `TaskDefinition` gains, per event class, the visibility
-declaration — opens or silent — the flag saying whether an ask is
-user-facing or agent-answerable, the flag saying whether the result carries
-the task's events as a field of its own, and the group window the controller
-waits before calling in with a report.
-
-*The agent.* The hold-open rule goes, with `unreportedTaskNews` and the
-settling-sequence comparison. `TaskReports` gains the write-path visibility
-resolution and the minting of the arc ID where the event opens one. The
-controller gains the coalescing. The dispatcher keeps the queue, and the
-loop budget for agent-answered asks joins it. The projection gains the
-result's events field, rendered from the task table where the task kind
-declares it.
-
-*The guard.* `startsWork` covers a dispatch and a task invocation today; it
-gains the causation walk that refuses work reaching a cancelled task.
-
-*PROJECTION.md.* "A running task holds its arc open" goes. Fixed rule 4,
-that a task is always two notes, needs one amendment: the invocation note may
-be synthesised from the task table when the invocation has been summarised,
-and the completion is an arc of its own for the arc that reacts to it.
-
-*Rendering.* `RenderChat` and devchat's transcript draw a session as a
-sequence of arcs; a task-triggered arc needs a bubble that is not the user's
-words.
-
-The development harness
---------------------
-devchat is where the change is felt first, and mostly as removal.
-
-*`/cancel` keeps its job and gains a neighbour.* It stops the run in
-progress, which is synchronous work, and needs nothing new. A command that
-names a running task by ID cancels that task through the second axis, and for
-a person to name a task they have to see the tasks: the fold's task table is
-what a status line or a task list is built from, and "running", "waiting for
-input" and "finished" are already fields on it. Cancelling every task an arc
-started is the loop from Cancellation, and it lives here too.
-
-*The owed list goes.* A report that could not get its arc a turn is the
-hand-written scheduling devchat carries today: `taskOwedMsg`, the list of
-arcs owed a run, and the retry when the holder lets go. Under this proposal
-a report opens an arc and the worker queue serves it, so the TUI no longer
-decides when a task's news is worked on and the mechanism is deleted.
-`taskUnfiledMsg` stays; a report that could not be written at all is still
-worth showing.
-
-*The transcript gains a second kind of bubble.* A task-triggered arc is drawn
-with the ask's question or the task's name and result where a user arc is
-drawn with the user's words. Silent events are the frontend's alone: the
-progress display is built from them rather than from anything the model was
-shown.
-
-*The runner barely moves.* `localTasks` starts, cancels and takes input as it
-does today, minus the deferred-turn callback, and `SettleAbandonedTasks` on
-start-up keeps its job. A fast task that finishes, opens an arc, and starts
-another task makes the transcript busy; the coalescing that protects the
-model from a batch of events wants a matching rendering that shows the batch
-as one block.
+- T1  Events and payloads: R1, R2. pkg/events. Depends: none.
+- T2  Fold: session task table, arc-opening kind, correlation routing,
+  validation: R3–R7. pkg/history. Depends: T1.
+- T3  Store cutoff generalization: R8. devchat/filestore, pkg/agent
+  (EventSource doc). Depends: T2.
+- T4  Registry declarations: R9. pkg/agent/tasks.go. Depends: none.
+- T5  Ingress write path and work handover: R10, R11. pkg/agent/reports.go.
+  Depends: T2, T4.
+- T6  Coalescing in the controller: R12. pkg/agent plus the harness
+  controller. Depends: T4.
+- T7  Agent loop close rule: R13. pkg/agent/agent.go. Depends: T2.
+- T8  In-arc asks and the loop budget: D7, R14. pkg/agent. Depends: T5, T7.
+- T9  Cancellation task axis: R15, R16, and the devchat command. Depends:
+  T1, T2.
+- T10 Projection and rendering changes: R17–R20, PROJECTION.md amendments.
+  pkg/history, docs/PROJECTION.md. Depends: T2.
+- T11 devchat harness: R21–R23. devchat. Depends: T5, T7.
+- T12 Tests for AC1–AC11 across pkg/events, pkg/history, pkg/agent,
+  devchat; proofread of the amended documents. Depends: T1–T11.
 
 Open questions
 --------------------
-*What a task-triggered arc quotes.* `Arc.Content` is the user's words. The
-ask's message for an arc opened by an ask; for a result, the task's name and
-the result's summary, or nothing.
-
-*Whether the dispatcher interleaves or queues.* Two arcs for one person is a
-problem whether or not they share an arc; it is only more visible here. The
-queue the `ArcWorker` already has is the natural place to decide it.
-
-*What the loop budget is.* How many consecutive agent-answered asks a task
-may take before it is put to a person or settled is a number that wants
-measuring rather than guessing.
-
-*How much of the trail the result field carries.* A task that ran an hour and
-reported every ten seconds has more events than any result wants beside it.
-Carrying the last N, or carrying a summary the controller already wrote, are
-both available; which reads better wants trying against real tasks.
-
-*What a notification arc costs.* A task kind that declares every event class
-opens is a run per event, coalescing notwithstanding. The declaration is the
-control on it, and a task kind that misuses it is a configuration fault
-rather than a design one.
+- The loop budget's number (D7, R14): a number that wants measuring rather
+  than guessing.
+- How much of the trail a result carries (D9, R19): the last N events, or
+  a summary the controller already wrote.
+- What a result-opened arc quotes in `Arc.Content`: the task's name and
+  result summary, or the name alone.
+- Whether the dispatcher interleaves or queues two arcs for one person; the
+  work queue serving arcs is the natural place to decide.
+- The cost of a task kind that declares every event class open: the
+  declaration is the control on it, and a kind that misuses it is a
+  configuration fault rather than a design one.
