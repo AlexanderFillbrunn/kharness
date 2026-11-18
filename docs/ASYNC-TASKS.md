@@ -27,7 +27,7 @@ Current state
   task event carries the task ID in its payload as `CausationID`, and the
   event itself is correlated to the arc (`reportEvent`,
   pkg/agent/reports.go). Notifications are one undifferentiated class: the
-  payload is an opaque `any`.
+  payload is an opaque `any`, and no task event carries a visibility field.
 - A running task holds its arc open: `deriveArcState` (pkg/agent/agent.go)
   refuses to close while any task has `FinishedSeq == nil`, and takes an
   LLM turn on `unreportedTaskNews`; `closeArc` then writes `ARC_CLOSED`
@@ -72,13 +72,17 @@ Desired state
   task ID; the origin arc is read from the task table. A report is
   validated by whether the task exists in the session, not by whether an
   arc holds it.
-- D3  Correlation is the visibility. An event that opens an arc correlates
-  to the arc it opens and is that arc's opening record, carrying its own
-  content and actor, exactly as a user message does; every other task event
-  correlates to the task. There is no separate arc-opening record, no
-  visibility field and no new event type. Which task events open an arc is
-  D4's rule. Placement in a transcript is decided from correlation and
-  sequence number, as for every record.
+- D3  Visibility is explicit in the payload and decides the correlation.
+  Every task-emitted event carries a `Visibility` field — `opens` or
+  `silent` — set once, on the write path, from the declaration (D4). An
+  event that opens an arc carries `opens`, correlates to the arc it opens
+  and is that arc's opening record, carrying its own content and actor,
+  exactly as a user message does; a silent event carries `silent` and
+  correlates to the task. There is no separate arc-opening record and no
+  new event type. Which task events open an arc is D4's rule. Placement in
+  a transcript is still decided from correlation and sequence number, as
+  for every record; the payload field records the same decision explicitly
+  for readers, replay and validation.
 - D4  Asks and results always open an arc: an ask that opened none could
   never be answered, and a result that opened none would never be worked
   on. A notification opens an arc or stays silent according to its class:
@@ -86,8 +90,9 @@ Desired state
   declares each class of a task kind as opens or silent. A silent
   notification is invisible to the model in every projection; it is in the
   log for the frontend and for replay. The declaration is resolved once,
-  on the write path; a report naming a class the kind has not declared is
-  refused, not defaulted.
+  on the write path: the resolved visibility is written into the event's
+  payload and the correlation follows it (D3). A report naming a class the
+  kind has not declared is refused, not defaulted.
 - D5  The controller coalesces the notifications of each open class into
   at most one report per group window and class; asks and results are
   always written whole, since an ask merged into another report could
@@ -127,11 +132,14 @@ Requirements
 Events — pkg/events
 - R1  `AsyncTaskInvokePayload` gains `Actor users.Actor`. Task event
   payloads keep naming the task: the `CausationID` field already holds the
-  invoke event's ID, which is the task ID. `AsyncTaskEventPayload` gains
-  `Class string`, the notification's own name, carried from the report
-  into the log so the frontend and replay can tell notifications apart.
-  No event gains a visibility field — the correlation is the visibility —
-  and there are no new event types; the codec gains nothing.
+  invoke event's ID, which is the task ID. The task-emitted payloads —
+  `AsyncTaskEventPayload`, `AsyncTaskInputRequestedPayload`,
+  `AsyncTaskResultPayload` — gain `Visibility TaskVisibility` (`opens` |
+  `silent`), written by the write path (R10), and `AsyncTaskEventPayload`
+  gains `Class string`, the notification's own name, carried from the
+  report into the log so the frontend and replay can tell notifications
+  apart. There are no new event types; the codec gains nothing beyond the
+  new fields.
 - R2  `CancelPayload` gains an optional task ID. Set, the cancel is
   task-addressed; unset, arc-addressed exactly as today.
 
@@ -146,7 +154,9 @@ Fold — pkg/history
 - R5  Task events validate against the session task table: a report naming
   an unknown task ID is rejected by the fold.
 - R6  Correlation routes the fold: an arc-correlated event attaches to that
-  arc; a task-correlated event attaches to the task's transcript.
+  arc; a task-correlated event attaches to the task's transcript. The fold
+  cross-checks the payload's `Visibility` against the correlation — `opens`
+  must correlate to an arc, `silent` to a task — and rejects a mismatch.
 - R7  The read model for a run includes the session's task-correlated
   events, so the fold builds the task table; they enter no arc's
   transcript. Implementation choice: load the whole log, or extend the arc
@@ -166,12 +176,14 @@ Registry — pkg/agent/tasks.go
   carries the task's event trail.
 
 Ingress — pkg/agent/reports.go
-- R10 `TaskReports.Report` writes the event with its arc or task
-  correlation: an ask, a result, or a notification of an open class gets a
-  fresh arc ID as its correlation; a silent notification correlates to the
-  task. The notification's class is resolved from the registry on the write
-  path, and a class the kind has not declared is refused. The event
-  carries content, class, task ID and actor; that is the whole write.
+- R10 `TaskReports.Report` resolves the event's visibility from the
+  declaration on the write path and writes it into the payload: an ask, a
+  result, or a notification of an open class carries `opens` and gets a
+  fresh arc ID as its correlation; a silent notification carries `silent`
+  and correlates to the task. The notification's class is resolved from
+  the registry, and a class the kind has not declared is refused. The event
+  carries content, class, visibility, task ID and actor; that is the whole
+  write.
 - R11 After an opening event is persisted, the new arc becomes a work item
   in the same queue user arcs are served from; the origin arc is not
   re-worked, and the caller does not retry when the arc's lease is held.
@@ -197,9 +209,11 @@ Guard and cancel — pkg/agent/cancellation.go, pkg/history
   arc-scoped `startsWork` check, which stays.
 
 Projection — pkg/history/projection.go, docs/PROJECTION.md
-- R17 Placement is decided from correlation and seq for every record. A
-  task-correlated event appears in no arc's transcript under any modes;
-  the `async_events` and `async_input` modes go. PROJECTION.md's fixed
+- R17 Placement is decided from correlation and seq for every record, and
+  the payload's `Visibility` records the same decision explicitly (R6
+  cross-checks the two). A task-correlated event appears in no arc's
+  transcript under any modes; the `async_events` and `async_input` modes
+  go. PROJECTION.md's fixed
   rule 4 is amended: the invocation note stays in the origin arc; the
   completion is an arc of its own.
 - R18 `foreign_arc` notes quote `Arc.Content`, which is set for
@@ -260,6 +274,10 @@ Acceptance criteria
 - AC12 A notification naming a class its task kind has not declared is
   refused at the write path and nothing is logged; a declared open class
   mints an arc, a declared silent class correlates to the task.
+- AC13 Every task-emitted event in the log carries its `Visibility` in the
+  payload, and the fold rejects an event whose payload visibility disagrees
+  with its correlation (`opens` not correlated to an arc, `silent`
+  correlated to one).
 
 Tasks
 --------------------
@@ -280,7 +298,7 @@ Tasks
 - T10 Projection and rendering changes: R17–R20, PROJECTION.md amendments.
   pkg/history, docs/PROJECTION.md. Depends: T2.
 - T11 devchat harness: R21–R23. devchat. Depends: T5, T7.
-- T12 Tests for AC1–AC12 across pkg/events, pkg/history, pkg/agent,
+- T12 Tests for AC1–AC13 across pkg/events, pkg/history, pkg/agent,
   devchat; proofread of the amended documents. Depends: T1–T11.
 
 Open questions
