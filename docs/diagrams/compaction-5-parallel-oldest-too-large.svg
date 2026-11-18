@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 980" width="1080" height="980" font-family="ui-monospace, Menlo, Consolas, monospace">
+<rect width="100%" height="100%" fill="white"/>
+<text x="36" y="30" font-size="17" font-weight="bold" fill="#111">5. Parallel open arcs, the oldest too large to keep whole</text>
+<text x="36" y="52" font-size="12.5" fill="#555">bound(arc A) = its live boundary, bound(arc B) = its opening; the min passes the line through A and keeps B whole</text>
+<text x="36" y="76" font-size="12" fill="#555">context</text>
+<rect x="40" y="86" width="168" height="548" fill="#fafafa" stroke="#ccc"/>
+<line x1="141.76" y1="86" x2="141.76" y2="634" stroke="#d97706" stroke-width="2" stroke-dasharray="5,4"/>
+<line x1="187.64000000000001" y1="86" x2="187.64000000000001" y2="634" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,4"/>
+<text x="137.76" y="82" font-size="11.5" fill="#b45309" text-anchor="end">soft</text>
+<text x="191.64000000000001" y="82" font-size="11.5" fill="#b91c1c">hard</text>
+<polyline points="61.5,106.0 68.7,146.0 81.6,226.0 93.1,266.0 107.5,306.0 147.7,346.0 176.5,386.0 176.5,426.0 183.6,466.0 188.0,506.0 193.7,546.0 193.7,586.0 193.7,626.0" fill="none" stroke="#0f766e" stroke-width="2.5"/>
+<circle cx="147.7" cy="346.0" r="4" fill="#d97706"/>
+<circle cx="183.6" cy="466.0" r="4.5" fill="#dc2626"/>
+<rect x="250" y="92" width="330" height="28" rx="3" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.2"/>
+<text x="260" y="110" font-size="12" fill="#222">USER_MESSAGE</text>
+<rect x="250" y="132" width="330" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/>
+<text x="260" y="150" font-size="12" fill="#222">agent reply</text>
+<rect x="250" y="172" width="330" height="28" rx="3" fill="#dcfce7" stroke="#15803d" stroke-width="1.2"/>
+<text x="260" y="190" font-size="12" fill="#222">ARC_CLOSED</text>
+<rect x="250" y="212" width="330" height="28" rx="3" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.2"/>
+<text x="260" y="230" font-size="12" fill="#222">USER_MESSAGE</text>
+<rect x="250" y="252" width="330" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/>
+<text x="260" y="270" font-size="12" fill="#222">agent reply</text>
+<rect x="250" y="292" width="330" height="28" rx="3" fill="#fde68a" stroke="#b45309" stroke-width="1.2"/>
+<text x="260" y="310" font-size="12" fill="#222">tool call</text>
+<rect x="250" y="332" width="330" height="28" rx="3" fill="#fef9c7" stroke="#a16207" stroke-width="1.2"/>
+<text x="260" y="350" font-size="12" fill="#222">tool result</text>
+<rect x="250" y="372" width="330" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/>
+<text x="260" y="390" font-size="12" fill="#222">agent reply</text>
+<rect x="250" y="412" width="330" height="28" rx="3" fill="#fff7ed" stroke="#c2410c" stroke-width="1.2"/>
+<text x="260" y="430" font-size="11" fill="#222">COMPACTION_REQUESTED</text>
+<rect x="250" y="452" width="330" height="28" rx="3" fill="#fde68a" stroke="#b45309" stroke-width="1.2"/>
+<text x="260" y="470" font-size="12" fill="#222">tool call</text>
+<rect x="250" y="492" width="330" height="28" rx="3" fill="#fef9c7" stroke="#a16207" stroke-width="1.2"/>
+<text x="260" y="510" font-size="12" fill="#222">tool result</text>
+<rect x="250" y="532" width="330" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/>
+<text x="260" y="550" font-size="12" fill="#222">agent reply</text>
+<rect x="250" y="572" width="330" height="28" rx="3" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.2"/>
+<text x="260" y="590" font-size="12" fill="#222">ARC_SUSPENDED</text>
+<rect x="250" y="612" width="330" height="28" rx="3" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.2"/>
+<text x="260" y="630" font-size="12" fill="#222">task event (X)</text>
+<path d="M 215 426.0 H 245" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4,3"/>
+<path d="M 215 586.0 H 245" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3"/>
+<path d="M 600 94 V 198" stroke="#64748b" stroke-width="2" fill="none"/>
+<path d="M 594 94 H 600 M 594 198 H 600" stroke="#64748b" stroke-width="2" fill="none"/>
+<text x="610" y="150.0" font-size="12.5" fill="#64748b">arc 1, closed</text>
+<path d="M 600 214 V 598" stroke="#7c3aed" stroke-width="2" fill="none"/>
+<path d="M 594 214 H 600 M 594 598 H 600" stroke="#7c3aed" stroke-width="2" fill="none"/>
+<text x="610" y="410.0" font-size="12.5" fill="#7c3aed">arc A, open, suspended  (spans the cut)</text>
+<path d="M 600 614 V 638" stroke="#7c3aed" stroke-width="2" fill="none"/>
+<path d="M 594 614 H 600 M 594 638 H 600" stroke="#7c3aed" stroke-width="2" fill="none"/>
+<text x="610" y="630.0" font-size="12.5" fill="#7c3aed">arc B, task-triggered, open</text>
+<line x1="232" y1="522" x2="640" y2="522" stroke="#111" stroke-width="3"/>
+<line x1="232" y1="528" x2="640" y2="528" stroke="#111" stroke-width="3"/>
+<text x="646" y="530" font-size="12.5" font-weight="bold" fill="#111">the cut</text>
+<text x="36" y="682" font-size="12" fill="#333">Arc A is over the arc threshold, so it contributes its live boundary to the min; arc B, opened later</text>
+<text x="36" y="701" font-size="12" fill="#333">and small, contributes its opening. The cut is min(live boundary of A, opening of B) - 1: the line</text>
+<text x="36" y="720" font-size="12" fill="#333">passes through A's spent prefix — the summary covers its earlier rounds, the reply and suspension</text>
+<text x="36" y="739" font-size="12" fill="#333">below the cut stay verbatim, and A's next turn reads summary, a note at the cut and a skeleton —</text>
+<text x="36" y="758" font-size="12" fill="#333">while B is entirely below the cut and reads the summary plus its own whole log. B's bound can never</text>
+<text x="36" y="777" font-size="12" fill="#333">push the cut past A's live material: a fitting younger arc may only pull the line earlier, never</text>
+<text x="36" y="796" font-size="12" fill="#333">into an open arc's live part.</text>
+<rect x="36" y="928" width="14" height="14" rx="2" fill="#dbeafe" stroke="#1d4ed8"/>
+<text x="55" y="939" font-size="11" fill="#444">user msg</text>
+<rect x="116" y="928" width="14" height="14" rx="2" fill="#e2e8f0" stroke="#334155"/>
+<text x="135" y="939" font-size="11" fill="#444">agent reply</text>
+<rect x="217" y="928" width="14" height="14" rx="2" fill="#fde68a" stroke="#b45309"/>
+<text x="236" y="939" font-size="11" fill="#444">tool call</text>
+<rect x="304" y="928" width="14" height="14" rx="2" fill="#fef9c7" stroke="#a16207"/>
+<text x="323" y="939" font-size="11" fill="#444">tool result</text>
+<rect x="405" y="928" width="14" height="14" rx="2" fill="#dcfce7" stroke="#15803d"/>
+<text x="424" y="939" font-size="11" fill="#444">arc closes</text>
+<rect x="499" y="928" width="14" height="14" rx="2" fill="#fff7ed" stroke="#c2410c"/>
+<text x="518" y="939" font-size="11" fill="#444">request</text>
+<rect x="572" y="928" width="14" height="14" rx="2" fill="#fee2e2" stroke="#b91c1c"/>
+<text x="591" y="939" font-size="11" fill="#444">suspend</text>
+<rect x="645" y="928" width="14" height="14" rx="2" fill="#ede9fe" stroke="#6d28d9"/>
+<text x="664" y="939" font-size="11" fill="#444">task event</text>
+<rect x="739" y="934" width="20" height="4" fill="#111"/><text x="764" y="939" font-size="11" fill="#444">the cut / watermark</text>
+</svg>

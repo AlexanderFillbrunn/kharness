@@ -123,6 +123,16 @@ threshold, draws its line at the arc's live boundary instead.
 
 Pictures of the cut
 --------------------
+Five pictures are drawn as diagrams under [diagrams/](diagrams/), one
+per case: [1, the ordinary case](diagrams/compaction-1-ordinary.svg),
+[2, the cut inside a too-large arc](diagrams/compaction-2-cut-inside-large-arc.svg),
+[3, the cut before a fitting arc](diagrams/compaction-3-cut-before-fitting-arc.svg),
+[4, parallel open arcs that all fit](diagrams/compaction-4-parallel-arcs-fit.svg)
+and [5, parallel open arcs with the oldest too large](diagrams/compaction-5-parallel-oldest-too-large.svg).
+Each draws the log as event blocks with the arcs bracketed and the cut as a
+double line, and beside the log a strip showing the context estimate as the
+log grows, with the soft and the hard budget as lines the curve crosses.
+
 Four situations, drawn vertically: the log grows downward, arcs are
 bracketed on the right, and the double line is the cut. Everything above
 the cut is replaced by the summary; everything below it is read as it
