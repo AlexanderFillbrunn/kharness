@@ -133,10 +133,12 @@ Each draws the log as event blocks with the arcs bracketed and the cut as a
 double line, and beside the log a strip showing the context estimate as a
 step function — one step per event, at the event's position — against the
 soft and the hard budget as lines the curve crosses. The parallel cases 4
-and 5 draw one column per run: an event both runs read spans both columns,
-an event of one run's own stays in that run's column, and a session
-record — the request, which correlates to the session and to no run —
-sits in a session lane of its own, in the fold and in no transcript.
+and 5 draw one column per run: an event both runs read spans both
+columns, and an event of one run's own stays in that run's column.
+Session records are dashed wherever they were written: in the writing
+run's column, or spanning the columns with a closed prefix when the
+writer was an arc nobody draws \u2014 the border carries the session, the
+position carries who knows of it.
 
 Four situations, drawn vertically: the log grows downward, arcs are
 bracketed on the right, and the double line is the cut. Everything above
