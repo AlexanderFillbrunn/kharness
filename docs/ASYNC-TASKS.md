@@ -75,14 +75,17 @@ Desired state
   to the arc it opens and is that arc's opening record, carrying its own
   content and actor, exactly as a user message does; every other task event
   correlates to the task. There is no separate arc-opening record, no
-  visibility field and no new event type. Placement in a transcript is
-  decided from correlation and sequence number, as for every record.
-- D4  What each event class does is declared in the registry where the task
-  kind is registered, keyed by the three classes a report carries —
-  notification, ask, result — as: opens an arc, or silent. A silent event
-  is invisible to the model in every projection; it is in the log for the
-  frontend and for replay. The declaration is resolved once, on the write
-  path; a report naming an unregistered kind is refused, not defaulted.
+  visibility field and no new event type. Which task events open an arc is
+  D4's rule. Placement in a transcript is decided from correlation and
+  sequence number, as for every record.
+- D4  Asks and results always open an arc: an ask that opened none could
+  never be answered, and a result that opened none would never be worked
+  on. Only notifications carry a declared visibility — opens an arc, or
+  silent — set in the registry where the task kind is registered. A silent
+  notification is invisible to the model in every projection; it is in the
+  log for the frontend and for replay. The declaration is resolved once,
+  on the write path; a report naming an unregistered kind is refused, not
+  defaulted.
 - D5  The controller coalesces what its task emits into at most one report
   per group window for the arc-opening classes. The window is declared per
   task kind and handed over at registration. Coalescing happens before the
@@ -149,22 +152,24 @@ Store — EventSource, devchat/filestore
   correlated to the arc.
 
 Registry — pkg/agent/tasks.go
-- R9  `TaskDefinition` gains: the visibility declaration per event class
-  (opens | silent); the ask answerability (user-facing | agent-answerable);
-  whether the result carries the task's event trail; the coalescing group
-  window.
+- R9  `TaskDefinition` gains: the visibility declaration for notifications
+  (opens | silent) — asks and results always open an arc; the ask
+  answerability (user-facing | agent-answerable); whether the result
+  carries the task's event trail; the coalescing group window.
 
 Ingress — pkg/agent/reports.go
-- R10 `TaskReports.Report` resolves the event's visibility from the
-  registry on the write path: an opening event gets a fresh arc ID as its
-  correlation, a silent event correlates to the task. The event carries
-  content, task ID and actor; that is the whole write.
+- R10 `TaskReports.Report` writes the event with its arc or task
+  correlation: an ask, a result, or a notification declared open gets a
+  fresh arc ID as its correlation; a silent notification correlates to the
+  task, its visibility resolved from the registry on the write path. The
+  event carries content, task ID and actor; that is the whole write.
 - R11 After an opening event is persisted, the new arc becomes a work item
   in the same queue user arcs are served from; the origin arc is not
   re-worked, and the caller does not retry when the arc's lease is held.
 - R12 Coalescing lives in the controller: at most one report per group
-  window per task for the arc-opening classes, using the window declared
-  at registration. Silent events are written as they arrive.
+  window per task for the classes that open an arc (D4), using the window
+  declared at registration. Silent notifications are written as they
+  arrive.
 
 Agent loop — pkg/agent/agent.go
 - R13 `deriveArcState` closes the arc when the last response requested no
@@ -218,17 +223,18 @@ Acceptance criteria
   new arc goes to the worker as a work item. The owed list is not involved.
 - AC3  An arc whose last response requested no tool calls is closed (`KX`
   written, status `DONE`) while a task it started is still running.
-- AC4  An agent-answerable ask opens an arc; `provide_task_input` in that
-  arc executes under the invoke's actor, and the answer is in the ask arc's
-  own transcript at any cutoff.
+- AC4  An ask — user-facing or agent-answerable — always opens an arc, and
+  so does a result. For an agent-answerable ask, `provide_task_input` in
+  that arc executes under the invoke's actor, and the answer is in the ask
+  arc's own transcript at any cutoff.
 - AC5  Past the configured budget of consecutive agent-answered asks, the
   next ask is relayed (user-facing) or the task is settled.
 - AC6  A cancel naming a task ID settles the task in the log with actor and
   seq, reaches `TaskController.Cancel`, and a late report naming that task
   is refused.
-- AC7  A silent task event appears in no arc's `ModelTranscript` under any
-  modes; `Modes` has no `async_events` / `async_input`; a `foreign_arc`
-  note for a task-opened arc quotes its `Content`.
+- AC7  A notification declared silent appears in no arc's `ModelTranscript`
+  under any modes; `Modes` has no `async_events` / `async_input`; a
+  `foreign_arc` note for a task-opened arc quotes its `Content`.
 - AC8  `GetEventsForArc` on a task-opened arc returns its opening event and
   everything correlated to it; replay folds the arc and `RenderChat` shows
   it.
@@ -274,6 +280,7 @@ Open questions
   result summary, or the name alone.
 - Whether the dispatcher interleaves or queues two arcs for one person; the
   work queue serving arcs is the natural place to decide.
-- The cost of a task kind that declares every event class open: the
-  declaration is the control on it, and a kind that misuses it is a
-  configuration fault rather than a design one.
+- The cost of a task kind that declares its notifications open: a run per
+  notification, coalescing notwithstanding. The declaration is the control
+  on it, and a kind that misuses it is a configuration fault rather than
+  a design one.
