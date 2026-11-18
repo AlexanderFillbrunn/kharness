@@ -26,7 +26,8 @@ Current state
   event's ID, with `AsyncTask.CorrelationID` naming the origin arc. Every
   task event carries the task ID in its payload as `CausationID`, and the
   event itself is correlated to the arc (`reportEvent`,
-  pkg/agent/reports.go).
+  pkg/agent/reports.go). Notifications are one undifferentiated class: the
+  payload is an opaque `any`.
 - A running task holds its arc open: `deriveArcState` (pkg/agent/agent.go)
   refuses to close while any task has `FinishedSeq == nil`, and takes an
   LLM turn on `unreportedTaskNews`; `closeArc` then writes `ARC_CLOSED`
@@ -80,16 +81,19 @@ Desired state
   sequence number, as for every record.
 - D4  Asks and results always open an arc: an ask that opened none could
   never be answered, and a result that opened none would never be worked
-  on. Only notifications carry a declared visibility — opens an arc, or
-  silent — set in the registry where the task kind is registered. A silent
+  on. A notification opens an arc or stays silent according to its class:
+  every notification carries a class name in its payload, and the registry
+  declares each class of a task kind as opens or silent. A silent
   notification is invisible to the model in every projection; it is in the
   log for the frontend and for replay. The declaration is resolved once,
-  on the write path; a report naming an unregistered kind is refused, not
-  defaulted.
-- D5  The controller coalesces what its task emits into at most one report
-  per group window for the arc-opening classes. The window is declared per
-  task kind and handed over at registration. Coalescing happens before the
-  log; nothing about it is recorded. Silent events flow as they are.
+  on the write path; a report naming a class the kind has not declared is
+  refused, not defaulted.
+- D5  The controller coalesces the notifications of each open class into
+  at most one report per group window and class; asks and results are
+  always written whole, since an ask merged into another report could
+  never be answered. The window is declared per class at registration.
+  Coalescing happens before the log; nothing about it is recorded. Silent
+  notifications flow as they are.
 - D6  The actor is copied forward. The invoke records the actor that started
   the task; every event the task emits carries the same one, so every arc
   one of them opens inherits it. The actor is not the correlation ID and
@@ -123,8 +127,11 @@ Requirements
 Events — pkg/events
 - R1  `AsyncTaskInvokePayload` gains `Actor users.Actor`. Task event
   payloads keep naming the task: the `CausationID` field already holds the
-  invoke event's ID, which is the task ID. No event gains a visibility
-  field; no new event types; the codec gains nothing.
+  invoke event's ID, which is the task ID. `AsyncTaskEventPayload` gains
+  `Class string`, the notification's own name, carried from the report
+  into the log so the frontend and replay can tell notifications apart.
+  No event gains a visibility field — the correlation is the visibility —
+  and there are no new event types; the codec gains nothing.
 - R2  `CancelPayload` gains an optional task ID. Set, the cancel is
   task-addressed; unset, arc-addressed exactly as today.
 
@@ -152,24 +159,26 @@ Store — EventSource, devchat/filestore
   correlated to the arc.
 
 Registry — pkg/agent/tasks.go
-- R9  `TaskDefinition` gains: the visibility declaration for notifications
-  (opens | silent) — asks and results always open an arc; the ask
-  answerability (user-facing | agent-answerable); whether the result
-  carries the task's event trail; the coalescing group window.
+- R9  `TaskDefinition` gains, per named notification class: the visibility
+  declaration (opens | silent) and the coalescing group window — asks and
+  results always open an arc and are never coalesced; plus the ask
+  answerability (user-facing | agent-answerable) and whether the result
+  carries the task's event trail.
 
 Ingress — pkg/agent/reports.go
 - R10 `TaskReports.Report` writes the event with its arc or task
-  correlation: an ask, a result, or a notification declared open gets a
+  correlation: an ask, a result, or a notification of an open class gets a
   fresh arc ID as its correlation; a silent notification correlates to the
-  task, its visibility resolved from the registry on the write path. The
-  event carries content, task ID and actor; that is the whole write.
+  task. The notification's class is resolved from the registry on the write
+  path, and a class the kind has not declared is refused. The event
+  carries content, class, task ID and actor; that is the whole write.
 - R11 After an opening event is persisted, the new arc becomes a work item
   in the same queue user arcs are served from; the origin arc is not
   re-worked, and the caller does not retry when the arc's lease is held.
-- R12 Coalescing lives in the controller: at most one report per group
-  window per task for the classes that open an arc (D4), using the window
-  declared at registration. Silent notifications are written as they
-  arrive.
+- R12 Coalescing lives in the controller: per task and notification class,
+  at most one report per group window for open classes, using the window
+  declared at registration (D5). Asks and results are written whole;
+  silent notifications are written as they arrive.
 
 Agent loop — pkg/agent/agent.go
 - R13 `deriveArcState` closes the arc when the last response requested no
@@ -232,21 +241,25 @@ Acceptance criteria
 - AC6  A cancel naming a task ID settles the task in the log with actor and
   seq, reaches `TaskController.Cancel`, and a late report naming that task
   is refused.
-- AC7  A notification declared silent appears in no arc's `ModelTranscript`
-  under any modes; `Modes` has no `async_events` / `async_input`; a
-  `foreign_arc` note for a task-opened arc quotes its `Content`.
+- AC7  A notification whose class is declared silent appears in no arc's
+  `ModelTranscript` under any modes; `Modes` has no `async_events` /
+  `async_input`; a `foreign_arc` note for a task-opened arc quotes its
+  `Content`.
 - AC8  `GetEventsForArc` on a task-opened arc returns its opening event and
   everything correlated to it; replay folds the arc and `RenderChat` shows
   it.
-- AC9  A task kind with an arc-opening notification class emits one report
-  per group window: three events inside one window produce one log record;
-  silent-class events are each logged.
+- AC9  Coalescing is per class: three notifications of an open class inside
+  one group window produce one log record; notifications of a silent class
+  are each logged. An ask and a result are always written whole.
 - AC10 devchat: no `taskOwedMsg` path remains; a report arriving while the
   origin arc is being worked opens a new arc served by the worker; an
   unwritable report still shows `taskUnfiledMsg`.
 - AC11 With compaction (COMPACTION.md): a running task does not hold the
   watermark, and a task whose invoke is below the watermark is still in the
   task table, its invocation note synthesized from the table.
+- AC12 A notification naming a class its task kind has not declared is
+  refused at the write path and nothing is logged; a declared open class
+  mints an arc, a declared silent class correlates to the task.
 
 Tasks
 --------------------
@@ -267,7 +280,7 @@ Tasks
 - T10 Projection and rendering changes: R17–R20, PROJECTION.md amendments.
   pkg/history, docs/PROJECTION.md. Depends: T2.
 - T11 devchat harness: R21–R23. devchat. Depends: T5, T7.
-- T12 Tests for AC1–AC11 across pkg/events, pkg/history, pkg/agent,
+- T12 Tests for AC1–AC12 across pkg/events, pkg/history, pkg/agent,
   devchat; proofread of the amended documents. Depends: T1–T11.
 
 Open questions
@@ -280,7 +293,7 @@ Open questions
   result summary, or the name alone.
 - Whether the dispatcher interleaves or queues two arcs for one person; the
   work queue serving arcs is the natural place to decide.
-- The cost of a task kind that declares its notifications open: a run per
-  notification, coalescing notwithstanding. The declaration is the control
-  on it, and a kind that misuses it is a configuration fault rather than
-  a design one.
+- The cost of declaring a notification class open: a run per event of that
+  class, coalescing notwithstanding. The declaration is the control on it,
+  and a kind that misuses it is a configuration fault rather than a design
+  one.
