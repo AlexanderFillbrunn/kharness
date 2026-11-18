@@ -502,15 +502,20 @@ other arc suspend — estimates low and runs. Where the request stands
 the arrival of the newcomer needs no new request; the one already in the
 log is satisfied for every arc by the single `COMPACTED`.
 
-And a closing point about what the compaction may read: an event that
-lands between the request and the computation is inside the region the
-compactor sees, for the request records the want and not a snapshot —
-the compactor computes against the log as it stands when it takes the
-item. The watermark it writes may therefore be later than the request's
-own sequence: the request carries a floor, the watermark of the
-compaction in force when it was written, and the coverage rule asks only
-that the result reach past that. A request that falls below the new
-watermark is discarded on read once covered, like any other.
+And a closing point about when the watermark is drawn: a free worker
+takes the item at once, and the handler reads the log and fixes the
+watermark at its start — the tens of seconds of the window are the
+summary computation, which runs afterwards and cannot move the line. The
+compaction therefore normally reflects the open arcs as they stood at
+the request: the bound rule is evaluated on the log at that read, and an
+arc opened afterwards is no part of the bound; the arcs it leaves open
+below the cut keep their whole logs, and the first turn it delays meets
+the compaction through the admission check instead. Where the item
+waits — a lease held, a busy queue — the read is later and the watermark
+may reach farther, past the request's own sequence: the request names a
+floor, not a snapshot, and the coverage rule asks only that the result
+reach past the floor. A request that falls below the new watermark is
+discarded on read once covered, like any other.
 
 *Suspension is recorded.* The suspending run — or the admission check, for
 a run that has not started — writes an `ARC_SUSPENDED` event, correlated

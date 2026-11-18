@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 776" width="1080" font-family="ui-monospace, Menlo, Consolas, monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 833" width="1080" font-family="ui-monospace, Menlo, Consolas, monospace">
 <rect width="100%" height="100%" fill="white"/>
 <text x="36" y="30" font-size="17" font-weight="bold" fill="#111">2. The cut inside an arc that is too large to keep whole</text>
 <text x="36" y="52" font-size="12.5" fill="#555">arc 2's own log exceeds the arc threshold, so its bound is its live boundary and the line passes through its spent</text>
@@ -33,28 +33,31 @@
 <path d="M 600 218 V 602" stroke="#64748b" stroke-width="2" fill="none"/>
 <path d="M 594 218 H 600 M 594 602 H 600" stroke="#64748b" stroke-width="2" fill="none"/>
 <text x="610" y="414.0" font-size="12.5" fill="#475569">arc 2, open, suspended  (spans the cut)</text>
-<line x1="232" y1="486" x2="620" y2="486" stroke="#111" stroke-width="3"/><line x1="232" y1="492" x2="620" y2="492" stroke="#111" stroke-width="3"/><text x="628" y="494" font-size="12.5" font-weight="bold" fill="#111">the cut</text>
-<text x="36" y="660" font-size="12" fill="#333">Arc 2 does not fit the arc threshold, so bound(arc 2) = its live boundary. The rounds above the cut</text>
-<text x="36" y="679" font-size="12" fill="#333">are summarised with everything else; the reply and suspension below the cut are live material. The</text>
-<text x="36" y="698" font-size="12" fill="#333">next turn reads the summary, a note standing at the cut, and the arc's surviving part, rendered as</text>
-<text x="36" y="717" font-size="12" fill="#333">a skeleton: tool calls without their results. Crossing the hard budget made the run suspend.</text>
-<rect x="36" y="740" width="14" height="14" rx="2" fill="#dbeafe" stroke="#1d4ed8"/>
-<text x="55" y="751" font-size="11" fill="#444">user msg</text>
-<rect x="116" y="740" width="14" height="14" rx="2" fill="#e2e8f0" stroke="#334155"/>
-<text x="135" y="751" font-size="11" fill="#444">agent reply</text>
-<rect x="217" y="740" width="14" height="14" rx="2" fill="#fde68a" stroke="#b45309"/>
-<text x="236" y="751" font-size="11" fill="#444">tool call</text>
-<rect x="304" y="740" width="14" height="14" rx="2" fill="#fef9c7" stroke="#a16207"/>
-<text x="323" y="751" font-size="11" fill="#444">tool result</text>
-<rect x="405" y="740" width="14" height="14" rx="2" fill="#dcfce7" stroke="#15803d"/>
-<text x="424" y="751" font-size="11" fill="#444">arc closes</text>
-<rect x="499" y="740" width="14" height="14" rx="2" fill="#fff7ed" stroke="#c2410c"/>
-<text x="518" y="751" font-size="11" fill="#444">request</text>
-<rect x="572" y="740" width="14" height="14" rx="2" fill="#fee2e2" stroke="#b91c1c"/>
-<text x="591" y="751" font-size="11" fill="#444">suspend</text>
-<rect x="645" y="740" width="14" height="14" rx="2" fill="#ede9fe" stroke="#6d28d9"/>
-<text x="664" y="751" font-size="11" fill="#444">task event</text>
-<rect x="739" y="746" width="20" height="4" fill="#111"/>
-<text x="764" y="751" font-size="11" fill="#444">the cut / watermark</text>
-<line x1="904" y1="747" x2="924" y2="747" stroke="#0f766e" stroke-width="2.5"/>
-<text x="929" y="751" font-size="11" fill="#444">context estimate, one step per event</text></svg>
+<line x1="232" y1="406" x2="620" y2="406" stroke="#111" stroke-width="3"/><line x1="232" y1="412" x2="620" y2="412" stroke="#111" stroke-width="3"/><text x="628" y="414" font-size="12.5" font-weight="bold" fill="#111">the cut</text>
+<text x="36" y="660" font-size="12" fill="#333">The item is taken at once and the watermark is fixed at the request: the summary computation runs</text>
+<text x="36" y="679" font-size="12" fill="#333">afterwards and cannot move the line. Arc 2 does not fit the arc threshold, so its bound is its live</text>
+<text x="36" y="698" font-size="12" fill="#333">boundary — the cut lands just under its round-1 reply, the last response it had when the request</text>
+<text x="36" y="717" font-size="12" fill="#333">was written. The rounds arc 2 takes afterwards, on the transcript it started with, all land below</text>
+<text x="36" y="736" font-size="12" fill="#333">the cut. Crossing the hard budget made the run suspend; the resume reads the summary, a note</text>
+<text x="36" y="755" font-size="12" fill="#333">standing at the cut, and the surviving part as a skeleton: its opening request verbatim, tool</text>
+<text x="36" y="774" font-size="12" fill="#333">calls without results. The request survives the cut; once covered, it is discarded on read.</text>
+<rect x="36" y="797" width="14" height="14" rx="2" fill="#dbeafe" stroke="#1d4ed8"/>
+<text x="55" y="808" font-size="11" fill="#444">user msg</text>
+<rect x="116" y="797" width="14" height="14" rx="2" fill="#e2e8f0" stroke="#334155"/>
+<text x="135" y="808" font-size="11" fill="#444">agent reply</text>
+<rect x="217" y="797" width="14" height="14" rx="2" fill="#fde68a" stroke="#b45309"/>
+<text x="236" y="808" font-size="11" fill="#444">tool call</text>
+<rect x="304" y="797" width="14" height="14" rx="2" fill="#fef9c7" stroke="#a16207"/>
+<text x="323" y="808" font-size="11" fill="#444">tool result</text>
+<rect x="405" y="797" width="14" height="14" rx="2" fill="#dcfce7" stroke="#15803d"/>
+<text x="424" y="808" font-size="11" fill="#444">arc closes</text>
+<rect x="499" y="797" width="14" height="14" rx="2" fill="#fff7ed" stroke="#c2410c"/>
+<text x="518" y="808" font-size="11" fill="#444">request</text>
+<rect x="572" y="797" width="14" height="14" rx="2" fill="#fee2e2" stroke="#b91c1c"/>
+<text x="591" y="808" font-size="11" fill="#444">suspend</text>
+<rect x="645" y="797" width="14" height="14" rx="2" fill="#ede9fe" stroke="#6d28d9"/>
+<text x="664" y="808" font-size="11" fill="#444">task event</text>
+<rect x="739" y="803" width="20" height="4" fill="#111"/>
+<text x="764" y="808" font-size="11" fill="#444">the cut / watermark</text>
+<line x1="904" y1="804" x2="924" y2="804" stroke="#0f766e" stroke-width="2.5"/>
+<text x="929" y="808" font-size="11" fill="#444">context estimate, one step per event</text></svg>
