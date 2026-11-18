@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 755" width="1080" font-family="ui-monospace, Menlo, Consolas, monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 755" width="1120" font-family="ui-monospace, Menlo, Consolas, monospace">
 <rect width="100%" height="100%" fill="white"/>
 <text x="36" y="30" font-size="17" font-weight="bold" fill="#111">3. The cut before an arc whose own log fits the threshold</text>
 <text x="36" y="52" font-size="12.5" fill="#555">the prefix, not arc 2, crosses the soft budget; the opening bound keeps the arc whole, and the summary never covers</text>
@@ -53,8 +53,8 @@
 <rect x="645" y="719" width="14" height="14" rx="2" fill="#ede9fe" stroke="#6d28d9"/>
 <text x="664" y="730" font-size="11" fill="#444">task event</text>
 <rect x="739" y="719" width="14" height="14" rx="2" fill="#fffbeb" stroke="#c2410c"/>
-<text x="758" y="730" font-size="11" fill="#444">request (session, dashed)</text>
-<rect x="938" y="725" width="20" height="4" fill="#111"/>
-<text x="963" y="730" font-size="11" fill="#444">the cut / watermark</text>
-<line x1="1103" y1="726" x2="1123" y2="726" stroke="#0f766e" stroke-width="2.5"/>
-<text x="1128" y="730" font-size="11" fill="#444">context estimate, one step per event</text></svg>
+<text x="758" y="730" font-size="11" fill="#444">request (session lane)</text>
+<rect x="917" y="725" width="20" height="4" fill="#111"/>
+<text x="942" y="730" font-size="11" fill="#444">the cut / watermark</text>
+<line x1="1082" y1="726" x2="1102" y2="726" stroke="#0f766e" stroke-width="2.5"/>
+<text x="1107" y="730" font-size="11" fill="#444">context estimate, one step per event</text></svg>

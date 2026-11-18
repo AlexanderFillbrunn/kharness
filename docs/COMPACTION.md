@@ -134,7 +134,9 @@ double line, and beside the log a strip showing the context estimate as a
 step function — one step per event, at the event's position — against the
 soft and the hard budget as lines the curve crosses. The parallel cases 4
 and 5 draw one column per run: an event both runs read spans both columns,
-an event of one run's own stays in that run's column.
+an event of one run's own stays in that run's column, and a session
+record — the request, which correlates to the session and to no run —
+sits in a session lane of its own, in the fold and in no transcript.
 
 Four situations, drawn vertically: the log grows downward, arcs are
 bracketed on the right, and the double line is the cut. Everything above
