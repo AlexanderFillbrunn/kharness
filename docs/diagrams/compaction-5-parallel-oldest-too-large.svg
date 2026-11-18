@@ -2,7 +2,7 @@
 <rect width="100%" height="100%" fill="white"/>
 <text x="36" y="30" font-size="17" font-weight="bold" fill="#111">5. Parallel open arcs, the oldest too large to keep whole</text>
 <text x="36" y="52" font-size="12.5" fill="#555">bound(arc A) = its live boundary, bound(arc B) = its opening; the min passes the line through A and keeps B whole</text>
-<text x="250" y="56" font-size="11.5" fill="#888">a block spanning both columns is an event both runs read</text>
+<text x="250" y="56" font-size="11.5" fill="#888">solid full-width: both runs read it; dashed: a session record, in the fold, in no transcript</text>
 <text x="250" y="76" font-size="12.5" font-weight="bold" fill="#4c1d95">run of arc A (open, spans the cut)</text>
 <rect x="250" y="96" width="300" height="588" fill="#fbfaff" stroke="#e9e4f8"/>
 <text x="586" y="76" font-size="12.5" font-weight="bold" fill="#4c1d95">run of arc B (task-triggered, open)</text>
@@ -25,13 +25,12 @@
 <rect x="250" y="336" width="300" height="28" rx="3" fill="#fef9c7" stroke="#a16207" stroke-width="1.2"/><text x="260" y="355" font-size="12" fill="#222">tool result</text>
 <rect x="586" y="376" width="300" height="28" rx="3" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.2"/><text x="596" y="395" font-size="12" fill="#222">task event (X)</text>
 <rect x="250" y="416" width="300" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/><text x="260" y="435" font-size="12" fill="#222">agent reply</text>
-<rect x="250" y="456" width="636" height="28" rx="3" fill="#fff7ed" stroke="#c2410c" stroke-width="1.2"/><text x="260" y="475" font-size="12" fill="#222">COMPACTION_REQUESTED</text>
+<rect x="250" y="456" width="636" height="28" rx="3" fill="#fffbeb" stroke="#c2410c" stroke-width="1.2" stroke-dasharray="6,4"/><text x="260" y="475" font-size="12" fill="#222">COMPACTION_REQUESTED  (session record)</text>
 <rect x="250" y="496" width="300" height="28" rx="3" fill="#fde68a" stroke="#b45309" stroke-width="1.2"/><text x="260" y="515" font-size="12" fill="#222">tool call</text>
 <rect x="250" y="536" width="300" height="28" rx="3" fill="#fef9c7" stroke="#a16207" stroke-width="1.2"/><text x="260" y="555" font-size="12" fill="#222">tool result</text>
 <rect x="250" y="576" width="300" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/><text x="260" y="595" font-size="12" fill="#222">agent reply</text>
 <rect x="250" y="616" width="300" height="28" rx="3" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.2"/><text x="260" y="635" font-size="12" fill="#222">ARC_SUSPENDED</text>
 <rect x="586" y="656" width="300" height="28" rx="3" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.2"/><text x="596" y="675" font-size="12" fill="#222">ARC_SUSPENDED</text>
-<path d="M 215 470 H 245" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4,3"/>
 <path d="M 215 630 H 245" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3"/>
 <path d="M 215 670 H 245" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3"/>
 <path d="M 894 98 V 202" stroke="#64748b" stroke-width="2" fill="none"/>
@@ -63,7 +62,9 @@
 <text x="591" y="926" font-size="11" fill="#444">suspend</text>
 <rect x="645" y="915" width="14" height="14" rx="2" fill="#ede9fe" stroke="#6d28d9"/>
 <text x="664" y="926" font-size="11" fill="#444">task event</text>
-<rect x="739" y="921" width="20" height="4" fill="#111"/>
-<text x="764" y="926" font-size="11" fill="#444">the cut / watermark</text>
-<line x1="904" y1="922" x2="924" y2="922" stroke="#0f766e" stroke-width="2.5"/>
-<text x="929" y="926" font-size="11" fill="#444">context estimate, one step per event</text></svg>
+<rect x="739" y="915" width="14" height="14" rx="2" fill="#fffbeb" stroke="#c2410c"/>
+<text x="758" y="926" font-size="11" fill="#444">request (session, dashed)</text>
+<rect x="938" y="921" width="20" height="4" fill="#111"/>
+<text x="963" y="926" font-size="11" fill="#444">the cut / watermark</text>
+<line x1="1103" y1="922" x2="1123" y2="922" stroke="#0f766e" stroke-width="2.5"/>
+<text x="1128" y="926" font-size="11" fill="#444">context estimate, one step per event</text></svg>
