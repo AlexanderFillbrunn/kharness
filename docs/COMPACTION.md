@@ -491,16 +491,21 @@ read; where it is over the higher budget and no request stands, the check
 writes one.
 
 The estimate is made against the compaction in force, so a request that
-stands unsatisfied leaves the estimated transcript full. An arc opened
-while another arc's suspension is outstanding therefore suspends at
-admission too: its opening is later, its cutoff includes at least the
-material that made the other arc suspend, and the check writes its
-`ARC_SUSPENDED` before it has run. The one exemption follows projection,
-not suspension: an arc whose modes elide the suspended arc's material
-entirely — whose projected transcript contains none of what made the
-other arc suspend — estimates low and runs. Where the request stands
-the arrival of the newcomer needs no new request; the one already in the
-log is satisfied for every arc by the single `COMPACTED`.
+stands unsatisfied leaves the estimated transcript full. A fresh arc
+opened while another arc's suspension is outstanding normally finds its
+estimate over the higher budget at admission, and the check writes its
+`ARC_SUSPENDED` before it has run: its opening is later, so its cutoff
+holds at least the material that made the other arc suspend. The cause
+is the arc's own check result, not the other arc's stop — another arc's
+unresolved suspension is a predictor of the crossing, not a cause of it
+— and the criterion stands with no suspension anywhere in the log: a
+fresh arc whose own estimate crosses the higher budget suspends the same
+way. The one exemption follows projection, not suspension: an arc whose
+modes elide the other arc's material entirely — whose projected
+transcript contains none of what made it suspend — estimates low and
+runs. Where the request stands the arrival of the newcomer needs no new
+request; the one already in the log is satisfied for every arc by the
+single `COMPACTED`.
 
 And a closing point about when the watermark is drawn: a free worker
 takes the item at once, and the handler reads the log and fixes the
@@ -520,7 +525,13 @@ discarded on read once covered, like any other.
 *Suspension is recorded.* The suspending run — or the admission check, for
 a run that has not started — writes an `ARC_SUSPENDED` event, correlated
 to the arc, with causation naming the `COMPACTION_REQUESTED` and no
-payload of its own. The run then ends its in-flight period and the arc is
+payload of its own — and the request, never a run or another arc's
+suspension, is the right cause: a suspension is a wait, the object of
+the wait is the compaction that satisfies the request, and one request
+in the log serves every suspension this way, which is what the
+completion scan's link is made of. A suspension written by the
+admission check, with no other arc suspended anywhere, names the same
+kind of cause. The run then ends its in-flight period and the arc is
 left unworked; nothing is enqueued and nothing waits on a condition. A
 suspension has three derived states, all read from the log: *outstanding*
 until a `COMPACTED` covering the request's watermark lands; *released*
