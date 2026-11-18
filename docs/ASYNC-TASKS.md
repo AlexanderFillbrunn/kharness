@@ -27,7 +27,8 @@ Current state
   task event carries the task ID in its payload as `CausationID`, and the
   event itself is correlated to the arc (`reportEvent`,
   pkg/agent/reports.go). Notifications are one undifferentiated class: the
-  payload is an opaque `any`, and no task event carries an effect field.
+  payload is an opaque `any`, and no task event carries an LLMVisibility
+  field.
 - A running task holds its arc open: `deriveArcState` (pkg/agent/agent.go)
   refuses to close while any task has `FinishedSeq == nil`, and takes an
   LLM turn on `unreportedTaskNews`; `closeArc` then writes `ARC_CLOSED`
@@ -72,45 +73,47 @@ Desired state
   task ID; the origin arc is read from the task table. A report is
   validated by whether the task exists in the session, not by whether an
   arc holds it.
-- D3  Effect is explicit in the payload and decides the correlation.
-  Every task-emitted event carries an `Effect` field — `OPENS_ARC` or
-  `STAYS_WITH_TASK` — set once, on the write path, from the declaration
-  (D4). An event with `OPENS_ARC` correlates to the arc it opens and is
-  that arc's opening record, carrying its own content and actor, exactly
-  as a user message does; an event with `STAYS_WITH_TASK` correlates to
-  the task. There is no separate arc-opening record and no new event
-  type. Which task events get `OPENS_ARC` is D4's rule. Placement in a
-  transcript is still decided from correlation and sequence number, as
-  for every record; the payload field records the same decision
-  explicitly for readers, replay and validation.
-- D4  Asks and results always open an arc: an ask that opened none could
-  never be answered, and a result that opened none would never be worked
-  on. A notification has effect `OPENS_ARC` or `STAYS_WITH_TASK` according
-  to its class: every notification carries a class name in its payload,
-  and the registry declares each class of a task kind as `OPENS_ARC` or
-  `STAYS_WITH_TASK`. A `STAYS_WITH_TASK` notification is invisible to the
-  model in every projection; it is in the log for the frontend and for
-  replay. The declaration is resolved once, on the write path: the
-  resolved effect is written into the event's payload and the correlation
-  follows it (D3). A report naming a class the kind has not declared is
-  refused, not defaulted.
-- D5  The controller coalesces the notifications of each `OPENS_ARC`
+- D3  LLMVisibility is explicit in the payload and decides the
+  correlation. Every task-emitted event carries an `LLMVisibility` field —
+  `None`, `AsMessage` or `InResult` — set once, on the write path, from
+  the declaration (D4). An `AsMessage` event correlates to the arc it
+  opens and is that arc's opening record, carrying its own content and
+  actor, exactly as a user message does; a `None` or `InResult` event
+  correlates to the task. There is no separate arc-opening record and no
+  new event type. Which task events get which value is D4's rule.
+  Placement in a transcript is still decided from correlation and
+  sequence number, as for every record; the payload field records the
+  same decision explicitly for readers, replay and validation.
+- D4  Asks and results are always `AsMessage`: an ask that opened no arc
+  could never be answered, and a result that opened none would never be
+  worked on. A notification's `LLMVisibility` — `None`, `AsMessage` or
+  `InResult` — is declared per class: every notification carries a class
+  name in its payload, and the registry declares each class of a task
+  kind. `AsMessage` opens an arc. `InResult` folds the event into the
+  final task result message (D9). `None` is invisible to the model in
+  every projection; it is in the log for the frontend and for replay.
+  The declaration is resolved once, on the write path: the resolved value
+  is written into the event's payload and the correlation follows it
+  (D3). A report naming a class the kind has not declared is refused, not
+  defaulted.
+- D5  The controller coalesces the notifications of each `AsMessage`
   class into at most one report per group window and class; asks and
   results are always written whole, since an ask merged into another
   report could never be answered. The window is declared per class at
   registration. Coalescing happens before the log; nothing about it is
-  recorded. `STAYS_WITH_TASK` notifications flow as they are.
+  recorded. `None` and `InResult` notifications flow as they are.
 - D6  The actor is copied forward. The invoke records the actor that started
   the task; every event the task emits carries the same one, so every arc
   one of them opens inherits it. The actor is not the correlation ID and
   not a live grant of authority: it records who started the work.
-- D7  An ask may be relayed to a person or answered by the model in the arc
-  the ask opened, through the input tool, under the invocation's actor; the
-  answer is written correlated to the ask's arc, so the cutoff includes it.
-  Whether an ask is user-facing or agent-answerable is declared with the
-  task kind, and an ask may override. A loop budget bounds agent-answered
-  asks: after a fixed number of consecutive ones without a human turn, the
-  next ask is relayed or the task is settled.
+- D7  An ask always opens an arc, and in that arc the model decides: it
+  either puts the question to the user, or answers the ask itself through
+  the input tool (`provide_task_input`), under the invocation's actor; the
+  answer is written correlated to the ask's arc, so the cutoff includes
+  it. This is the model's decision per ask, not a setting of the task. A
+  loop budget bounds model-answered asks: after a fixed number of
+  consecutive ones without a human turn, the next ask goes to the user or
+  the task is settled.
 - D8  Cancellation gains a second axis addressed to the task. A cancel naming
   a task ID reaches the runner through the controller and settles the task
   in the log, with who cancelled it and when. The guard follows the same
@@ -120,10 +123,10 @@ Desired state
   there is no batch-cancel event.
 - D9  A task-triggered arc has no user words. `Arc.Content` is the ask's
   message for an ask-opened arc, and the task's name (and result summary)
-  for a result-opened arc. Where the task kind declares it, the
-  result-opened arc carries the task's events as a field of its own,
-  rendered from the task table. `STAYS_WITH_TASK` events are the
-  frontend's alone.
+  for a result-opened arc. Events declared `InResult` are folded into the
+  final result message of the result-opened arc, rendered from the task
+  table at render time; they are not projected as their own messages.
+  `None` events are the frontend's alone.
 - D10 A running task does not pin the compaction watermark; a report is
   written when it arrives and its run is deferred like any other run. See
   [COMPACTION.md](COMPACTION.md), sections Async tasks, Compaction and the
@@ -136,8 +139,8 @@ Events — pkg/events
   payloads keep naming the task: the `CausationID` field already holds the
   invoke event's ID, which is the task ID. The task-emitted payloads —
   `AsyncTaskEventPayload`, `AsyncTaskInputRequestedPayload`,
-  `AsyncTaskResultPayload` — gain `Effect TaskEffect` (`OPENS_ARC` |
-  `STAYS_WITH_TASK`), written by the write path (R10), and
+  `AsyncTaskResultPayload` — gain `LLMVisibility` (`None` | `AsMessage` |
+  `InResult`), written by the write path (R10), and
   `AsyncTaskEventPayload`
   gains `Class string`, the notification's own name, carried from the
   report into the log so the frontend and replay can tell notifications
@@ -158,8 +161,8 @@ Fold — pkg/history
   an unknown task ID is rejected by the fold.
 - R6  Correlation routes the fold: an arc-correlated event attaches to that
   arc; a task-correlated event attaches to the task's transcript. The fold
-  cross-checks the payload's `Effect` against the correlation —
-  `OPENS_ARC` must correlate to an arc, `STAYS_WITH_TASK` to a task —
+  cross-checks the payload's `LLMVisibility` against the correlation —
+  `AsMessage` must correlate to an arc, `None` and `InResult` to a task —
   and rejects a mismatch.
 - R7  The read model for a run includes the session's task-correlated
   events, so the fold builds the task table; they enter no arc's
@@ -173,37 +176,34 @@ Store — EventSource, devchat/filestore
   correlated to the arc.
 
 Registry — pkg/agent/tasks.go
-- R9  `TaskDefinition` gains, per named notification class: the effect
-  declaration (`OPENS_ARC` | `STAYS_WITH_TASK`) and the coalescing group
-  window — asks and
-  results always open an arc and are never coalesced; plus the ask
-  answerability (user-facing | agent-answerable) and whether the result
-  carries the task's event trail.
+- R9  `TaskDefinition` gains, per named notification class: the
+  `LLMVisibility` declaration (`None` | `AsMessage` | `InResult`) and the
+  coalescing group window — asks and results are always `AsMessage` and
+  are never coalesced.
 
 Ingress — pkg/agent/reports.go
-- R10 `TaskReports.Report` resolves the event's effect from the
+- R10 `TaskReports.Report` resolves the event's `LLMVisibility` from the
   declaration on the write path and writes it into the payload: an ask, a
-  result, or a notification of an `OPENS_ARC` class carries `OPENS_ARC`
-  and gets a fresh arc ID as its correlation; a `STAYS_WITH_TASK`
-  notification correlates to the task. The notification's class is
-  resolved from the registry, and a class the kind has not declared is
-  refused. The event carries content, class, effect, task ID and actor;
-  that is the whole write.
+  result, or a notification of an `AsMessage` class gets a fresh arc ID
+  as its correlation; `None` and `InResult` events correlate to the task.
+  The notification's class is resolved from the registry, and a class the
+  kind has not declared is refused. The event carries content, class,
+  LLMVisibility, task ID and actor; that is the whole write.
 - R11 After an opening event is persisted, the new arc becomes a work item
   in the same queue user arcs are served from; the origin arc is not
   re-worked, and the caller does not retry when the arc's lease is held.
 - R12 Coalescing lives in the controller: per task and notification class,
-  at most one report per group window for `OPENS_ARC` classes, using the
+  at most one report per group window for `AsMessage` classes, using the
   window declared at registration (D5). Asks and results are written
-  whole; `STAYS_WITH_TASK` notifications are written as they arrive.
+  whole; `None` and `InResult` notifications are written as they arrive.
 
 Agent loop — pkg/agent/agent.go
 - R13 `deriveArcState` closes the arc when the last response requested no
   tool calls, whatever tasks are unfinished. `unreportedTaskNews` and the
   finished-sequence wait go. `closeArc` is unchanged.
-- R14 The loop budget for agent-answered asks lives with the dispatcher,
+- R14 The loop budget for model-answered asks lives with the dispatcher,
   configurable on `AgentConfig` with a default; past the budget the next
-  ask is relayed or the task settled (D7).
+  ask goes to the user or the task is settled (D7).
 
 Guard and cancel — pkg/agent/cancellation.go, pkg/history
 - R15 A task-addressed cancel is folded by `applyCancel`: the task is
@@ -215,22 +215,22 @@ Guard and cancel — pkg/agent/cancellation.go, pkg/history
 
 Projection — pkg/history/projection.go, docs/PROJECTION.md
 - R17 Placement is decided from correlation and seq for every record, and
-  the payload's `Effect` records the same decision explicitly (R6
+  the payload's `LLMVisibility` records the same decision explicitly (R6
   cross-checks the two). A task-correlated event appears in no arc's
-  transcript under any modes; the `async_events` and `async_input` modes
-  go. PROJECTION.md's fixed
+  transcript as its own record — `None` never, `InResult` only folded
+  into the result message (R19); the `async_events` and `async_input`
+  modes go. PROJECTION.md's fixed
   rule 4 is amended: the invocation note stays in the origin arc; the
   completion is an arc of its own.
 - R18 `foreign_arc` notes quote `Arc.Content`, which is set for
   task-opened arcs as D9 says.
-- R19 Where a task kind declares the trail, the result-opened arc's
-  transcript carries the task's events as a field of the result, gathered
-  from the task table at render time.
+- R19 Events declared `InResult` are folded into the final result message
+  of the result-opened arc, gathered from the task table at render time.
 
 Rendering — pkg/history/chat.go, devchat
 - R20 `RenderChat` and devchat's transcript draw a session as a sequence of
   arcs; a task-triggered arc renders its `Content` as its opening bubble.
-  `STAYS_WITH_TASK` events render in the frontend only.
+  `None` events render in the frontend only.
 
 Harness — devchat
 - R21 The owed-turn mechanism is deleted: `taskOwedMsg`, `m.owed`,
@@ -251,26 +251,26 @@ Acceptance criteria
   new arc goes to the worker as a work item. The owed list is not involved.
 - AC3  An arc whose last response requested no tool calls is closed (`KX`
   written, status `DONE`) while a task it started is still running.
-- AC4  An ask — user-facing or agent-answerable — always opens an arc, and
-  so does a result. For an agent-answerable ask, `provide_task_input` in
-  that arc executes under the invoke's actor, and the answer is in the ask
-  arc's own transcript at any cutoff.
-- AC5  Past the configured budget of consecutive agent-answered asks, the
-  next ask is relayed (user-facing) or the task is settled.
+- AC4  An ask always opens an arc, and so does a result. In the ask's arc
+  the model either puts the question to the user or answers it with
+  `provide_task_input` under the invoke's actor, and the answer is in the
+  ask arc's own transcript at any cutoff.
+- AC5  Past the configured budget of consecutive model-answered asks, the
+  next ask goes to the user or the task is settled.
 - AC6  A cancel naming a task ID settles the task in the log with actor and
   seq, reaches `TaskController.Cancel`, and a late report naming that task
   is refused.
-- AC7  A notification whose class is declared `STAYS_WITH_TASK` appears in no arc's
-  `ModelTranscript` under any modes; `Modes` has no `async_events` /
-  `async_input`; a `foreign_arc` note for a task-opened arc quotes its
-  `Content`.
+- AC7  A notification declared `None` appears in no arc's `ModelTranscript`
+  under any modes, and one declared `InResult` appears only folded into
+  the result message; `Modes` has no `async_events` / `async_input`; a
+  `foreign_arc` note for a task-opened arc quotes its `Content`.
 - AC8  `GetEventsForArc` on a task-opened arc returns its opening event and
   everything correlated to it; replay folds the arc and `RenderChat` shows
   it.
-- AC9  Coalescing is per class: three notifications of an `OPENS_ARC` class
+- AC9  Coalescing is per class: three notifications of an `AsMessage` class
   inside one group window produce one log record; notifications of a
-  `STAYS_WITH_TASK` class are each logged. An ask and a result are always
-  written whole.
+  `None` or `InResult` class are each logged. An ask and a result are
+  always written whole.
 - AC10 devchat: no `taskOwedMsg` path remains; a report arriving while the
   origin arc is being worked opens a new arc served by the worker; an
   unwritable report still shows `taskUnfiledMsg`.
@@ -278,12 +278,12 @@ Acceptance criteria
   watermark, and a task whose invoke is below the watermark is still in the
   task table, its invocation note synthesized from the table.
 - AC12 A notification naming a class its task kind has not declared is
-  refused at the write path and nothing is logged; a declared `OPENS_ARC`
-  class mints an arc, a `STAYS_WITH_TASK` class correlates to the task.
-- AC13 Every task-emitted event in the log carries its `Effect` in the
-  payload, and the fold rejects an event whose payload effect disagrees
-  with its correlation (`OPENS_ARC` not correlated to an arc,
-  `STAYS_WITH_TASK` correlated to one).
+  refused at the write path and nothing is logged; a declared `AsMessage`
+  class mints an arc, while `None` and `InResult` correlate to the task.
+- AC13 Every task-emitted event in the log carries its `LLMVisibility` in
+  the payload, and the fold rejects an event whose payload value disagrees
+  with its correlation (`AsMessage` not correlated to an arc, `None` or
+  `InResult` correlated to one).
 
 Tasks
 --------------------
@@ -311,13 +311,13 @@ Open questions
 --------------------
 - The loop budget's number (D7, R14): a number that wants measuring rather
   than guessing.
-- How much of the trail a result carries (D9, R19): the last N events, or
-  a summary the controller already wrote.
+- How much of the `InResult` trail the result message carries (D9, R19):
+  the last N events, or a summary the controller already wrote.
 - What a result-opened arc quotes in `Arc.Content`: the task's name and
   result summary, or the name alone.
 - Whether the dispatcher interleaves or queues two arcs for one person; the
   work queue serving arcs is the natural place to decide.
-- The cost of declaring a notification class `OPENS_ARC`: a run per event
-  of that class, coalescing notwithstanding. The declaration is the control on it,
-  and a kind that misuses it is a configuration fault rather than a design
-  one.
+- The cost of declaring a notification class `AsMessage`: a run per event
+  of that class, coalescing notwithstanding. The declaration is the
+  control on it, and a kind that misuses it is a configuration fault
+  rather than a design one.
