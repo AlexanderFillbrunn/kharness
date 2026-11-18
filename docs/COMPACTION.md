@@ -490,6 +490,28 @@ written — so the admission check estimates the transcript the run would
 read; where it is over the higher budget and no request stands, the check
 writes one.
 
+The estimate is made against the compaction in force, so a request that
+stands unsatisfied leaves the estimated transcript full. An arc opened
+while another arc's suspension is outstanding therefore suspends at
+admission too: its opening is later, its cutoff includes at least the
+material that made the other arc suspend, and the check writes its
+`ARC_SUSPENDED` before it has run. The one exemption follows projection,
+not suspension: an arc whose modes elide the suspended arc's material
+entirely — whose projected transcript contains none of what made the
+other arc suspend — estimates low and runs. Where the request stands
+the arrival of the newcomer needs no new request; the one already in the
+log is satisfied for every arc by the single `COMPACTED`.
+
+And a closing point about what the compaction may read: an event that
+lands between the request and the computation is inside the region the
+compactor sees, for the request records the want and not a snapshot —
+the compactor computes against the log as it stands when it takes the
+item. The watermark it writes may therefore be later than the request's
+own sequence: the request carries a floor, the watermark of the
+compaction in force when it was written, and the coverage rule asks only
+that the result reach past that. A request that falls below the new
+watermark is discarded on read once covered, like any other.
+
 *Suspension is recorded.* The suspending run — or the admission check, for
 a run that has not started — writes an `ARC_SUSPENDED` event, correlated
 to the arc, with causation naming the `COMPACTION_REQUESTED` and no

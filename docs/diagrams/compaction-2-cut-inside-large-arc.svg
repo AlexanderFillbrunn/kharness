@@ -9,8 +9,9 @@
 <line x1="187.6" y1="90" x2="187.6" y2="600" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,4"/>
 <text x="137.8" y="84" font-size="11.5" fill="#b45309" text-anchor="end">soft</text>
 <text x="191.6" y="84" font-size="11.5" fill="#b91c1c">hard</text>
-<polyline points="60.6,110.0 60.6,150.0 67.3,150.0 67.3,190.0 71.3,190.0 71.3,230.0 79.2,230.0 79.2,270.0 89.9,270.0 89.9,310.0 103.2,310.0 103.2,350.0 123.1,350.0 123.1,390.0 129.8,390.0 129.8,430.0 148.4,430.0 148.4,470.0 153.7,470.0 153.7,510.0 156.4,510.0 156.4,550.0 163.0,550.0 163.0,590.0 163.0,590.0" fill="none" stroke="#0f766e" stroke-width="2.5"/>
-<rect x="137.8" y="426.0" width="8" height="8" fill="#d97706"/>
+<polyline points="60.6,110.0 60.6,150.0 67.3,150.0 67.3,190.0 71.3,190.0 71.3,230.0 79.2,230.0 79.2,270.0 89.9,270.0 89.9,310.0 103.2,310.0 103.2,350.0 123.1,350.0 123.1,390.0 137.7,390.0 137.7,430.0 140.4,430.0 140.4,470.0 145.7,470.0 145.7,510.0 151.0,510.0 151.0,550.0 176.3,550.0 176.3,590.0 176.3,590.0" fill="none" stroke="#0f766e" stroke-width="2.5"/>
+<rect x="137.8" y="386.0" width="8" height="8" fill="#d97706"/>
+<rect x="182.6" y="545.0" width="10" height="10" fill="#dc2626"/>
 <rect x="250" y="96" width="330" height="28" rx="3" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.2"/><text x="260" y="115" font-size="12" fill="#222">USER_MESSAGE</text>
 <rect x="250" y="136" width="330" height="28" rx="3" fill="#e2e8f0" stroke="#334155" stroke-width="1.2"/><text x="260" y="155" font-size="12" fill="#222">agent reply</text>
 <rect x="250" y="176" width="330" height="28" rx="3" fill="#dcfce7" stroke="#15803d" stroke-width="1.2"/><text x="260" y="195" font-size="12" fill="#222">ARC_CLOSED</text>
