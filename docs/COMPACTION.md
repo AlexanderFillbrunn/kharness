@@ -495,21 +495,25 @@ read; where it is over the higher budget and no request stands, the check
 writes one.
 
 The estimate is made against the compaction in force, so a request that
-stands unsatisfied leaves the estimated transcript full. A fresh arc
-opened while another arc's suspension is outstanding normally finds its
-estimate over the higher budget at admission, and the check writes its
-`ARC_SUSPENDED` before it has run: its opening is later, so its cutoff
-holds at least the material that made the other arc suspend. The cause
-is the arc's own check result, not the other arc's stop — another arc's
-unresolved suspension is a predictor of the crossing, not a cause of it
-— and the criterion stands with no suspension anywhere in the log: a
-fresh arc whose own estimate crosses the higher budget suspends the same
-way. The one exemption follows projection, not suspension: an arc whose
-modes elide the other arc's material entirely — whose projected
-transcript contains none of what made it suspend — estimates low and
-runs. Where the request stands the arrival of the newcomer needs no new
-request; the one already in the log is satisfied for every arc by the
-single `COMPACTED`.
+stands unsatisfied leaves the estimated transcript full. Whether that
+suspends a fresh arc turns on its cutoff, which ends at its opening:
+an arc opened while another arc is still running inherits only what had
+landed when it opened, cannot read the rounds the running arc takes
+afterwards, and estimates over the higher budget only where the material
+below its own opening is itself over. The crossing happens most plainly
+for an arc opened after a heavy arc's rounds have all landed; an arc
+opened mid-run of another usually estimates low and runs, with nothing
+to suspend it for. Another arc's unresolved suspension is a predictor
+of an over-budget opening where the suspending rounds lie below the
+newcomer's own opening, and no predictor where they lie above it, for
+they are not disclosed to it. The cause is the arc's own check result
+in every case, and the criterion stands with no suspension anywhere in
+the log: a fresh arc whose own estimate crosses the higher budget
+suspends the same way. The one exemption follows projection, not
+suspension: an arc whose modes elide the earlier material entirely
+estimates low and runs. Where the request stands the arrival of the
+newcomer needs no new request; the one already in the log is satisfied
+for every arc by the single `COMPACTED`.
 
 And a closing point about when the watermark is drawn: a free worker
 takes the item at once, and the handler reads the log and fixes the
