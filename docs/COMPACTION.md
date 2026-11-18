@@ -130,8 +130,11 @@ per case: [1, the ordinary case](diagrams/compaction-1-ordinary.svg),
 [4, parallel open arcs that all fit](diagrams/compaction-4-parallel-arcs-fit.svg)
 and [5, parallel open arcs with the oldest too large](diagrams/compaction-5-parallel-oldest-too-large.svg).
 Each draws the log as event blocks with the arcs bracketed and the cut as a
-double line, and beside the log a strip showing the context estimate as the
-log grows, with the soft and the hard budget as lines the curve crosses.
+double line, and beside the log a strip showing the context estimate as a
+step function — one step per event, at the event's position — against the
+soft and the hard budget as lines the curve crosses. The parallel cases 4
+and 5 draw one column per run: an event both runs read spans both columns,
+an event of one run's own stays in that run's column.
 
 Four situations, drawn vertically: the log grows downward, arcs are
 bracketed on the right, and the double line is the cut. Everything above
