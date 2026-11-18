@@ -89,19 +89,37 @@ the task table, as described under Compaction and the fold.
 *An open arc's live material stays above the cut.* The live material is the
 arc's last response, an ask it has made that nobody has answered, and the
 request that opened it. Everything else in an open arc — the tool rounds
-already accounted for in a response — is spent prefix and may be summarised.
+already accounted for in a response — is spent prefix: summarised where the
+line passes through, and kept whole below the line where the opening bound
+applies.
 
 The rule that satisfies all three:
 
-    ThroughSeq = min(liveBoundary(arc) for arcs where arc.Status() != closed) - 1
+    bound(arc) = opening(arc)        where the arc's own log fits the arc threshold
+              = liveBoundary(arc)   otherwise
+    ThroughSeq = min(bound(arc) for arcs where arc.Status() != closed) - 1
 
 The live boundary of an arc is its last turn boundary, or its opening where
 it has taken no turn. An arc that has not been worked pins the watermark at
-its opening; an arc that keeps taking turns keeps advancing its own boundary.
-The line may pass through an open arc's spent prefix. The watermark is
+its opening. A worked arc takes the opening bound — the threshold under
+The arc the line passes through that decides between the whole arc log and
+a skeleton — where its own log so far fits it, and the line is drawn before
+the arc. The reason is duplication: an arc under the threshold renders its
+whole log verbatim, so a cut inside its spent prefix would summarise
+material the transcript then repeats word for word; the opening bound keeps
+the summary and the arc log disjoint, at the price of carrying the arc
+whole in every transcript until the next compaction. Only an arc too large
+to keep whole is cut at its live
+boundary, with the line passing through its spent prefix. The watermark is
 shared by all open arcs, so it advances only as far as the least advanced of
 them permits; an arc that stays open without taking a turn holds the line
 for the others.
+
+The fit is measured when the compaction computes its watermark, against the
+arc's log as it stands then. An arc kept whole that outgrows the threshold
+afterwards is not re-cut by a compaction already in force: the arc renders
+whole against that line, and the next compaction, finding the arc over the
+threshold, draws its line at the arc's live boundary instead.
 
 Pictures of the cut
 --------------------
@@ -137,9 +155,12 @@ its first turn reads the summary plus its own events.
 lower budget is crossed, so the loop writes a request and the compaction
 proceeds in parallel while the run continues; a later round would cross
 the higher budget, so the run writes `ARC_SUSPENDED` and stops. The
-compaction computes its watermark from the log as it stands: arc 2's live
-boundary is its last turn, so the cut lands inside the arc, with the
-finished part above it and the live part below it. Arc 2's next turn
+compaction computes its watermark from the log as it stands: arc 2 is too
+large for the line to be drawn at its opening, so its live boundary — its
+last turn — decides, and the cut lands inside the arc, with the
+finished part above it and the live part below it. Had arc 2 fitted under
+the arc threshold, the cut would have been drawn at its opening instead and
+the whole arc log would survive intact. Arc 2's next turn
 reads the summary, a note about what was summarised, and its own events
 below the cut.
 
@@ -165,26 +186,27 @@ below the cut.
 released: the compaction has landed and the completion scan has requeued
 it, so its next turn reads the summary plus the arc's own log. The arc's
 log contains one user message — the request that opened it — followed by
-its tool rounds; the events below the cut are the same in both
-renderings, and the difference is only in how the finished part is
-rendered: in full when the arc is small, as a skeleton when it is not.
+its tool rounds; where the cut sat depends on the arc's size when the
+compaction computed its watermark. Small, and the opening bound placed
+the cut at the arc's opening: nothing of the arc was summarised, the
+whole log is kept in full, and no note stands inside it. Large, and the
+cut sat at the arc's live boundary: the finished part that fell above it
+was summarised with everything else, and the arc log's surviving part
+renders as a skeleton.
 
-    small, the arc's whole log, kept in full:
+    small, the cut at the opening, the arc's whole log kept in full:
 
-      [ summary ]
+      [ summary: everything before the arc ]
       the request that opened the arc, word for word
       agent reply
       tool call
-      tool result                   <- finished part,
+      tool result                   <- the arc's whole log,
       agent reply                      kept as it is
-
-      [ note: the work above this note was summarised ]
-
       tool call
-      tool result                   <- events below the cut,
-      agent reply                      the same in both renderings
+      tool result
+      agent reply
 
-    large, a skeleton:
+    large, the cut inside, a skeleton:
 
       [ summary ]
       the request that opened the arc, word for word
@@ -242,8 +264,9 @@ line below its own last turn, so the new compaction is not in force under
 it. An arc that has been opened but not yet worked is quiescent — nothing
 has been written against its prefix — so its first turn reads whatever
 compaction is in force then. A suspended run is in the same position: not in
-flight, its live boundary at its suspension round, so the line may pass through
-its earlier rounds and its resume reads the compaction in force then. This
+flight, so the line sits before it — at its opening where it fits the arc
+threshold, at its live boundary with its earlier rounds above the cut where
+it does not — and its resume reads the compaction in force then. This
 is what allows a run to be deferred during a compaction window while its
 trigger event is written immediately; see Where a run waits.
 
@@ -270,11 +293,14 @@ not interact. Specifying snapshots is separate work and not done here.
 The arc the line passes through
 --------------------
 An open arc whose spent prefix falls below the watermark renders against the
-cut. Under this design the only such arcs are suspended ones: an arc that
-has not been worked pins the watermark at its opening, and a run in flight
-pins the line below its last turn, so the `ARC_SUSPENDED` event and the line
-mark the same arcs, and the event is the projection's explicit trigger. Its
-transcript at a turn is:
+cut. Under this design the only such arcs are suspended ones that do not
+fit the arc threshold: an arc that has not been worked pins the watermark
+at its opening, a run in flight pins the line below its last turn, and a
+suspended arc that fits takes the opening bound and keeps its whole log
+below the cut — so the `ARC_SUSPENDED` event and the line mark the same
+arcs, the event is the projection's explicit trigger, and only the arcs
+over the threshold render against the cut at all. Its transcript at a turn
+is:
 
     the summary of everything below the watermark, plus
     the arc's own log, rendered as described below, with
@@ -288,21 +314,25 @@ watermark separates them in the log. The note also states which record
 wins: the arc's own log is verbatim, the summary is not, and where the
 two disagree the model is told to trust the arc log. Where an
 `ARC_SUSPENDED` stands in the log, the note also says the request was
-paused while its context was compacted. The
-summary and the arc log overlap — the arc's prefix is part of the region
-the summariser covers — and the overlap is expected; a summary is written
-once and shared by every arc opened after it, so open arcs are not excluded
-from it.
+paused while its context was compacted. The summary and the arc log do not
+otherwise overlap: an arc small enough to render whole is never spanned,
+because the opening bound placed the cut before it, and the skeleton thins
+the finished part rather than repeating it — the summary covers the region
+once, in prose, and the arc log carries only what the cut left below it.
 
-*Under the threshold, the whole arc log.* An arc whose own events above the
-watermark fit inside a threshold renders in full. Compaction is lossless for
-every arc that stayed small; the lossy rendering is reserved for arcs that do
-not fit, which is the only case where dropping material is better than
-overflowing.
+*Fitting arcs never render against the cut.* A suspended arc whose own log
+fits the threshold was kept whole by the opening bound at the moment the
+watermark was computed, so nothing of it was summarised and its transcript
+is the summary plus its own log in full, with no note inside it. Compaction
+is lossless for every arc that stayed small; the lossy rendering is
+reserved for arcs that do not fit, which is the only case where dropping
+material is better than overflowing — and the only case the line passes
+through.
 
 *Above it, a skeleton.* The arc's log is rendered as its opening request,
 verbatim; the tool calls it made, without their results; and its messages
-above the watermark. What is dropped are the tool results of the spent
+below the line — the arc's live part, which survives whole. What is dropped
+are the tool results of the spent
 prefix: superseded middle results, not current state — the last response is
 above the cut — and re-derivable by calling the tool again where the tool is
 idempotent. A tool that is not idempotent, or whose results are too
@@ -310,10 +340,12 @@ expensive to re-derive, wants a registry-level mark, not a compaction rule.
 
 *Derived, not recorded.* The threshold test, the note and the skeleton are
 rendered from the payload the compaction already carries, so the payload
-gains nothing for them. Whether an arc fits is a token count taken at
-render time, so the projection is a function of the log, the cutoff, the
-threshold and the tokenizer. If exact checkability is ever wanted, one bit
-per spanning arc in the payload restores it.
+gains nothing for them. Whether an arc fits is a token count taken when
+the compaction draws its line — the bound rule under Where the cut goes —
+and the test decides the rendering the same way, so the projection is a
+function of the log, the cutoff, the threshold and the tokenizer. If exact
+checkability is ever wanted, one bit per spanning arc in the payload
+restores it.
 
 *Conditions.* The cut takes effect at the start of an arc's next turn, never
 during a run. Tool calls and their results are never separated by the line.
@@ -573,7 +605,8 @@ Blocking: the tail of the window.
       the next round would cross the higher budget
       the run writes the suspension and stops; the arc waits
       ...
-      the compaction lands, the cut inside the arc's finished part
+      the compaction lands, the cut before the arc or, where the arc grew
+      past its threshold, inside the arc's finished part
       the completion scan requeues the arc
       the run resumes as a new turn, reading the summary
 
@@ -727,7 +760,10 @@ synthesised from the task table for an unsettled task whose invoke is below
 the watermark. `Modes` gains nothing, because compaction has no mode.
 
 `pkg/agent` gains the `Compactor` interface with its three implementations,
-the method and the two budgets on `AgentConfig`, the loop's check after
+the method and the two budgets on `AgentConfig` and with them the arc
+threshold the bound rule tests, the bound rule itself that computes the
+watermark from the open arcs — an arc's opening or its live boundary,
+whichever the threshold allows — the loop's check after
 every round that writes a `COMPACTION_REQUESTED` and enqueues the compaction
 work item when the fold says one is due, the compaction lease scoped to
 the session and the leaving-unacknowledged of an item that finds it held,
@@ -776,10 +812,12 @@ never taken over while it is still working, short enough that a dead worker
 does not hold the request past a person's patience. A measured distribution
 of compaction times decides it; a guess does not.
 
-*What the spanning arc's threshold is.* The line between rendering an arc's
-log whole and rendering its skeleton is a token count, and it wants choosing
-against the cache cost of re-cutting rather than as a round number under the
-context limit.
+*What the spanning arc's threshold is.* One number does double duty: the
+bound rule uses it to decide where the line is drawn — before a fitting
+arc, at the live boundary of one that is not — and the projection uses it
+to decide how a spanned arc renders. It wants choosing against the
+duplication the opening bound avoids and the cache cost of re-cutting
+rather than as a round number under the context limit.
 
 *Whether the higher budget is reachable at all.* If the lower budget is
 set well, a run rarely suspends, and the higher-budget check and the
