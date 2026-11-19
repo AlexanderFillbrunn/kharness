@@ -74,7 +74,7 @@ everything written in between must be read.
 
 Where the cut goes
 --------------------
-Three constraints on `ThroughSeq`.
+Four constraints on `ThroughSeq`.
 
 *A tool call and its result are not separated.* Providers require the pair
 to be contiguous, and the projection makes it the one exception to log order.
@@ -93,11 +93,30 @@ already accounted for in a response — is spent prefix: summarised where the
 line passes through, and kept whole below the line where the opening bound
 applies.
 
-The rule that satisfies all three:
+*A tail stays above the cut.* The last `KeepRecentTokens` of the log are
+never summarised. Walking backwards from the end of the log as it stands when
+the compaction computes its watermark and accumulating the per-event token
+estimate the diagrams draw (under Pictures of the cut) until
+`KeepRecentTokens` is reached gives a token point; the last turn boundary at
+or below it is `tailCap`. The tail is measured on the projection, the same
+material the summary is made from.
+
+The rule that satisfies all four:
 
     bound(arc) = opening(arc)        where the arc's own log fits the arc threshold
               = liveBoundary(arc)   otherwise
-    ThroughSeq = min(bound(arc) for arcs where arc.Status() != closed) - 1
+    ThroughSeq = min( min(bound(arc) for arcs where arc.Status() != closed) - 1,
+                     tailCap )
+
+The tail cap only ever lowers the cut below what the bound rule chose, so it
+cannot span a fitting open arc — the opening bound already holds the cut
+before it — and a turn boundary never separates a tool call from its result.
+Where the whole log is smaller than `KeepRecentTokens` the cap constrains
+nothing. Where a single arc outruns the tail, the bound rule's live boundary
+decides, the live part kept above the line may be smaller than
+`KeepRecentTokens`, and the spanning arc renders as the skeleton it already
+does. Like the skeleton, the cap is derived from the log and the config, so
+the payload gains nothing for it.
 
 The live boundary of an arc is its last turn boundary, or its opening where
 it has taken no turn. An arc that has not been worked pins the watermark at
@@ -132,7 +151,8 @@ and [5, parallel open arcs with the oldest too large](diagrams/compaction-5-para
 Each draws the log as event blocks with the arcs bracketed and the cut as a
 double line, and beside the log a strip showing the context estimate as a
 step function — one step per event, at the event's position — against the
-soft and the hard budget as lines the curve crosses. The parallel cases 4
+soft and the hard budget and the tail cap as lines the curve crosses. The
+parallel cases 4
 and 5 draw one column per run: an event both runs read spans both
 columns, and an event of one run's own stays in that run's column.
 Session records are dashed wherever they were written: in the writing
@@ -455,7 +475,9 @@ lower budget triggers compaction and sits well below what the provider
 accepts; the higher budget suspends runs and sits close to the limit. The
 lower is checked first on any round, so by the time a run threatens the
 higher budget, a compaction is already in flight or already landed. A run
-reaching the higher budget is expected for long arcs.
+reaching the higher budget is expected for long arcs. A third value,
+`KeepRecentTokens`, is the tail of the log the cut must leave above it, as
+under Where the cut goes.
 
 Whether compaction is due is a pure function of the log. `AssistantMessage`
 `Payload.Usage` carries the input tokens of the last reply, and distinguishes
@@ -819,10 +841,11 @@ synthesised from the task table for an unsettled task whose invoke is below
 the watermark. `Modes` gains nothing, because compaction has no mode.
 
 `pkg/agent` gains the `Compactor` interface with its three implementations,
-the method and the two budgets on `AgentConfig` and with them the arc
-threshold the bound rule tests, the bound rule itself that computes the
-watermark from the open arcs — an arc's opening or its live boundary,
-whichever the threshold allows — the loop's check after
+the method, the two budgets and `KeepRecentTokens` on `AgentConfig` and with
+them the arc threshold the bound rule tests, the bound rule itself that
+computes the watermark from the open arcs and the tail cap — an arc's
+opening or its live boundary, whichever the threshold allows — the loop's
+check after
 every round that writes a `COMPACTION_REQUESTED` and enqueues the compaction
 work item when the fold says one is due, the compaction lease scoped to
 the session and the leaving-unacknowledged of an item that finds it held,
@@ -853,7 +876,8 @@ Open questions
 measure and are the provider's, arriving one turn late and absent when a
 provider reports nothing. An estimate from the transcript is available
 immediately and is wrong by an unknown amount. The first is probably right
-and the nil case needs an answer.
+and the nil case needs an answer. The tail cap under Where the cut goes is
+measured with the estimate, so its accuracy is this question's too.
 
 *Whether a summary is one block or several.* One block per compaction is
 simplest and means the second compaction summarises a summary, losing a
