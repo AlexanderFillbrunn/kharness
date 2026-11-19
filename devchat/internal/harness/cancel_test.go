@@ -1,4 +1,4 @@
-package main
+package harness
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"fillbrunn.ai/kube-agent/devchat/filestore"
+	"fillbrunn.ai/kube-agent/devchat/pkg/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"

@@ -23,4 +23,4 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 )
 
-replace fillbrunn.ai/kube-agent => ../
+replace fillbrunn.ai/kube-agent => ../agent

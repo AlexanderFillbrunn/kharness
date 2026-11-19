@@ -24,7 +24,7 @@ The encoder's work is four repairs and a shape translation.
 Input
 --------------------
 A `ModelTranscript` is a flat ordered list of `ModelMessage`. Four shapes, from
-`pkg/history/projection.go`.
+`agent/pkg/history/projection.go`.
 
     ModelTextMessage        text with a role, USER or INSTRUCTION
     ModelAssistantMessage   the model's text, plus the calls it requested

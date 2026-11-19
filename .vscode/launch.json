@@ -6,7 +6,7 @@
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/cmd/devchat",
+      "program": "${workspaceFolder}/devchat/cmd/devchat",
       // The harness is a full-screen terminal app, and only the integrated
       // terminal gives it a real terminal to draw on.
       "console": "integratedTerminal",
@@ -18,7 +18,7 @@
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/cmd/devchat",
+      "program": "${workspaceFolder}/devchat/cmd/devchat",
       "console": "integratedTerminal",
       "envFile": "${workspaceFolder}/.env",
       "args": [

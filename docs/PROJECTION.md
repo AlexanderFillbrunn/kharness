@@ -20,8 +20,8 @@ Three representations, two transitions.
     provider messages
 
     event log           what happened, append-only, one session
-    History             the log folded into arcs. `pkg/history/history.go`
-    ModelTranscript     provider-agnostic messages. `pkg/history/projection.go`
+    History             the log folded into arcs. `agent/pkg/history/history.go`
+    ModelTranscript     provider-agnostic messages. `agent/pkg/history/projection.go`
     provider messages   one vendor's wire format
 
 The fold is mechanical. It nests each record under the arc named by its
@@ -42,7 +42,7 @@ This document specifies projection only. Encoding is specified in
 Output
 --------------------
 `ModelTranscript` is a slice of `ModelMessage`, in send order. Four shapes,
-defined in `pkg/history/projection.go`.
+defined in `agent/pkg/history/projection.go`.
 
     ModelTextMessage        text with a role, USER or INSTRUCTION
     ModelAssistantMessage   the model's text, plus the calls it requested

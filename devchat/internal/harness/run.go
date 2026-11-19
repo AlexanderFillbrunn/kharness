@@ -1,23 +1,11 @@
-// Command devchat is a terminal harness for driving the agent by hand.
-//
-// It is a development tool, not the product. It talks to one model over one
-// file-based log and offers tools that answer from canned data.
-//
-//	export OPENAI_API_KEY=...
-//	cd devchat && go run .
-//
-// Type a message and the agent runs until it is your turn again. Enter sends
-// and esc leaves. A run in progress is stopped by ctrl+c or by /cancel, which
-// withdraws the arc in the log rather than dropping it on the screen.
-//
-// Sessions are kept under .devchat/. Pointing -store at a log again resumes
-// that conversation, and /clear moves the current one aside.
-package main
+// Package harness is the devchat terminal application behind the devchat
+// command: the session, the interface and the canned tools. It lives in
+// internal so that nothing outside this module can depend on it.
+package harness
 
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,19 +13,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"fillbrunn.ai/kube-agent/devchat/filestore"
+	"fillbrunn.ai/kube-agent/devchat/pkg/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/users"
 )
-
-// defaultStore keeps sessions in a directory of their own. They are working
-// files of a development tool, and they hold whole conversations, so they do
-// not belong next to the source.
-const defaultStore = ".devchat/session.jsonl"
-
-// defaultSettings is the agent settings file the resolver reads. It is a
-// working file of a development tool, so it lives with the sessions.
-const defaultSettings = ".devchat/agents.json"
 
 // localAgentID names the one agent this harness runs. The resolver ignores
 // it, but every work item and every event carries it, so the plumbing is
@@ -47,19 +26,10 @@ const localAgentID = "local"
 const defaultSystemPrompt = `You are a Kubernetes operations assistant with read and restart tools.
 Use them rather than guessing, and say plainly when a tool tells you something you did not expect.`
 
-func main() {
-	store := flag.String("store", defaultStore, "event log to append to, resuming it if it exists")
-	settings := flag.String("settings", defaultSettings, "agent settings the resolver reads, created if absent")
-	user := flag.String("user", "dev", "who the messages are from")
-	flag.Parse()
-
-	if err := run(*store, *settings, *user); err != nil {
-		fmt.Fprintf(os.Stderr, "devchat: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func run(storePath, settingsPath, userID string) error {
+// Run drives one devchat session: it opens the log, wires the agent to the
+// terminal and blocks until the interface leaves. The flags the command
+// takes are parsed in cmd/devchat; everything else lives here.
+func Run(storePath, settingsPath, userID string) error {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("OPENAI_API_KEY is not set")

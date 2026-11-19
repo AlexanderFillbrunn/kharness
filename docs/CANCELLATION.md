@@ -188,7 +188,7 @@ A tool that is stopped has to say what it did. A mutating tool interrupted
 after it issued its change reports that in its result rather than returning an
 error, because an error is recorded as a definite failure and a model told the
 restart failed is a model that restarts it again. `restartDeployment` in
-`devchat/tools.go` is the worked example.
+`devchat/internal/harness/tools.go` is the worked example.
 
 What a cancelled context reaches
 --------------------

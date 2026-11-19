@@ -19,17 +19,17 @@ is an object of the session (this spec). This spec chooses the second.
 Current state
 --------------------
 - An arc is opened only by `USER_MESSAGE`: `applyUserMessage`
-  (pkg/history/history.go). The store's cutoff, `GetEventsForArc`
-  (devchat/filestore/store.go), finds an arc by scanning for a
+  (agent/pkg/history/history.go). The store's cutoff, `GetEventsForArc`
+  (devchat/pkg/filestore/store.go), finds an arc by scanning for a
   `USER_MESSAGE` with the arc's correlation ID.
 - A task is nested in its origin arc: `Arc.AsyncTasks`, keyed by the invoke
   event's ID, with `AsyncTask.CorrelationID` naming the origin arc. Every
   task event carries the task ID in its payload as `CausationID`, and the
   event itself is correlated to the arc (`reportEvent`,
-  pkg/agent/reports.go). Notifications are one undifferentiated class: the
+  agent/pkg/agent/reports.go). Notifications are one undifferentiated class: the
   payload is an opaque `any`, and no task event carries an LLMVisibility
   field.
-- A running task holds its arc open: `deriveArcState` (pkg/agent/agent.go)
+- A running task holds its arc open: `deriveArcState` (agent/pkg/agent/agent.go)
   refuses to close while any task has `FinishedSeq == nil`, and takes an
   LLM turn on `unreportedTaskNews`; `closeArc` then writes `ARC_CLOSED`
   (`KX`) naming the last response.
@@ -37,8 +37,8 @@ Current state
   `holdsTask` (the named arc owns the task), persists the event correlated
   to that arc, then calls `ArcWorker.Work` on it. When the lease is held
   it returns false, and devchat queues the turn itself: `taskOwedMsg`,
-  `m.owed`, `settleOwed` (devchat/tui.go), fed by the `deferred` callback in
-  devchat/tasks.go.
+  `m.owed`, `settleOwed` (devchat/internal/harness/tui.go), fed by the `deferred` callback in
+  devchat/internal/harness/tasks.go.
 - An ask is answered from outside the asking arc:
   `ASYNC_TASK_INPUT_REQUESTED` parks the task (`WAITING`); the human's
   answer is a new user message, which opens a new arc. The cutoff gives an
@@ -48,16 +48,16 @@ Current state
 - Projection: fixed rule 4 of PROJECTION.md — a task is always two notes,
   at invocation and completion. Notifications and input asks are governed
   by the modes `async_events` / `async_input` (note | elide) in
-  `projectAsyncTasks` (pkg/history/projection.go).
+  `projectAsyncTasks` (agent/pkg/history/projection.go).
 - Cancel is arc-scoped only: `applyCancel` settles pending calls and
   interrupts, and for tasks only records `TerminatedWork` — the task itself
   is not settled. The guard refuses writes that start work on a cancelled
   arc: `startsWork` covers `TOOL_DISPATCHED` and `ASYNC_TASK_INVOKE`
-  (pkg/agent/cancellation.go).
+  (agent/pkg/agent/cancellation.go).
 - Actor: `events.Event.Actor` exists and `UserMessagePayload` duplicates it
   into the payload; `AsyncTaskInvokePayload` carries no actor. Reaching a
   running task needs its origin arc: `TaskRef{ArcRef, ID, Name}`.
-- Rendering: `RenderChat` (pkg/history/chat.go) and devchat's transcript
+- Rendering: `RenderChat` (agent/pkg/history/chat.go) and devchat's transcript
   draw each arc as a user bubble plus replies; `Arc.Content` is the user's
   words.
 
@@ -143,7 +143,7 @@ Desired state
   notification, the ask's message for an ask-opened arc, and for a
   result-opened arc the task's result as returned in
   `AsyncTaskResultPayload.Result`, not summarized (the payload struct does
-  carry the result, pkg/events/payloads.go). Events declared `InResult`
+  carry the result, agent/pkg/events/payloads.go). Events declared `InResult`
   are folded into the final result message of the result-opened arc,
   rendered from the task table at render time; they are not projected as
   their own messages. How much of the trail that message carries is
@@ -157,7 +157,7 @@ Desired state
 - D11 The work queue interleaves: work items — user arcs and task-opened
   arcs alike, from any user — are served in parallel as they arrive; there
   is no per-user or per-session serialization. The lease stays per arc
-  (pkg/agent/lease.go), so interleaving is across arcs, never two runs on
+  (agent/pkg/agent/lease.go), so interleaving is across arcs, never two runs on
   one arc.
 - D12 An `AsMessage` notification costs a run (it opens an arc), coalescing
   notwithstanding; the declaration is the control on that cost, and a kind
@@ -171,7 +171,7 @@ Desired state
 
 Requirements
 --------------------
-Events — pkg/events
+Events — agent/pkg/events
 - R1  `AsyncTaskInvokePayload` gains `Actor users.Actor`. Task event
   payloads keep naming the task: the `CausationID` field already holds the
   invoke event's ID, which is the task ID. The task-emitted payloads —
@@ -187,7 +187,7 @@ Events — pkg/events
   task-addressed: the event's correlation ID is the task ID and the fold
   settles the task, not an arc; unset, arc-addressed exactly as today.
 
-Fold — pkg/history
+Fold — agent/pkg/history
 - R3  `History` gains a session-level task table: every task in the session,
   keyed by task ID, in log order. `FoldStateFromHistory` rebuilds it. The
   task record keeps status, events, actor, name (from
@@ -216,14 +216,14 @@ Fold — pkg/history
   transcript. Implementation choice: load the whole log, or extend the arc
   query with task-correlated events.
 
-Store — EventSource, devchat/filestore
+Store — EventSource, devchat/pkg/filestore
 - R8  `GetEventsForArc` finds an arc by its opening event — the earliest
   event correlated to the arc ID whose kind is opening (`USER_MESSAGE`,
   or a task event whose payload carries `AsMessage`), not only
   `USER_MESSAGE`. The cutoff rule is unchanged: everything up to and
   including the opening event, plus everything correlated to the arc.
 
-Registry — pkg/agent/tasks.go
+Registry — agent/pkg/agent/tasks.go
 - R9  `TaskDefinition` gains, per named notification class: the
   `LLMVisibility` declaration (`None` | `AsMessage` | `InResult`) and the
   coalescing group window — asks and results are always `AsMessage` and
@@ -234,7 +234,7 @@ Registry — pkg/agent/tasks.go
   folded as `InResult`. The agent config holds the global overrides for
   N and the limit.
 
-Ingress — pkg/agent/reports.go
+Ingress — agent/pkg/agent/reports.go
 - R10 `TaskReports.Report` names the session and the task ID — `TaskRef`
   loses `ArcRef` and `Name` and is `{SessionID, ID}`; the origin arc and
   the kind are read from the task table — and validates the report by
@@ -251,9 +251,9 @@ Ingress — pkg/agent/reports.go
   re-worked, and the caller does not retry when the arc's lease is held.
   Work items interleave in arrival order across arcs and users (D11); the
   per-arc lease still serializes the runs of one arc. The enqueue goes
-  through a minimal interface defined in pkg/agent —
+  through a minimal interface defined in agent/pkg/agent —
   `Enqueue(ctx, ArcRef, agentID)` — which redisinfra's WorkQueue
-  satisfies, so pkg/agent does not import redisinfra.
+  satisfies, so agent/pkg/agent does not import redisinfra.
 - R12 Coalescing lives in the controller: per task and notification class,
   at most one report per group window for `AsMessage` classes, using the
   window declared at registration (D5): the first notification of a
@@ -266,12 +266,12 @@ Ingress — pkg/agent/reports.go
   `AsMessage`-class notification is demoted per the overflow policy and
   opens no arc.
 
-Agent loop — pkg/agent/agent.go
+Agent loop — agent/pkg/agent/agent.go
 - R13 `deriveArcState` closes the arc when the last response requested no
   tool calls, whatever tasks are unfinished. `unreportedTaskNews` and the
   finished-sequence wait go. `closeArc` is unchanged.
 
-Guard and cancel — pkg/agent/cancellation.go, pkg/history
+Guard and cancel — agent/pkg/agent/cancellation.go, agent/pkg/history
 - R14 A task-addressed cancel (correlation ID = task ID, R2) is folded by
   `applyCancel`: the task is validated against the session table and
   settled — status `CANCELLED`, `FinishedAt`/`FinishedSeq` from the event,
@@ -291,7 +291,7 @@ Guard and cancel — pkg/agent/cancellation.go, pkg/history
   gains a method answering a task ID (filestore scans the log for the
   `CANCEL` correlated to that task ID); the arc lookup is unchanged.
 
-Projection — pkg/history/projection.go, docs/PROJECTION.md
+Projection — agent/pkg/history/projection.go, docs/PROJECTION.md
 - R16 Placement is decided from correlation and seq for every record, and
   the payload's `LLMVisibility` records the same decision explicitly (R6
   cross-checks the two). A task-correlated event appears in no arc's
@@ -307,7 +307,7 @@ Projection — pkg/history/projection.go, docs/PROJECTION.md
   The message carries the last N of them, or all of them at -1 (D9; N per
   R9, with a global override in the agent config).
 
-Rendering — pkg/history/chat.go, devchat
+Rendering — agent/pkg/history/chat.go, devchat
 - R19 `RenderChat` and devchat's transcript draw a session as a sequence of
   arcs; a task-triggered arc renders its `Content` as its opening bubble.
   `None` events render in the frontend only.
@@ -371,23 +371,23 @@ Acceptance criteria
 
 Tasks
 --------------------
-- T1  Events and payloads: R1, R2. pkg/events. Depends: none.
+- T1  Events and payloads: R1, R2. agent/pkg/events. Depends: none.
 - T2  Fold: session task table, arc-opening kind, correlation routing,
-  validation: R3–R7. pkg/history. Depends: T1.
-- T3  Store cutoff generalization: R8. devchat/filestore, pkg/agent
+  validation: R3–R7. agent/pkg/history. Depends: T1.
+- T3  Store cutoff generalization: R8. devchat/pkg/filestore, agent/pkg/agent
   (EventSource doc). Depends: T2.
-- T4  Registry declarations: R9. pkg/agent/tasks.go. Depends: none.
-- T5  Ingress write path and work handover: R10, R11. pkg/agent/reports.go.
+- T4  Registry declarations: R9. agent/pkg/agent/tasks.go. Depends: none.
+- T5  Ingress write path and work handover: R10, R11. agent/pkg/agent/reports.go.
   Depends: T2, T4.
-- T6  Coalescing in the controller: R12. pkg/agent plus the harness
+- T6  Coalescing in the controller: R12. agent/pkg/agent plus the harness
   controller. Depends: T4.
-- T7  Agent loop close rule: R13. pkg/agent/agent.go. Depends: T2.
-- T8  In-arc asks: D7. pkg/agent. Depends: T5, T7.
+- T7  Agent loop close rule: R13. agent/pkg/agent/agent.go. Depends: T2.
+- T8  In-arc asks: D7. agent/pkg/agent. Depends: T5, T7.
 - T9  Cancellation task axis: R14, R15, and the devchat command. Depends:
   T1, T2.
 - T10 Projection and rendering changes: R16–R19, PROJECTION.md amendments.
-  pkg/history, docs/PROJECTION.md. Depends: T2.
+  agent/pkg/history, docs/PROJECTION.md. Depends: T2.
 - T11 devchat harness: R20–R22. devchat. Depends: T5, T7.
-- T12 Tests for AC1–AC13 across pkg/events, pkg/history, pkg/agent,
+- T12 Tests for AC1–AC13 across agent/pkg/events, agent/pkg/history, agent/pkg/agent,
   devchat; proofread of the amended documents. Depends: T1–T11.
 

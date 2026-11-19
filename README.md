@@ -4,17 +4,32 @@ kube-agent
 This repository holds three modules, so the framework and its concrete
 implementations cannot grow into each other:
 
-    fillbrunn.ai/kube-agent             the framework (this module)
-    fillbrunn.ai/kube-agent/devchat     the terminal harness
-    fillbrunn.ai/kube-agent/redisinfra  Redis-backed lease, cancellation hub and work queue
+    fillbrunn.ai/kube-agent             the framework, in agent/
+    fillbrunn.ai/kube-agent/devchat     the terminal harness, in devchat/
+    fillbrunn.ai/kube-agent/redisinfra  Redis-backed lease, cancellation hub and work queue, in redisinfra/
+
+Each module lives in its own folder under the repository root and is laid out
+the way a Go project of its kind is laid out, and go.work ties the three into
+one workspace, so a change to the framework is built and tested against both
+other modules at once:
+
+    go.work               the workspace tying the three modules together
+    agent/                the framework module (path fillbrunn.ai/kube-agent)
+      pkg/                its packages; the module is a library
+    devchat/
+      cmd/devchat/        the harness binary
+      internal/harness/   the harness itself, unreachable from other modules
+      pkg/filestore/      the file-backed event log
+    redisinfra/
+      pkg/redisinfra/     the Redis-backed lease, cancellation hub, work queue and log
 
 An event-sourced agent. The log is the source of truth: a conversation is a
 sequence of events, a `History` is the fold of them, and what the model sees is
 derived from that fold rather than kept alongside it.
 
-    pkg/events     the event types and their payloads
-    pkg/history    the fold, and the projection into a model transcript
-    pkg/agent      the agent loop, the tool registry, and the OpenAI client
+    agent/pkg/events     the event types and their payloads
+    agent/pkg/history    the fold, and the projection into a model transcript
+    agent/pkg/agent      the agent loop, the tool registry, and the OpenAI client
 
 Two documents specify the transitions between the log and a provider's request,
 and the code follows them rather than the other way round:
@@ -39,12 +54,12 @@ guarded and reaches a run in this process, but nothing further.
 Development harness
 --------------------
 `devchat` is a separate module in this repository, so the agent framework and
-its UI cannot grow into each other. `devchat` and `devchat/filestore` exist to
-exercise the agent by hand. Neither is part of the product.
+its UI cannot grow into each other. `devchat` and `devchat/pkg/filestore` exist
+to exercise the agent by hand. Neither is part of the product.
 
     export OPENAI_API_KEY=...
     cd devchat
-    go run .
+    go run ./cmd/devchat
 
 A full-screen terminal interface, built on Bubble Tea. Type a message; the
 agent runs until it is your turn again, with the reply appearing as it is
@@ -79,7 +94,7 @@ something you can read with `cat` and a failure something you can replay:
 `-store` takes any path if you want a session somewhere else; the directory is
 created if it is not there.
 
-`devchat/filestore` lives in the harness's module, out of the framework's
+`devchat/pkg/filestore` lives in the harness's module, out of the framework's
 reach, on purpose. It reads the whole log for every query, never compacts, and
 assumes a single writer. It is a way to
 run the agent without standing anything up, not the first draft of a real

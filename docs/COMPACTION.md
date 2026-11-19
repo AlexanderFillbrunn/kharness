@@ -801,24 +801,24 @@ can carry it; otherwise it is user text.
 
 What would have to change
 --------------------
-`pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
+`agent/pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
 — `COMPACTED` carrying the method that ran — and `ARC_SUSPENDED`, which
 carries no payload of its own; the codec gains their cases.
 
-`pkg/history` gains `LastCompaction` on `History`, the apply function that
+`agent/pkg/history` gains `LastCompaction` on `History`, the apply function that
 sets it by coverage rather than arrival, `CompactionDue`, and the derived
 suspension states: outstanding until a covering `COMPACTED` lands, released
 until a response follows the `ARC_SUSPENDED`, then resolved. The fold
 itself changes nothing else: it reads the whole log, as it does today.
 The missing-arc and nil-correlation checks are already in.
 
-`pkg/history/projection.go` emits the summary at the head of the transcript,
+`agent/pkg/history/projection.go` emits the summary at the head of the transcript,
 the note and the threshold test and the skeleton for a suspended arc — the
 `ARC_SUSPENDED` event being the trigger — and the invocation note
 synthesised from the task table for an unsettled task whose invoke is below
 the watermark. `Modes` gains nothing, because compaction has no mode.
 
-`pkg/agent` gains the `Compactor` interface with its three implementations,
+`agent/pkg/agent` gains the `Compactor` interface with its three implementations,
 the method and the two budgets on `AgentConfig` and with them the arc
 threshold the bound rule tests, the bound rule itself that computes the
 watermark from the open arcs — an arc's opening or its live boundary,
