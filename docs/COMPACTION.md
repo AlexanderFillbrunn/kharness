@@ -140,8 +140,9 @@ them permits; an arc that stays open without taking a turn holds the line
 for the others.
 
 The fit is measured with the estimate, when the compaction computes its
-watermark, against the arc's log as it stands then. An arc kept whole that outgrows the threshold
-afterwards is not re-cut by a compaction already in force: the arc renders
+watermark, against the arc's log as it stands then. An arc kept whole that
+outgrows the threshold afterwards is not re-cut by a compaction already in
+force: the arc renders
 whole against that line, and the next compaction, finding the arc over the
 threshold, draws its line at the arc's live boundary instead.
 
