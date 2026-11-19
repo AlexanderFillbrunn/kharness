@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -258,7 +258,7 @@ func cancelledTaskArc(t *testing.T, reason string) *logStore {
 func workerOver(t *testing.T, store *logStore, controller TaskController, options ...ArcWorkerOption) *ArcWorker {
 	t.Helper()
 	tasks := NewTaskRegistry()
-	if err := tasks.RegisterTask(&mcp.Tool{Name: "auditor"}, func(context.Context, TaskRef, any) error {
+	if err := tasks.RegisterTask(TaskMetadata{Name: "auditor"}, func(context.Context, TaskRef, any) error {
 		return nil
 	}); err != nil {
 		t.Fatalf("RegisterTask: %v", err)

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // The scenarios in projection-scenarios/ are the worked examples these tests
@@ -213,6 +213,10 @@ func shape(transcript *ModelTranscript) []string {
 		case ModelTextMessage:
 			if typed.MessageRole == ModelRoleInstruction {
 				out = append(out, "s{}")
+				continue
+			}
+			if typed.MessageRole == ModelRoleTask {
+				out = append(out, fmt.Sprintf("k(%s)", typed.Content))
 				continue
 			}
 			out = append(out, fmt.Sprintf("u(%s)", typed.Content))
@@ -642,8 +646,8 @@ func TestTaskNotificationsAreGovernedByTheirDeclaredClass(t *testing.T) {
 	// the arc it opened; the result is the opening message of its own arc.
 	wantShape(t, transcript,
 		"u(audit the cluster)", "a(started the audit)", "n{}",
-		"u(Task auditor with id a1.1 (emitted an event)\nfound 3 busy namespaces)", "n{}",
-		"u(Task auditor with id a1.1 (returned results)\nno findings)", "n{}",
+		"k(Task auditor with id a1.1 (emitted an event)\nfound 3 busy namespaces)", "n{}",
+		"k(Task auditor with id a1.1 (returned results)\nno findings)", "n{}",
 		"a(audit clean)", "u(thanks)")
 	for _, text := range allTexts(transcript) {
 		if strings.Contains(text, "scanned 40 namespaces") {
@@ -668,7 +672,10 @@ func TestAnAskOpensAnArcTheAnswerBelongsTo(t *testing.T) {
 		"u(upgrade the cluster)",
 		"a(starting)",
 		"n{}", "n{}",
-		"u(Task upgrader with id a1.1 (asks a question)\nwhich maintenance window?)", "n{}",
+		"k(Task upgrader with id a1.1 (asks a question)\n"+
+			"[background task, not the user — answer it with provide_task_input, "+
+			"or ask the user first and then call provide_task_input with their answer]\n"+
+			"which maintenance window?)", "n{}",
 		"u(status?)")
 
 	// Projecting the ask's own arc reads the answer too, at any cutoff,
@@ -1248,7 +1255,7 @@ func TestAResultOpensAnArcOfItsOwn(t *testing.T) {
 		"u(audit the cluster)",
 		"a(started the audit)",
 		"n{}", "n{}",
-		"u(Task auditor with id a1.1 (returned results)\n3 findings: 2 pods without limits, 1 single replica)", "n{}",
+		"k(Task auditor with id a1.1 (returned results)\n3 findings: 2 pods without limits, 1 single replica)", "n{}",
 		"u(thanks)")
 	for _, text := range noteTexts(transcript) {
 		if strings.Contains(text, "finished") {
@@ -1865,7 +1872,7 @@ func TestInResultEventsAreFoldedIntoTheResultMessage(t *testing.T) {
 		"u(audit the cluster)",
 		"a(started the audit)",
 		"n{}", "n{}",
-		"u(Task auditor with id a1.1 (returned results)\n3 findings\nchecked kube-system\nchecked ingress\nchecked data)", "n{}",
+		"k(Task auditor with id a1.1 (returned results)\n3 findings\nchecked kube-system\nchecked ingress\nchecked data)", "n{}",
 		"u(thanks)")
 
 	// The last N at N=2.

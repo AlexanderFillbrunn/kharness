@@ -23,6 +23,11 @@ const (
 	// ModelRoleInstruction is a system or developer prompt rather than
 	// anything a participant said.
 	ModelRoleInstruction ModelMessageRole = "INSTRUCTION"
+	// ModelRoleTask marks the opening message of an arc a background task
+	// opened. It is not the user speaking. Which role carries it to a
+	// provider is the encoder's decision, so the projection leaves it in a
+	// role of its own, like a note. See ENCODING.md.
+	ModelRoleTask ModelMessageRole = "TASK"
 	// ModelRoleTool is the result of a tool call, fed back to the model as its
 	// own message.
 	ModelRoleTool ModelMessageRole = "TOOL"
@@ -40,10 +45,11 @@ type ModelMessage interface {
 	modelMessage()
 }
 
-// ModelTextMessage is plain text from the user or an instruction given to the
-// model. MessageRole says which, so the two share a type.
+// ModelTextMessage is plain text from the user, an instruction given to the
+// model, or the opening of a task-opened arc. MessageRole says which, so the
+// three share a type.
 type ModelTextMessage struct {
-	MessageRole ModelMessageRole // user, system, or developer
+	MessageRole ModelMessageRole // user, instruction, or task
 	Content     string
 }
 
@@ -436,9 +442,15 @@ func planArc(arc *Arc, modes Modes, isTarget bool) arcPlan {
 	return plan
 }
 
-// keepArc emits an arc's own records.
+// keepArc emits an arc's own records. An arc a task opened carries the TASK
+// role rather than USER: the task is not the user, and a provider with an
+// operator role can carry the opening as one.
 func (p *projector) keepArc(arc *Arc) {
-	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: ModelRoleUser, Content: p.history.OpeningContent(arc)})
+	role := ModelRoleUser
+	if arc.OpenedByTask != "" {
+		role = ModelRoleTask
+	}
+	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: role, Content: p.history.OpeningContent(arc)})
 
 	// An arc that was cancelled or died is not coming back, which changes what
 	// an unanswered call under it means: not "no result yet" but "no result,

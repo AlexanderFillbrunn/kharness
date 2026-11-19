@@ -264,8 +264,8 @@ What this touched
                                 ref; Acquire takes a context and can fail
     agent/pkg/agent/cancellation.go   CancelSource takes ArcRef; the cache is gone
     agent/pkg/agent/tasks.go          TaskRef embeds ArcRef
-    agent/pkg/agent/reports.go        Report routes by ArcRef
-    devchat/pkg/filestore          both queries take ArcRef and scope by session
+    ingress/pkg/ingress/reports.go        Report routes by ArcRef
+    devchat/internal/filestore          both queries take ArcRef and scope by session
     devchat                 one sink per stream, wired into the persistor
                                 and the worker rather than into the agent
 

@@ -20,13 +20,13 @@ Current state
 --------------------
 - An arc is opened only by `USER_MESSAGE`: `applyUserMessage`
   (agent/pkg/history/history.go). The store's cutoff, `GetEventsForArc`
-  (devchat/pkg/filestore/store.go), finds an arc by scanning for a
+  (devchat/internal/filestore/store.go), finds an arc by scanning for a
   `USER_MESSAGE` with the arc's correlation ID.
 - A task is nested in its origin arc: `Arc.AsyncTasks`, keyed by the invoke
   event's ID, with `AsyncTask.CorrelationID` naming the origin arc. Every
   task event carries the task ID in its payload as `CausationID`, and the
   event itself is correlated to the arc (`reportEvent`,
-  agent/pkg/agent/reports.go). Notifications are one undifferentiated class: the
+  ingress/pkg/ingress/reports.go). Notifications are one undifferentiated class: the
   payload is an opaque `any`, and no task event carries an LLMVisibility
   field.
 - A running task holds its arc open: `deriveArcState` (agent/pkg/agent/agent.go)
@@ -143,7 +143,7 @@ Desired state
   notification, the ask's message for an ask-opened arc, and for a
   result-opened arc the task's result as returned in
   `AsyncTaskResultPayload.Result`, not summarized (the payload struct does
-  carry the result, agent/pkg/events/payloads.go). Events declared `InResult`
+  carry the result, proto/pkg/events/payloads.go). Events declared `InResult`
   are folded into the final result message of the result-opened arc,
   rendered from the task table at render time; they are not projected as
   their own messages. How much of the trail that message carries is
@@ -171,7 +171,7 @@ Desired state
 
 Requirements
 --------------------
-Events — agent/pkg/events
+Events — proto/pkg/events
 - R1  `AsyncTaskInvokePayload` gains `Actor users.Actor`. Task event
   payloads keep naming the task: the `CausationID` field already holds the
   invoke event's ID, which is the task ID. The task-emitted payloads —
@@ -216,15 +216,16 @@ Fold — agent/pkg/history
   transcript. Implementation choice: load the whole log, or extend the arc
   query with task-correlated events.
 
-Store — EventSource, devchat/pkg/filestore
+Store — EventSource, devchat/internal/filestore
 - R8  `GetEventsForArc` finds an arc by its opening event — the earliest
   event correlated to the arc ID whose kind is opening (`USER_MESSAGE`,
   or a task event whose payload carries `AsMessage`), not only
   `USER_MESSAGE`. The cutoff rule is unchanged: everything up to and
   including the opening event, plus everything correlated to the arc.
 
-Registry — agent/pkg/agent/tasks.go
-- R9  `TaskDefinition` gains, per named notification class: the
+Registry — proto/pkg/common/taskdef.go, agent/pkg/agent/tasks.go
+- R9  The task declaration — `TaskMetadata` in common, plain data shared
+  with the ingress — gains, per named notification class: the
   `LLMVisibility` declaration (`None` | `AsMessage` | `InResult`) and the
   coalescing group window — asks and results are always `AsMessage` and
   are never coalesced. The kind also declares the `InResult` trail length
@@ -232,9 +233,12 @@ Registry — agent/pkg/agent/tasks.go
   event limit (maximum arc-opening notification events per task, D12) and
   the overflow policy for events past the limit — ignored (`None`) or
   folded as `InResult`. The agent config holds the global overrides for
-  N and the limit.
+  N and the limit. The declaration carries no provider types: the
+  model-facing tool is generated from the metadata by the agent
+  (`toolFor`), and the starter is registered on the agent's side, since it
+  is process-bound.
 
-Ingress — agent/pkg/agent/reports.go
+Ingress — ingress/pkg/ingress/reports.go
 - R10 `TaskReports.Report` names the session and the task ID — `TaskRef`
   loses `ArcRef` and `Name` and is `{SessionID, ID}`; the origin arc and
   the kind are read from the task table — and validates the report by
@@ -371,13 +375,14 @@ Acceptance criteria
 
 Tasks
 --------------------
-- T1  Events and payloads: R1, R2. agent/pkg/events. Depends: none.
+- T1  Events and payloads: R1, R2. proto/pkg/events. Depends: none.
 - T2  Fold: session task table, arc-opening kind, correlation routing,
   validation: R3–R7. agent/pkg/history. Depends: T1.
-- T3  Store cutoff generalization: R8. devchat/pkg/filestore, agent/pkg/agent
+- T3  Store cutoff generalization: R8. devchat/internal/filestore, agent/pkg/agent
   (EventSource doc). Depends: T2.
-- T4  Registry declarations: R9. agent/pkg/agent/tasks.go. Depends: none.
-- T5  Ingress write path and work handover: R10, R11. agent/pkg/agent/reports.go.
+- T4  Registry declarations: R9. proto/pkg/common/taskdef.go (metadata),
+  agent/pkg/agent/tasks.go (starter, model-facing tool). Depends: none.
+- T5  Ingress write path and work handover: R10, R11. ingress/pkg/ingress/reports.go.
   Depends: T2, T4.
 - T6  Coalescing in the controller: R12. agent/pkg/agent plus the harness
   controller. Depends: T4.
@@ -388,6 +393,6 @@ Tasks
 - T10 Projection and rendering changes: R16–R19, PROJECTION.md amendments.
   agent/pkg/history, docs/PROJECTION.md. Depends: T2.
 - T11 devchat harness: R20–R22. devchat. Depends: T5, T7.
-- T12 Tests for AC1–AC13 across agent/pkg/events, agent/pkg/history, agent/pkg/agent,
+- T12 Tests for AC1–AC13 across proto/pkg/events, agent/pkg/history, agent/pkg/agent,
   devchat; proofread of the amended documents. Depends: T1–T11.
 

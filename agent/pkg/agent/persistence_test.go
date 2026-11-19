@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // Nothing in the chain invents a session. A writer that did not name one has a

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // A narrow terminal is the case that breaks a layout, because a style given a

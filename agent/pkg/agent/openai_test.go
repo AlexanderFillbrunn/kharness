@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -263,5 +263,101 @@ func TestEncodePairsCallsUnderVendorIDs(t *testing.T) {
 	result := captured.Messages[2]
 	if result.Role != openAIRoleTool || result.ToolCallID != "call_abc" {
 		t.Errorf("result message = %+v, want a tool message keyed by call_abc", result)
+	}
+}
+
+// taskAskHistory returns a history whose last arc was opened by a task's ask,
+// so a request against it carries the ask's opening message.
+func taskAskHistory(t *testing.T) *history.History {
+	t.Helper()
+	arc := testArcID
+	askArc := "arc-ask"
+	actor := users.Actor{UserID: "alice", TenantID: "acme"}
+	at := time.Unix(0, 0)
+	h, err := history.Replay(testSessionID, []events.Event{
+		{
+			SessionID: testSessionID, ID: arc, Seq: 0, Timestamp: at,
+			Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor},
+		},
+		{
+			SessionID: testSessionID, ID: "task-1", Seq: 1, Timestamp: at,
+			Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor},
+		},
+		{
+			SessionID: testSessionID, ID: "ask-1", Seq: 2, Timestamp: at,
+			Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
+			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage},
+		},
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	return h
+}
+
+// taskOpening returns the message that carries the ask arc's opening content.
+func taskOpening(captured *openAIRequest) *openAIMessage {
+	for i := range captured.Messages {
+		m := &captured.Messages[i]
+		if m.Content != nil && strings.Contains(*m.Content, "asks a question") {
+			return m
+		}
+	}
+	return nil
+}
+
+// A task-opened arc's opening message is not the user speaking, so a provider
+// with an operator role can carry it as one. By default it goes out as user,
+// which every provider accepts.
+func TestEncodeCarriesATaskArcUnderTheConfiguredRole(t *testing.T) {
+	body := `{"id":"chatcmpl-3","model":"gpt-5","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`
+	h := taskAskHistory(t)
+
+	var captured openAIRequest
+	captureServer := newTestServer(t, body, &captured)
+	def := NewOpenAI("test-key", "gpt-5", WithBaseURL(captureServer.URL))
+	if _, err := def.Response(context.Background(), h, &LLMOptions{}); err != nil {
+		t.Fatalf("default Response: %v", err)
+	}
+	opening := taskOpening(&captured)
+	if opening == nil {
+		t.Fatalf("no message carries the ask's opening content in %+v", captured.Messages)
+	}
+	if opening.Role != openAIRoleUser {
+		t.Errorf("default task arc role = %q, want user", opening.Role)
+	}
+	if !strings.Contains(*opening.Content, "[background task, not the user") {
+		t.Errorf("task arc content = %q, want the background-task header", *opening.Content)
+	}
+
+	captured = openAIRequest{}
+	captureServer = newTestServer(t, body, &captured)
+	dev := NewOpenAI("test-key", "gpt-5", WithBaseURL(captureServer.URL), WithTaskRole(openAIRoleDeveloper))
+	if _, err := dev.Response(context.Background(), h, &LLMOptions{}); err != nil {
+		t.Fatalf("developer Response: %v", err)
+	}
+	opening = taskOpening(&captured)
+	if opening == nil {
+		t.Fatalf("no message carries the ask's opening content in %+v", captured.Messages)
+	}
+	if opening.Role != openAIRoleDeveloper {
+		t.Errorf("configured task arc role = %q, want developer", opening.Role)
+	}
+}
+
+// A role the API does not define is refused at configuration time, not as a
+// 400 on the first request.
+func TestSetTaskRoleRefusesAnUnknownRole(t *testing.T) {
+	llm := NewOpenAI("test-key", "gpt-5")
+	if err := llm.SetTaskRole("bogus"); err == nil {
+		t.Error("SetTaskRole accepted a role OpenAI does not define")
+	}
+	if err := llm.SetTaskRole(openAIRoleDeveloper); err != nil {
+		t.Fatalf("SetTaskRole: %v", err)
+	}
+	if llm.taskRole != openAIRoleDeveloper {
+		t.Errorf("taskRole = %q, want developer", llm.taskRole)
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // newRedis starts an in-process Redis and returns a client on it, so that no

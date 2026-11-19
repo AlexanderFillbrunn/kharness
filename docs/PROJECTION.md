@@ -44,7 +44,7 @@ Output
 `ModelTranscript` is a slice of `ModelMessage`, in send order. Four shapes,
 defined in `agent/pkg/history/projection.go`.
 
-    ModelTextMessage        text with a role, USER or INSTRUCTION
+    ModelTextMessage        text with a role, USER, INSTRUCTION or TASK
     ModelAssistantMessage   the model's text, plus the calls it requested
     ModelToolMessage        one call's outcome, keyed by tool call ID
     ModelNoteMessage        synthesized status, carrying no role
@@ -155,6 +155,9 @@ Role is the letter. Provenance is the bracket.
     {…}     synthesized by the projector
 
     u(U1)       ModelTextMessage, USER. The user's own words.
+    k(U3)       ModelTextMessage, TASK. The opening of an arc a background task
+                opened; it is not the user speaking. Which wire role carries it
+                is the encoder's decision, like a note's.
     a(R1.1)     ModelAssistantMessage. The model's own words.
     t(T1.1.1)   A call, carried by the assistant message that requested it.
     r(T1.1.1)   ModelToolMessage. The outcome of that call.
@@ -347,8 +350,18 @@ declaration, and the correlation follows it:
                  question | returned results)` — followed by the event's own
                  content, the notification's payload for a notification, the
                  ask's message for an ask, and for a result the task's result
-                 as returned, not summarized. That arc is a work item of its
-                 own, and the model works it like any other arc.
+                 as returned, not summarized. An ask carries one more line
+                 between the note and its message, a header that says the
+                 question comes from a background task and not from the user,
+                 and that it may be answered directly through the input tool or
+                 put to the user first: `[background task, not the user —
+                 answer it with provide_task_input, or ask the user first and
+                 then call provide_task_input with their answer]`. The header
+                 is what keeps the model from reading the question as the
+                 user's own words. That arc is a work item of its own, and the
+                 model works it like any other arc. The opening message of any
+                 task-opened arc carries the TASK role, not USER; which wire
+                 role it is sent under is left to the encoder.
     IN_RESULT    the event stays correlated to the task and is folded into the
                  final result message of the result-opened arc, gathered from
                  the task table at render time. The message carries the last N
@@ -622,12 +635,18 @@ or after the last result in it.
 
 Left to the encoder
 --------------------
-Two questions about a projected transcript are answered per provider, in
+Three questions about a projected transcript are answered per provider, in
 [ENCODING.md](ENCODING.md).
 
 *Note rendering.* `n{…}` carries no role. Anthropic and OpenAI have an operator
 role that can carry a note at a position. Mistral and Gemini do not, so a note
 is user text there.
+
+*Task-arc rendering.* `k(…)` carries the TASK role. It is carried as `user`
+text by default, which every provider accepts; a provider with an operator
+role may carry it as that instead, configured per agent definition
+(`task_role`, e.g. `developer` on OpenAI). The content's own header names the
+provenance either way, so the role is a convenience, not the only signal.
 
 *Role alternation.* Interleaved arcs can put two user messages in a row.
 Anthropic combines them, OpenAI accepts them, Mistral and Gemini reject them.

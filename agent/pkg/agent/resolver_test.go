@@ -12,7 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 )
 
 // A work item that cannot say who works the arc is refused before anything is
@@ -244,5 +244,74 @@ func TestFileResolverRefusesAnUnknownModelSource(t *testing.T) {
 	resolver := NewFileResolver(path, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming a model source nothing holds resolved")
+	}
+}
+
+// roleLLM is a named model that can also carry a task role, the way an
+// encoder-backed client can.
+type roleLLM struct {
+	namedLLM
+	role string
+}
+
+func (l *roleLLM) SetTaskRole(role string) error {
+	if role != "user" && role != "developer" && role != "system" {
+		return fmt.Errorf("unknown role %q", role)
+	}
+	l.role = role
+	return nil
+}
+
+// A definition's task_role travels to the model client that can carry it, so
+// a task-opened arc reaches the model under the named role. A client without
+// the setter, or a role nobody defines, is a settings error rather than a
+// silent fallback to user.
+func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
+	roleModels := map[string]ModelFactory{
+		"test": func(ref ModelRef) (LLM, error) {
+			return &roleLLM{namedLLM: namedLLM{name: ref.Name}}, nil
+		},
+	}
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "agents.json")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+		return path
+	}
+
+	path := write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
+	resolver := NewFileResolver(path, nil, roleModels)
+	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if role := agent.llm.(*roleLLM).role; role != "developer" {
+		t.Errorf("task role = %q, want developer", role)
+	}
+
+	// No task_role: the client keeps its default.
+	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"}}`)
+	resolver = NewFileResolver(path, nil, roleModels)
+	if agent, err = resolver.ResolveAgent(context.Background(), testAgentID); err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if role := agent.llm.(*roleLLM).role; role != "" {
+		t.Errorf("task role = %q, want unset without task_role in the file", role)
+	}
+
+	// A role the client refuses is a settings error.
+	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"bogus"}`)
+	resolver = NewFileResolver(path, nil, roleModels)
+	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
+		t.Error("an unknown task_role resolved")
+	}
+
+	// A client that cannot carry a task role at all is a settings error too.
+	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
+	resolver = NewFileResolver(path, nil, scriptedModels)
+	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
+		t.Error("task_role against a model without a setter resolved")
 	}
 }

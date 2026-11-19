@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -47,7 +47,7 @@ func (c *fakeController) ProvideInput(_ context.Context, ref TaskRef, requestID,
 func taskRegistryWith(t *testing.T, name string, start Starter) *TaskRegistry {
 	t.Helper()
 	registry := NewTaskRegistry()
-	if err := registry.RegisterTask(&mcp.Tool{Name: name}, start); err != nil {
+	if err := registry.RegisterTask(TaskMetadata{Name: name}, start); err != nil {
 		t.Fatalf("register task: %v", err)
 	}
 	return registry
@@ -67,13 +67,13 @@ func toolNames(tools []*mcp.Tool) []string {
 func TestARegistryOffersOneToolPerTaskPlusTwo(t *testing.T) {
 	registry := NewTaskRegistry()
 	for _, name := range []string{"auditor", "migrator"} {
-		if err := registry.RegisterTask(&mcp.Tool{Name: name}, func(context.Context, TaskRef, any) error { return nil }); err != nil {
+		if err := registry.RegisterTask(TaskMetadata{Name: name}, func(context.Context, TaskRef, any) error { return nil }); err != nil {
 			t.Fatalf("register task: %v", err)
 		}
 	}
 
 	want := []string{"auditor", "migrator", CancelTaskTool, ProvideTaskInputTool}
-	if got := toolNames(registry.All()); !slices.Equal(got, want) {
+	if got := toolNames(taskToolSet{registry}.All()); !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)
 	}
 }
@@ -81,24 +81,24 @@ func TestARegistryOffersOneToolPerTaskPlusTwo(t *testing.T) {
 // With nothing to start there is nothing to stop or answer, so an empty
 // registry costs the model no tools at all.
 func TestAnEmptyRegistryOffersNothing(t *testing.T) {
-	if tools := NewTaskRegistry().All(); len(tools) != 0 {
+	if tools := (taskToolSet{NewTaskRegistry()}).All(); len(tools) != 0 {
 		t.Errorf("tools = %v, want none", toolNames(tools))
 	}
-	if tools := (*TaskRegistry)(nil).All(); len(tools) != 0 {
+	if tools := (taskToolSet{(*TaskRegistry)(nil)}).All(); len(tools) != 0 {
 		t.Errorf("nil registry tools = %v, want none", toolNames(tools))
 	}
 }
 
 func TestATaskCannotTakeTheNameOfTheToolsThatAddressTasks(t *testing.T) {
 	registry := NewTaskRegistry()
-	err := registry.RegisterTask(&mcp.Tool{Name: CancelTaskTool}, func(context.Context, TaskRef, any) error { return nil })
+	err := registry.RegisterTask(TaskMetadata{Name: CancelTaskTool}, func(context.Context, TaskRef, any) error { return nil })
 	if err == nil {
 		t.Fatal("a task was registered under the name of the tool that cancels tasks")
 	}
 }
 
 func TestATaskNeedsAWayToStart(t *testing.T) {
-	if err := NewTaskRegistry().RegisterTask(&mcp.Tool{Name: "auditor"}, nil); err == nil {
+	if err := NewTaskRegistry().RegisterTask(TaskMetadata{Name: "auditor"}, nil); err == nil {
 		t.Fatal("a task with no starter was registered")
 	}
 }
@@ -135,7 +135,7 @@ func TestTheModelIsOfferedToolsAndTasksTogether(t *testing.T) {
 	}
 
 	want := []string{"list_pods", "auditor", CancelTaskTool, ProvideTaskInputTool}
-	if got := toolNames(CombineTools(agent.tools, agent.tasks).All()); !slices.Equal(got, want) {
+	if got := toolNames(CombineTools(agent.tools, taskToolSet{agent.tasks}).All()); !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)
 	}
 }
@@ -149,10 +149,10 @@ func TestAnAgentWithoutTasksIsUnchanged(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if got := toolNames(CombineTools(agent.tools, agent.tasks).All()); !slices.Equal(got, []string{"list_pods"}) {
+	if got := toolNames(CombineTools(agent.tools, taskToolSet{agent.tasks}).All()); !slices.Equal(got, []string{"list_pods"}) {
 		t.Errorf("tools = %v, want the one registered tool", got)
 	}
-	if agent.tasks.classify(CancelTaskTool) != opTool {
+	if classify(agent.tasks, CancelTaskTool) != opTool {
 		t.Error("a name that addresses tasks routed somewhere with no tasks to address")
 	}
 }
@@ -166,7 +166,7 @@ func TestClassifyNamesTheOperation(t *testing.T) {
 		ProvideTaskInputTool: opProvideInput,
 		"list_pods":          opTool,
 	} {
-		if got := tasks.classify(name); got != want {
+		if got := classify(tasks, name); got != want {
 			t.Errorf("classify(%s) = %v, want %v", name, got, want)
 		}
 	}
@@ -294,6 +294,22 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	// task or stop it later.
 	if text := resultText(t, lastCallIn(t, h, testArcID)); !strings.Contains(text, task.ID) {
 		t.Errorf("result = %q, want it to carry the task id", text)
+	}
+}
+
+// The start result tells the model both ways to answer a task's question:
+// directly through the input tool, or by putting the question to the user
+// first and then passing the answer on.
+func TestTheStartResultOffersBothWaysToAnswerAnAsk(t *testing.T) {
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	h := userArcHistory(t)
+	runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
+
+	text := resultText(t, lastCallIn(t, h, testArcID))
+	for _, want := range []string{"put the question to the user first", ProvideTaskInputTool, CancelTaskTool} {
+		if !strings.Contains(text, want) {
+			t.Errorf("start result = %q, want it to mention %q", text, want)
+		}
 	}
 }
 

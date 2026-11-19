@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 )
 
 const (
@@ -42,6 +42,11 @@ type OpenAI struct {
 	// noteRole carries synthesized notes. OpenAI offers `developer` and
 	// `system`; compatible endpoints frequently reject `developer`.
 	noteRole string
+
+	// taskRole carries the opening message of a task-opened arc, which is not
+	// the user speaking. `user` by default, which every provider accepts;
+	// `developer` or `system` where the provider has an operator role.
+	taskRole string
 }
 
 // OpenAIOption configures an OpenAI client.
@@ -70,6 +75,41 @@ func WithSystemNoteRole() OpenAIOption {
 	return func(o *OpenAI) { o.noteRole = openAIRoleSystem }
 }
 
+// WithTaskRole carries the opening message of a task-opened arc under the
+// named role rather than `user`, for providers with an operator role such as
+// `developer`. The role must be one OpenAI accepts: user, developer or
+// system; anything else is a programming error and panics here rather than a
+// 400 at request time.
+func WithTaskRole(role string) OpenAIOption {
+	return func(o *OpenAI) {
+		if err := validateOpenAIRole(role); err != nil {
+			panic(err)
+		}
+		o.taskRole = role
+	}
+}
+
+// SetTaskRole sets the role a task-opened arc's opening message is carried
+// under, for a definition that names one. It is WithTaskRole as a method, so
+// a resolver can apply a settings file to a client it did not build.
+func (o *OpenAI) SetTaskRole(role string) error {
+	if err := validateOpenAIRole(role); err != nil {
+		return err
+	}
+	o.taskRole = role
+	return nil
+}
+
+// validateOpenAIRole accepts the roles the Chat Completions API defines for
+// messages in the array.
+func validateOpenAIRole(role string) error {
+	switch role {
+	case openAIRoleUser, openAIRoleDeveloper, openAIRoleSystem:
+		return nil
+	}
+	return fmt.Errorf("not an OpenAI message role: %q", role)
+}
+
 // NewOpenAI returns a client for one model.
 func NewOpenAI(apiKey, model string, opts ...OpenAIOption) *OpenAI {
 	llm := &OpenAI{
@@ -79,6 +119,7 @@ func NewOpenAI(apiKey, model string, opts ...OpenAIOption) *OpenAI {
 		client:   http.DefaultClient,
 		modes:    history.DefaultModes(),
 		noteRole: openAIRoleDeveloper,
+		taskRole: openAIRoleUser,
 	}
 	for _, opt := range opts {
 		opt(llm)
@@ -186,7 +227,7 @@ func (o *OpenAI) buildRequest(h *history.History, arcID string, opts *LLMOptions
 		return nil, fmt.Errorf("project arc %s: %w", arcID, err)
 	}
 
-	enc := encoder{vendorIDs: vendorToolCallIDs(h), noteRole: o.noteRole}
+	enc := encoder{vendorIDs: vendorToolCallIDs(h), noteRole: o.noteRole, taskRole: o.taskRole}
 	messages, err := enc.encodeTranscript(transcript, opts.SystemPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("encode transcript of arc %s: %w", arcID, err)

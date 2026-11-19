@@ -76,6 +76,19 @@ type AgentSettings struct {
 	SystemPrompt string    `json:"system_prompt"`
 	Model        ModelRef  `json:"model"`
 	Tools        []ToolRef `json:"tools"`
+
+	// TaskRole names the provider role the opening message of a task-opened
+	// arc is carried as — "developer" where the model has an operator role,
+	// so a background task's question does not arrive looking like the user
+	// speaking. Empty means "user", the default. The model source must be
+	// able to carry it; one that cannot is a settings error, not a fallback.
+	TaskRole string `json:"task_role,omitempty"`
+}
+
+// TaskRoleSetter is implemented by an LLM client whose encoder can carry a
+// task-opened arc under a chosen provider role.
+type TaskRoleSetter interface {
+	SetTaskRole(role string) error
 }
 
 // ModelFactory builds the client that asks one source's models. A process
@@ -157,6 +170,15 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 	llm, err := factory(settings.Model)
 	if err != nil {
 		return nil, err
+	}
+	if settings.TaskRole != "" {
+		setter, ok := llm.(TaskRoleSetter)
+		if !ok {
+			return nil, fmt.Errorf("model source %s cannot carry task messages under a %q role", settings.Model.Source, settings.TaskRole)
+		}
+		if err := setter.SetTaskRole(settings.TaskRole); err != nil {
+			return nil, fmt.Errorf("task_role %q: %w", settings.TaskRole, err)
+		}
 	}
 	return NewAgent(&AgentConfig{SystemPrompt: settings.SystemPrompt}, tools, llm, f.options...)
 }

@@ -23,7 +23,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // leaseKey names the key one arc's lease lives under. The session and the arc

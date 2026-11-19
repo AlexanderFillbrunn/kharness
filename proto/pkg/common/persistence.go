@@ -1,4 +1,4 @@
-package agent
+package common
 
 import (
 	"context"
@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 type Sink[E any] interface {
@@ -45,14 +46,87 @@ type EventSource interface {
 	// written, which is what the task table and the report validation are
 	// built from.
 	GetEventsForSession(ctx context.Context, sessionID string) ([]*events.Event, error)
+
+	// TaskState reads what the log says about one task — whether the session
+	// holds it, its kind and actor, and whether it has settled — with a
+	// targeted scan rather than a fold of the whole session. It is the
+	// admission check for task-emitted writes.
+	TaskState(ctx context.Context, sessionID, taskID string) (*TaskState, error)
 }
 
-// WorkEnqueuer is the sliver of the work queue the report path needs: after an
-// opening event is persisted, the new arc becomes a work item in the same
-// queue user arcs are served from. Work items interleave in arrival order
-// across arcs and users; the per-arc lease serializes the runs of one arc.
-type WorkEnqueuer interface {
-	Enqueue(ctx context.Context, ref ArcRef, agentID string) error
+// TaskState is what the log says about one async task, read without folding
+// the session.
+type TaskState struct {
+	// Exists reports whether the session holds a task with this ID, i.e. an
+	// invoke event under it.
+	Exists bool
+
+	// TaskName is the kind the task was invoked as.
+	TaskName string
+
+	// Actor is the one the invoke recorded; nil where none was.
+	Actor *users.Actor
+
+	// Settled reports whether the task has a result or a task-addressed
+	// cancel, after which nothing more may be reported about it.
+	Settled bool
+
+	// Status is the task's lifecycle state, meaningful once Exists is set.
+	Status events.TaskStatus
+}
+
+// TaskStateOf reads what a log says about one task of one session. Stores
+// implement EventSource.TaskState as their read plus this, so the scan lives
+// in one place. The log must be in write order.
+func TaskStateOf(sessionID, taskID string, log []*events.Event) *TaskState {
+	state := &TaskState{Status: events.TaskStatusPending}
+	for _, ev := range log {
+		if ev.SessionID != sessionID {
+			continue
+		}
+		switch ev.Typ {
+		case events.AsyncTaskInvokeEventType:
+			if ev.ID != taskID {
+				continue
+			}
+			state.Exists = true
+			if payload, ok := ev.Payload.(events.AsyncTaskInvokePayload); ok {
+				state.TaskName = payload.TaskName
+				if payload.Actor.UserID != "" {
+					actor := payload.Actor
+					state.Actor = &actor
+				}
+			}
+			if state.Actor == nil && ev.Actor.UserID != "" {
+				actor := ev.Actor
+				state.Actor = &actor
+			}
+		case events.AsyncTaskResultEventType:
+			if payload, ok := ev.Payload.(events.AsyncTaskResultPayload); ok && payload.CausationID == taskID {
+				state.Settled = true
+				state.Status = statusOfOutcome(payload.Outcome)
+			}
+		case events.CancelEventType:
+			if ev.CorrelationID != nil && *ev.CorrelationID == taskID {
+				state.Settled = true
+				state.Status = events.TaskStatusCancelled
+			}
+		}
+	}
+	return state
+}
+
+// statusOfOutcome maps a reported outcome to the task status the fold derives
+// from the same payload.
+func statusOfOutcome(outcome events.AsyncTaskOutcome) events.TaskStatus {
+	switch outcome {
+	case events.AsyncTaskOutcomeFailed:
+		return events.TaskStatusFailed
+	case events.AsyncTaskOutcomeCancelled:
+		return events.TaskStatusCancelled
+	default:
+		return events.TaskStatusSuccess
+	}
 }
 
 // EventSink is told about events once they have been written. It is the

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 )
 
 // This file is the OpenAI half of the encoding step ENCODING.md specifies: it
@@ -70,6 +70,11 @@ type encoder struct {
 	// noteRole is where a note is carried. Every note in one request uses the
 	// same role, so the role is a stable signal of provenance.
 	noteRole string
+
+	// taskRole is where the opening message of a task-opened arc is carried.
+	// The task is not the user, so a provider with an operator role can take
+	// it as one. Empty means user, which every provider accepts.
+	taskRole string
 }
 
 // encodeTranscript renders a transcript as the messages of one request. The
@@ -97,8 +102,13 @@ func (e encoder) encodeMessage(message history.ModelMessage) ([]openAIMessage, e
 	switch m := message.(type) {
 	case history.ModelTextMessage:
 		role := openAIRoleUser
-		if m.Role() == history.ModelRoleInstruction {
+		switch m.Role() {
+		case history.ModelRoleInstruction:
 			role = openAIRoleSystem
+		case history.ModelRoleTask:
+			if e.taskRole != "" {
+				role = e.taskRole
+			}
 		}
 		return []openAIMessage{textMessage(role, m.Content)}, nil
 

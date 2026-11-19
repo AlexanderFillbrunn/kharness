@@ -9,7 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // result is what a fake worker reports for one run.

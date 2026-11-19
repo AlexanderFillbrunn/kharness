@@ -13,8 +13,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // Messages carrying a run into the interface. A run happens on its own

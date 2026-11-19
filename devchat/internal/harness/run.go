@@ -13,9 +13,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"fillbrunn.ai/kube-agent/devchat/pkg/filestore"
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // localAgentID names the one agent this harness runs. The resolver ignores
@@ -24,7 +25,9 @@ import (
 const localAgentID = "local"
 
 const defaultSystemPrompt = `You are a Kubernetes operations assistant with read and restart tools.
-Use them rather than guessing, and say plainly when a tool tells you something you did not expect.`
+Use them rather than guessing, and say plainly when a tool tells you something you did not expect.
+
+Some work runs as background tasks. Each message a task sends arrives as a turn of its own with a "[background task, not the user]" header — the header, not the message role, is what marks it as coming from a task. When a background task asks a question, you may answer it yourself with provide_task_input, or put the question to the user first and then call provide_task_input with their answer. Do not ask the user about a question that has already been answered.`
 
 // Run drives one devchat session: it opens the log, wires the agent to the
 // terminal and blocks until the interface leaves. The flags the command
@@ -132,7 +135,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// The inbound half. A task calls this rather than writing to the log, which
 	// is the path a job somewhere else would have to take, so the harness
 	// exercises it rather than going around it.
-	reports, err := agent.NewTaskReports(persistor, store, tasks, enqueuer)
+	reports, err := ingress.NewTaskReports(persistor, store, tasks, enqueuer)
 	if err != nil {
 		return err
 	}
@@ -150,7 +153,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// The only runner here is this process, so a task in that log is one an
 	// earlier process died on. Left alone it would hold its arc open for
 	// ever.
-	settled, err := agent.SettleAbandonedTasks(context.Background(), agent.AsAgent(localAgentID, persistor), recorded)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), agent.AsAgent(localAgentID, persistor), recorded)
 	if err != nil {
 		return err
 	}
@@ -205,6 +208,7 @@ func writeDefaultSettings(path string) error {
 	settings := agent.AgentSettings{
 		SystemPrompt: defaultSystemPrompt,
 		Model:        agent.ModelRef{Source: "openai", Name: "gpt-5"},
+		TaskRole:     "developer",
 		Tools: []agent.ToolRef{
 			{Source: "local", Name: "list_pods"},
 			{Source: "local", Name: "wait"},

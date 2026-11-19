@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 )
 
 // RawToken is a token emitted from the LLM during streaming.

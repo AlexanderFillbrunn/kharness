@@ -1,4 +1,4 @@
-package agent
+package ingress_test
 
 import (
 	"context"
@@ -7,25 +7,24 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // coalesceRegistry declares one task kind with an AsMessage class coalesced in
 // a short window, a None class and an InResult class, so a test can watch the
 // windows close without waiting.
-func coalesceRegistry(t *testing.T, window time.Duration, options ...TaskOption) *TaskRegistry {
+func coalesceRegistry(t *testing.T, window time.Duration, options ...common.TaskOption) *common.TaskRegistry {
 	t.Helper()
-	registry := NewTaskRegistry()
-	classes := map[string]NotificationClass{
+	registry := common.NewTaskRegistry()
+	classes := map[string]common.NotificationClass{
 		"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: window},
 		"detail":   {Visibility: events.LLMVisibilityNone},
 		"fold":     {Visibility: events.LLMVisibilityInResult},
 	}
-	options = append([]TaskOption{WithNotificationClasses(classes)}, options...)
-	err := registry.RegisterTask(&mcp.Tool{Name: "auditor"}, func(context.Context, TaskRef, any) error {
-		return nil
-	}, options...)
+	options = append([]common.TaskOption{common.WithNotificationClasses(classes)}, options...)
+	err := registry.RegisterTask(common.TaskMetadata{Name: "auditor"}, options...)
 	if err != nil {
 		t.Fatalf("RegisterTask: %v", err)
 	}
@@ -64,10 +63,10 @@ func waitFor(condition func() bool) bool {
 // may happen on its timer goroutine.
 type reportLog struct {
 	mu    sync.Mutex
-	filed []TaskReport
+	filed []ingress.TaskReport
 }
 
-func (l *reportLog) file(r TaskReport) {
+func (l *reportLog) file(r ingress.TaskReport) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.filed = append(l.filed, r)
@@ -79,7 +78,7 @@ func (l *reportLog) count() int {
 	return len(l.filed)
 }
 
-func (l *reportLog) last() TaskReport {
+func (l *reportLog) last() ingress.TaskReport {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.filed[len(l.filed)-1]
@@ -95,24 +94,24 @@ func TestCoalescingMergesOneClassPerWindow(t *testing.T) {
 	registry := coalesceRegistry(t, window)
 	store := runningTaskStore(t)
 	enqueuer := &recordingEnqueuer{}
-	reports, err := NewTaskReports(store, store, registry, enqueuer)
+	reports, err := ingress.NewTaskReports(store, store, registry, enqueuer)
 	if err != nil {
-		t.Fatalf("NewTaskReports: %v", err)
+		t.Fatalf("ingress.NewTaskReports: %v", err)
 	}
-	coalescer := NewCoalescer()
+	coalescer := ingress.NewCoalescer()
 	def, ok := registry.Get("auditor")
 	if !ok {
 		t.Fatal("auditor is not registered")
 	}
-	file := func(r TaskReport) {
+	file := func(r ingress.TaskReport) {
 		if err := reports.Report(context.Background(), taskRef(), testAgentID, r); err != nil {
 			t.Errorf("Report: %v", err)
 		}
 	}
 
 	for i := range 3 {
-		coalescer.Offer(taskRef(), def, TaskReport{
-			Kind: TaskReportNotification, Class: "progress", Message: fmt.Sprintf("step %d done", i),
+		coalescer.Offer(taskRef(), def, ingress.TaskReport{
+			Kind: ingress.TaskReportNotification, Class: "progress", Message: fmt.Sprintf("step %d done", i),
 		}, file)
 	}
 	// The window is still open, so nothing of the class has been logged yet.
@@ -121,8 +120,8 @@ func TestCoalescingMergesOneClassPerWindow(t *testing.T) {
 	}
 
 	// None and InResult classes flow as they are.
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "detail", Message: "noise"}, file)
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "fold", Message: "for the result"}, file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "detail", Message: "noise"}, file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "fold", Message: "for the result"}, file)
 	if got := len(taskEvents(t, store)); got != 2 {
 		t.Fatalf("%d notification events logged, want the two that flow as they are", got)
 	}
@@ -172,12 +171,12 @@ func TestCoalescingMergesOneClassPerWindow(t *testing.T) {
 	}
 
 	// An ask and a result are always written whole, never coalesced.
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
 		t.Fatalf("Report(ask): %v", err)
 	}
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Outcome: events.AsyncTaskOutcomeSuccess, Result: "3 findings"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportCompleted, Outcome: events.AsyncTaskOutcomeSuccess, Result: "3 findings"}); err != nil {
 		t.Fatalf("Report(result): %v", err)
 	}
 	all, err := store.GetEventsForSession(context.Background(), testSessionID)
@@ -212,22 +211,22 @@ func TestCoalescingMergesOneClassPerWindow(t *testing.T) {
 // results are always written whole and are not demoted.
 func TestPastTheEventLimitNotificationsAreDemoted(t *testing.T) {
 	const window = 40 * time.Millisecond
-	registry := coalesceRegistry(t, window, WithEventLimit(2), WithOverflowPolicy(OverflowFold))
+	registry := coalesceRegistry(t, window, common.WithEventLimit(2), common.WithOverflowPolicy(common.OverflowFold))
 	store := runningTaskStore(t)
 	enqueuer := &recordingEnqueuer{}
-	reports, err := NewTaskReports(store, store, registry, enqueuer)
+	reports, err := ingress.NewTaskReports(store, store, registry, enqueuer)
 	if err != nil {
-		t.Fatalf("NewTaskReports: %v", err)
+		t.Fatalf("ingress.NewTaskReports: %v", err)
 	}
-	coalescer := NewCoalescer()
+	coalescer := ingress.NewCoalescer()
 	def, _ := registry.Get("auditor")
-	file := func(r TaskReport) {
+	file := func(r ingress.TaskReport) {
 		if err := reports.Report(context.Background(), taskRef(), testAgentID, r); err != nil {
 			t.Errorf("Report: %v", err)
 		}
 	}
-	progress := func(msg string) TaskReport {
-		return TaskReport{Kind: TaskReportNotification, Class: "progress", Message: msg}
+	progress := func(msg string) ingress.TaskReport {
+		return ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "progress", Message: msg}
 	}
 
 	// Two windows flush, each admitting one arc-opening event: the limit of
@@ -264,15 +263,15 @@ func TestPastTheEventLimitNotificationsAreDemoted(t *testing.T) {
 	}
 
 	// An ask and a result past the limit are still written whole.
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
 		t.Fatalf("Report(ask): %v", err)
 	}
 	if refs := enqueuer.refs(); len(refs) != 3 {
 		t.Errorf("the ask was demoted: enqueued %d arcs, want three", len(refs))
 	}
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Outcome: events.AsyncTaskOutcomeSuccess, Result: "done"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportCompleted, Outcome: events.AsyncTaskOutcomeSuccess, Result: "done"}); err != nil {
 		t.Fatalf("Report(result): %v", err)
 	}
 	if refs := enqueuer.refs(); len(refs) != 4 {
@@ -284,16 +283,16 @@ func TestPastTheEventLimitNotificationsAreDemoted(t *testing.T) {
 // demoted to None, not folded.
 func TestTheDefaultOverflowPolicyIgnores(t *testing.T) {
 	const window = 40 * time.Millisecond
-	registry := coalesceRegistry(t, window, WithEventLimit(1))
+	registry := coalesceRegistry(t, window, common.WithEventLimit(1))
 	def, _ := registry.Get("auditor")
-	coalescer := NewCoalescer()
+	coalescer := ingress.NewCoalescer()
 	log := &reportLog{}
 
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "progress", Message: "one"}, log.file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "progress", Message: "one"}, log.file)
 	if !waitFor(func() bool { return log.count() == 1 }) {
 		t.Fatal("the first window never flushed")
 	}
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "progress", Message: "two"}, log.file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "progress", Message: "two"}, log.file)
 	if log.count() != 2 {
 		t.Fatalf("filed %d reports, want the demoted second one immediately", log.count())
 	}
@@ -305,16 +304,16 @@ func TestTheDefaultOverflowPolicyIgnores(t *testing.T) {
 // The global override in the agent config wins over the kind's declared limit.
 func TestTheGlobalEventLimitOverrideWins(t *testing.T) {
 	const window = 40 * time.Millisecond
-	registry := coalesceRegistry(t, window, WithEventLimit(5))
+	registry := coalesceRegistry(t, window, common.WithEventLimit(5))
 	def, _ := registry.Get("auditor")
-	coalescer := NewCoalescer(WithEventLimitOverride(1))
+	coalescer := ingress.NewCoalescer(ingress.WithEventLimitOverride(1))
 	log := &reportLog{}
 
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "progress", Message: "one"}, log.file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "progress", Message: "one"}, log.file)
 	if !waitFor(func() bool { return log.count() == 1 }) {
 		t.Fatal("the first window never flushed")
 	}
-	coalescer.Offer(taskRef(), def, TaskReport{Kind: TaskReportNotification, Class: "progress", Message: "two"}, log.file)
+	coalescer.Offer(taskRef(), def, ingress.TaskReport{Kind: ingress.TaskReportNotification, Class: "progress", Message: "two"}, log.file)
 	if log.count() != 2 || log.last().Visibility != events.LLMVisibilityNone {
 		t.Fatalf("filed %d reports, last visibility %s, want the second demoted to NONE by the override of 1", log.count(), log.last().Visibility)
 	}

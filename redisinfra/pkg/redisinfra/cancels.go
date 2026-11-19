@@ -9,7 +9,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 )
 
 // unsubscribeTimeout bounds the one Redis call a watcher's stop makes, so
@@ -19,7 +20,7 @@ const unsubscribeTimeout = 5 * time.Second
 // cancelChannel names the pub/sub channel one arc's cancellation is announced
 // on. A watcher subscribes to exactly its arc's channel, so an announcement
 // for one arc reaches nobody watching another.
-func cancelChannel(ref agent.ArcRef) string {
+func cancelChannel(ref common.ArcRef) string {
 	return "kube-agent:cancel:" + ref.SessionID + ":" + ref.ArcID
 }
 
@@ -40,13 +41,13 @@ type RedisCancels struct {
 	// connection serves every watcher in the process, since a process with
 	// several arcs under way should not hold a connection per arc.
 	mu       sync.Mutex
-	watchers map[agent.ArcRef]map[chan struct{}]struct{}
+	watchers map[common.ArcRef]map[chan struct{}]struct{}
 	pubsub   *redis.PubSub
 }
 
 // NewRedisCancels builds a cancellation hub over a Redis client.
 func NewRedisCancels(client *redis.Client) *RedisCancels {
-	return &RedisCancels{client: client, watchers: map[agent.ArcRef]map[chan struct{}]struct{}{}}
+	return &RedisCancels{client: client, watchers: map[common.ArcRef]map[chan struct{}]struct{}{}}
 }
 
 var _ agent.CancelNotifier = (*RedisCancels)(nil)
@@ -58,7 +59,7 @@ var _ agent.CancelWatcher = (*RedisCancels)(nil)
 // is in the log, and the guard stops the run at its next step whatever
 // happens to the announcement. A watcher that never receives it costs time
 // and money, never correctness.
-func (c *RedisCancels) NotifyCancel(ctx context.Context, ref agent.ArcRef) error {
+func (c *RedisCancels) NotifyCancel(ctx context.Context, ref common.ArcRef) error {
 	payload, err := json.Marshal(ref)
 	if err != nil {
 		return fmt.Errorf("could not announce the cancel of arc %s: %w", ref, err)
@@ -77,7 +78,7 @@ func (c *RedisCancels) NotifyCancel(ctx context.Context, ref agent.ArcRef) error
 // CancelWatcher contract already names. Stopping after a cancel does
 // nothing, and a channel is never closed twice, since a notified arc's
 // watchers are removed when they are closed.
-func (c *RedisCancels) Watch(ctx context.Context, ref agent.ArcRef) (<-chan struct{}, func()) {
+func (c *RedisCancels) Watch(ctx context.Context, ref common.ArcRef) (<-chan struct{}, func()) {
 	cancelled := make(chan struct{})
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -94,7 +95,7 @@ func (c *RedisCancels) Watch(ctx context.Context, ref agent.ArcRef) (<-chan stru
 // subscribe adds the arc's channel to the shared subscription, connecting
 // once for the whole process and starting the loop that fans messages out
 // to the watchers.
-func (c *RedisCancels) subscribe(ctx context.Context, ref agent.ArcRef) error {
+func (c *RedisCancels) subscribe(ctx context.Context, ref common.ArcRef) error {
 	if c.pubsub == nil {
 		c.pubsub = c.client.Subscribe(ctx, cancelChannel(ref))
 		go c.dispatch()
@@ -110,7 +111,7 @@ func (c *RedisCancels) subscribe(ctx context.Context, ref agent.ArcRef) error {
 // same reason, the runs have to go on.
 func (c *RedisCancels) dispatch() {
 	for msg := range c.pubsub.Channel() {
-		var ref agent.ArcRef
+		var ref common.ArcRef
 		if json.Unmarshal([]byte(msg.Payload), &ref) != nil {
 			continue
 		}
@@ -125,7 +126,7 @@ func (c *RedisCancels) dispatch() {
 
 // unwatch removes a watcher, and drops the arc's subscription when it was
 // the last watcher on the arc.
-func (c *RedisCancels) unwatch(ref agent.ArcRef, cancelled chan struct{}) {
+func (c *RedisCancels) unwatch(ref common.ArcRef, cancelled chan struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	watching, ok := c.watchers[ref]

@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
@@ -57,9 +57,11 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 	// The ask and the result each opened an arc of their own, with content
 	// composed from the task and the event's own payload.
 	askArc, resultArc := history.Arcs[1], history.Arcs[2]
-	if askArc.ID != "ask-arc-1" || askArc.OpenedByTask != "task-1" ||
-		askArc.Content != "Task researcher with id task-1 (asks a question)\nWhich cluster?" {
-		t.Errorf("ask arc = %#v, want the note naming the task followed by the question", askArc)
+	wantAsk := "Task researcher with id task-1 (asks a question)\n" +
+		"[background task, not the user — answer it with provide_task_input, " +
+		"or ask the user first and then call provide_task_input with their answer]\nWhich cluster?"
+	if askArc.ID != "ask-arc-1" || askArc.OpenedByTask != "task-1" || askArc.Content != wantAsk {
+		t.Errorf("ask arc = %#v, want the note naming the task, the background-task header, and the question", askArc)
 	}
 	if resultArc.ID != "result-arc-1" || resultArc.OpenedByTask != "task-1" ||
 		resultArc.Content != "Task researcher with id task-1 (returned results)\nhealthy" {

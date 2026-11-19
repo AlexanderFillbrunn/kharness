@@ -7,11 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/devchat/pkg/filestore"
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // scriptLLM answers with a canned reply per turn. The order is the order the
@@ -38,7 +39,7 @@ func (l *scriptLLM) Response(ctx context.Context, h *history.History, opts *agen
 type harness struct {
 	store   *filestore.Store
 	session *session
-	reports *agent.TaskReports
+	reports *ingress.TaskReports
 	runner  *localTasks
 	llm     *scriptLLM
 }
@@ -76,7 +77,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	reports, err := agent.NewTaskReports(persistor, store, tasks, workEnqueuer{worker})
+	reports, err := ingress.NewTaskReports(persistor, store, tasks, workEnqueuer{worker})
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
@@ -189,8 +190,10 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 	if status := folded.Arcs[0].Status(); status != history.ArcStatusDone {
 		t.Fatalf("arc is %s, want it closed while its task runs on", status)
 	}
-	if task := firstTask(folded); task == nil || task.Status != history.AsyncTaskPending {
-		t.Fatalf("task = %+v, want the one started task still pending", firstTask(folded))
+	// The task may already have stopped to ask — the fake audit pauses only
+	// milliseconds here — so anything unfinished proves it outlived the arc.
+	if task := firstTask(folded); task == nil || task.FinishedSeq != nil {
+		t.Fatalf("task = %+v, want the one started task unfinished", firstTask(folded))
 	}
 
 	// The task asks a question. The ask is AsMessage, so it opens an arc of its
@@ -405,7 +408,7 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	settled, err := agent.SettleAbandonedTasks(ctx, agent.AsAgent(localAgentID, h.session.persistor), folded)
+	settled, err := ingress.SettleAbandonedTasks(ctx, agent.AsAgent(localAgentID, h.session.persistor), folded)
 	if err != nil {
 		t.Fatalf("SettleAbandonedTasks: %v", err)
 	}

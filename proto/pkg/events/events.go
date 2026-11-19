@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 type EventType string
@@ -28,6 +28,16 @@ const (
 	GuardrailBlockedEventType        EventType = "GUARDRAIL_BLOCKED"
 	CancelEventType                  EventType = "CANCEL"
 	ArcClosedEventType               EventType = "ARC_CLOSED"
+)
+
+// The names of the two tools every task-carrying agent offers to the model,
+// which address a task already running rather than start one. They are part
+// of the protocol vocabulary — the name of the input tool appears in
+// log-derived text the model reads — so they live here where every package
+// that writes or reads the log can share them.
+const (
+	CancelTaskToolName       = "cancel_task"
+	ProvideTaskInputToolName = "provide_task_input"
 )
 
 type EventPayload interface {

@@ -1,4 +1,4 @@
-package agent
+package ingress_test
 
 import (
 	"context"
@@ -8,10 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // logStore is a persistor that is also readable, which is what the inbound
@@ -60,7 +62,7 @@ func (s *logStore) GetEventsForSession(_ context.Context, sessionID string) ([]*
 // GetEventsForArc applies the projection's cutoff the way the real store does:
 // everything up to the arc's own opening event, plus everything correlated to
 // it or to a task afterwards.
-func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Event, error) {
+func (s *logStore) GetEventsForArc(_ context.Context, ref common.ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -86,7 +88,7 @@ func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Eve
 	return selected, nil
 }
 
-func (s *logStore) Cancelled(_ context.Context, ref ArcRef) (*events.Event, error) {
+func (s *logStore) Cancelled(_ context.Context, ref common.ArcRef) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, ev := range s.events {
@@ -108,6 +110,13 @@ func (s *logStore) CancelledTask(_ context.Context, _, taskID string) (*events.E
 	return nil, nil
 }
 
+// common.TaskState scans the in-memory log, the way a store scans its file.
+func (s *logStore) TaskState(_ context.Context, sessionID, taskID string) (*common.TaskState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return common.TaskStateOf(sessionID, taskID, s.events), nil
+}
+
 func (s *logStore) types() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -118,11 +127,11 @@ func (s *logStore) types() string {
 // them, and works them through the worker when the test wants that.
 type recordingEnqueuer struct {
 	mu       sync.Mutex
-	enqueued []ArcRef
-	work     func(ctx context.Context, ref ArcRef, agentID string)
+	enqueued []common.ArcRef
+	work     func(ctx context.Context, ref common.ArcRef, agentID string)
 }
 
-func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref ArcRef, agentID string) error {
+func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
 	e.mu.Lock()
 	e.enqueued = append(e.enqueued, ref)
 	work := e.work
@@ -133,23 +142,22 @@ func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref ArcRef, agentID str
 	return nil
 }
 
-func (e *recordingEnqueuer) refs() []ArcRef {
+func (e *recordingEnqueuer) refs() []common.ArcRef {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return append([]ArcRef(nil), e.enqueued...)
+	return append([]common.ArcRef(nil), e.enqueued...)
 }
 
 // taskRegistry declares the one kind of task the fixtures run, with a
 // coalescible AsMessage class and a None class.
-func taskRegistry(t *testing.T) *TaskRegistry {
+func taskRegistry(t *testing.T) *common.TaskRegistry {
 	t.Helper()
-	registry := NewTaskRegistry()
-	err := registry.RegisterTask(&mcp.Tool{Name: "auditor"}, func(context.Context, TaskRef, any) error {
-		return nil
-	}, WithNotificationClasses(map[string]NotificationClass{
-		"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: time.Hour},
-		"detail":   {Visibility: events.LLMVisibilityNone},
-	}))
+	registry := common.NewTaskRegistry()
+	err := registry.RegisterTask(common.TaskMetadata{Name: "auditor"},
+		common.WithNotificationClasses(map[string]common.NotificationClass{
+			"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: time.Hour},
+			"detail":   {Visibility: events.LLMVisibilityNone},
+		}))
 	if err != nil {
 		t.Fatalf("RegisterTask: %v", err)
 	}
@@ -184,31 +192,31 @@ func runningTaskStore(t *testing.T) *logStore {
 // reportsFor builds the ingress over the store, with an enqueuer that works
 // whatever it is handed through the worker, so a report's arc is served the
 // way the queue would serve it.
-func reportsFor(t *testing.T, store *logStore, enqueuer *recordingEnqueuer, replies ...*LLMResponse) *TaskReports {
+func reportsFor(t *testing.T, store *logStore, enqueuer *recordingEnqueuer, replies ...*agent.LLMResponse) *ingress.TaskReports {
 	t.Helper()
 	if enqueuer == nil {
 		enqueuer = &recordingEnqueuer{}
 	}
-	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: replies})
+	ag, err := agent.NewAgent(nil, nil, &fakeLLM{replies: replies})
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("agent.NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil)
+	worker, err := agent.NewArcWorker(store, store, agent.NewFixedResolver(ag), nil)
 	if err != nil {
-		t.Fatalf("NewArcWorker: %v", err)
+		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
-	enqueuer.work = func(ctx context.Context, ref ArcRef, agentID string) {
+	enqueuer.work = func(ctx context.Context, ref common.ArcRef, agentID string) {
 		_, _ = worker.Work(ctx, ref, agentID)
 	}
-	reports, err := NewTaskReports(store, store, taskRegistry(t), enqueuer)
+	reports, err := ingress.NewTaskReports(store, store, taskRegistry(t), enqueuer)
 	if err != nil {
-		t.Fatalf("NewTaskReports: %v", err)
+		t.Fatalf("ingress.NewTaskReports: %v", err)
 	}
 	return reports
 }
 
-func taskRef() TaskRef {
-	return TaskRef{SessionID: testSessionID, ID: "task-1"}
+func taskRef() common.TaskRef {
+	return common.TaskRef{SessionID: testSessionID, ID: "task-1"}
 }
 
 // AC2: a completion reported after the origin arc closed is persisted with a
@@ -217,10 +225,10 @@ func taskRef() TaskRef {
 func TestACompletionIsRecordedAndOpensANewArc(t *testing.T) {
 	store := runningTaskStore(t)
 	enqueuer := &recordingEnqueuer{}
-	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "the audit found 3 things"})
+	reports := reportsFor(t, store, enqueuer, &agent.LLMResponse{ModelID: "gpt-5", Content: "the audit found 3 things"})
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
@@ -262,10 +270,10 @@ func TestACompletionIsRecordedAndOpensANewArc(t *testing.T) {
 func TestAnInputRequestOpensAnArcUnderTheNameTheTaskGaveIt(t *testing.T) {
 	store := runningTaskStore(t)
 	enqueuer := &recordingEnqueuer{}
-	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
+	reports := reportsFor(t, store, enqueuer, &agent.LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
@@ -301,8 +309,8 @@ func TestAnInputRequestWithoutARequestIDIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, nil)
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportInputRequested, Message: "which namespace?"}); err == nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportInputRequested, Message: "which namespace?"}); err == nil {
 		t.Fatal("an unnamed request was accepted")
 	}
 
@@ -320,8 +328,8 @@ func TestANoneNotificationIsRecordedAgainstTheTaskAndOpensNoArc(t *testing.T) {
 	enqueuer := &recordingEnqueuer{}
 	reports := reportsFor(t, store, enqueuer)
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportNotification, Class: "detail", Message: "scanned 40 namespaces"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "detail", Message: "scanned 40 namespaces"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
@@ -353,10 +361,10 @@ func TestANoneNotificationIsRecordedAgainstTheTaskAndOpensNoArc(t *testing.T) {
 func TestAnAsMessageNotificationOpensAnArc(t *testing.T) {
 	store := runningTaskStore(t)
 	enqueuer := &recordingEnqueuer{}
-	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "noted"})
+	reports := reportsFor(t, store, enqueuer, &agent.LLMResponse{ModelID: "gpt-5", Content: "noted"})
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportNotification, Class: "progress", Message: "3 namespaces look busy"}); err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "progress", Message: "3 namespaces look busy"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
@@ -385,8 +393,8 @@ func TestANotificationNamingAnUndeclaredClassIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, nil)
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportNotification, Class: "undeclared", Message: "news"}); err == nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "undeclared", Message: "news"}); err == nil {
 		t.Fatal("a notification of an undeclared class was accepted")
 	}
 
@@ -403,8 +411,8 @@ func TestAReportNamingAnUnknownTaskIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, nil)
 
-	err := reports.Report(context.Background(), TaskRef{SessionID: testSessionID, ID: "not-this-one"}, testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
+	err := reports.Report(context.Background(), common.TaskRef{SessionID: testSessionID, ID: "not-this-one"}, testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
 		t.Fatal("a report about a task the session does not hold was accepted")
 	}
@@ -418,7 +426,7 @@ func TestACompletionWithoutAnOutcomeIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, nil)
 
-	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{Kind: TaskReportCompleted, Result: "done"}); err == nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{Kind: ingress.TaskReportCompleted, Result: "done"}); err == nil {
 		t.Fatal("a completion with no outcome was accepted")
 	}
 }
@@ -436,8 +444,8 @@ func TestALateReportOnASettledTaskIsRefused(t *testing.T) {
 	}
 	reports := reportsFor(t, store, nil)
 
-	err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
+	err := reports.Report(context.Background(), taskRef(), testAgentID, ingress.TaskReport{
+		Kind: ingress.TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
 		t.Fatal("a report on a cancelled task was accepted")
 	}
@@ -448,9 +456,9 @@ func TestALateReportOnASettledTaskIsRefused(t *testing.T) {
 
 func TestALeaseIsReleased(t *testing.T) {
 	ctx := context.Background()
-	lease := NewLocalLease()
-	first := ArcRef{SessionID: testSessionID, ArcID: "arc-1"}
-	second := ArcRef{SessionID: testSessionID, ArcID: "arc-2"}
+	lease := agent.NewLocalLease()
+	first := common.ArcRef{SessionID: testSessionID, ArcID: "arc-1"}
+	second := common.ArcRef{SessionID: testSessionID, ArcID: "arc-2"}
 
 	release, ok, err := lease.Acquire(ctx, first)
 	if err != nil || !ok {
@@ -475,12 +483,12 @@ func TestALeaseIsReleased(t *testing.T) {
 // session on the first.
 func TestALeaseKeysOnTheSessionToo(t *testing.T) {
 	ctx := context.Background()
-	lease := NewLocalLease()
+	lease := agent.NewLocalLease()
 
-	if _, ok, err := lease.Acquire(ctx, ArcRef{SessionID: "one", ArcID: testArcID}); err != nil || !ok {
+	if _, ok, err := lease.Acquire(ctx, common.ArcRef{SessionID: "one", ArcID: testArcID}); err != nil || !ok {
 		t.Fatalf("a free arc could not be taken: held=%v err=%v", !ok, err)
 	}
-	if _, ok, err := lease.Acquire(ctx, ArcRef{SessionID: "two", ArcID: testArcID}); err != nil || !ok {
+	if _, ok, err := lease.Acquire(ctx, common.ArcRef{SessionID: "two", ArcID: testArcID}); err != nil || !ok {
 		t.Errorf("the same arc ID in another session was blocked: held=%v err=%v", !ok, err)
 	}
 }
@@ -489,22 +497,22 @@ func TestALeaseKeysOnTheSessionToo(t *testing.T) {
 // that read that as "nobody holds it" would run the arc twice.
 type refusingLease struct{ err error }
 
-func (l refusingLease) Acquire(context.Context, ArcRef) (func(), bool, error) {
+func (l refusingLease) Acquire(context.Context, common.ArcRef) (func(), bool, error) {
 	return nil, false, l.err
 }
 
 func TestAWorkerReportsALeaseItCouldNotReach(t *testing.T) {
 	store := runningTaskStore(t)
-	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	ag, err := agent.NewAgent(nil, nil, &fakeLLM{})
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("agent.NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), refusingLease{err: errors.New("no route to the lock service")})
+	worker, err := agent.NewArcWorker(store, store, agent.NewFixedResolver(ag), refusingLease{err: errors.New("no route to the lock service")})
 	if err != nil {
-		t.Fatalf("NewArcWorker: %v", err)
+		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
 
-	worked, err := worker.Work(context.Background(), testRef(), testAgentID)
+	worked, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: testArcID}, testAgentID)
 	if err == nil {
 		t.Fatal("an unreachable lease was reported as an arc somebody else held")
 	}
@@ -517,16 +525,16 @@ func TestAWorkerReportsALeaseItCouldNotReach(t *testing.T) {
 // another's name, and everything the run then wrote would be filed there.
 func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
 	store := runningTaskStore(t)
-	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	ag, err := agent.NewAgent(nil, nil, &fakeLLM{})
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("agent.NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil)
+	worker, err := agent.NewArcWorker(store, store, agent.NewFixedResolver(ag), nil)
 	if err != nil {
-		t.Fatalf("NewArcWorker: %v", err)
+		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
 
-	if _, err := worker.Work(context.Background(), ArcRef{SessionID: "somebody-else", ArcID: testArcID}, testAgentID); err == nil {
+	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: "somebody-else", ArcID: testArcID}, testAgentID); err == nil {
 		t.Error("an arc was worked under a session it is not in")
 	}
 }
@@ -541,9 +549,9 @@ func TestAbandonedTasksAreSettledAsUnknown(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	settled, err := SettleAbandonedTasks(context.Background(), store, h)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, h)
 	if err != nil {
-		t.Fatalf("SettleAbandonedTasks: %v", err)
+		t.Fatalf("ingress.SettleAbandonedTasks: %v", err)
 	}
 	if settled != 1 {
 		t.Fatalf("settled %d tasks, want the one that was running", settled)
@@ -585,9 +593,9 @@ func TestSettlingAbandonedTasksLeavesFinishedOnesAlone(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	settled, err := SettleAbandonedTasks(context.Background(), store, h)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, h)
 	if err != nil {
-		t.Fatalf("SettleAbandonedTasks: %v", err)
+		t.Fatalf("ingress.SettleAbandonedTasks: %v", err)
 	}
 	if settled != 0 {
 		t.Errorf("settled %d tasks, want none: it had already reported", settled)
@@ -610,8 +618,8 @@ func TestAReportNamingNoAgentIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, nil)
 
-	if err := reports.Report(context.Background(), taskRef(), "", TaskReport{
-		Kind: TaskReportNotification, Class: "detail", Message: "half through",
+	if err := reports.Report(context.Background(), taskRef(), "", ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "detail", Message: "half through",
 	}); err == nil {
 		t.Error("a report naming no agent was accepted")
 	}

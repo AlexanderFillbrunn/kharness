@@ -12,7 +12,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 )
 
 // DefaultStream, DefaultGroup and DefaultDeadStream name the Redis streams the
@@ -47,8 +47,8 @@ type WorkItem struct {
 }
 
 // ref names the arc the item wants a run of.
-func (i WorkItem) ref() agent.ArcRef {
-	return agent.ArcRef{SessionID: i.SessionID, ArcID: i.ArcID}
+func (i WorkItem) ref() common.ArcRef {
+	return common.ArcRef{SessionID: i.SessionID, ArcID: i.ArcID}
 }
 
 // ArcRunner is the shape of ArcWorker.Work, which the consumer calls on
@@ -56,7 +56,7 @@ func (i WorkItem) ref() agent.ArcRef {
 // worker without depending on how one is built, and so that a test can run
 // the queue against a worker that is not an agent.
 type ArcRunner interface {
-	Work(ctx context.Context, ref agent.ArcRef, agentID string) (worked bool, err error)
+	Work(ctx context.Context, ref common.ArcRef, agentID string) (worked bool, err error)
 }
 
 // WorkQueue is the queue that delivers the runs a write owes an arc. Every
@@ -67,7 +67,7 @@ type WorkQueue interface {
 	// Enqueue adds an item for the arc named to the queue. It is the sliver of
 	// the queue the framework's report path needs, so pkg/agent can hand over
 	// an arc it opened without importing this package.
-	Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error
+	Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error
 	// Consume claims items and runs the worker over them, until the
 	// context is cancelled or the queue cannot go on. It returns only
 	// when there is nothing left to consume with.
@@ -202,7 +202,7 @@ var _ WorkQueue = (*RedisWorkQueue)(nil)
 // could never be worked: ArcWorker.Work refuses an empty agent id, and an
 // item enqueued anyway would fail on every consumer until it exhausted its
 // attempts and arrived in the dead stream saying nothing beyond that.
-func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error {
+func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
 	if agentID == "" {
 		return fmt.Errorf("a work item for arc %s names no agent", ref)
 	}
@@ -217,9 +217,7 @@ func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref agent.ArcRef, agentID 
 }
 
 // redisinfra's queue satisfies the framework's sliver of it.
-var _ interface {
-	Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error
-} = (*RedisWorkQueue)(nil)
+var _ common.WorkEnqueuer = (*RedisWorkQueue)(nil)
 
 // Consume claims items and works them until the context is cancelled.
 //

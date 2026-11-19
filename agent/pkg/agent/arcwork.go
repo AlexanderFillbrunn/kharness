@@ -5,20 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 )
-
-// ArcRef names one arc well enough to find it from any process. An arc ID is
-// unique on its own, but nothing that stores, locks or routes by arc can be
-// partitioned by session without being told the session as well, and a worker
-// claiming arcs off a shared queue has no other way to learn it.
-type ArcRef struct {
-	SessionID string
-	ArcID     string
-}
-
-func (r ArcRef) String() string { return r.SessionID + "/" + r.ArcID }
 
 // StreamToken is one piece of a reply as the model writes it, addressed well
 // enough to route from another process.

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

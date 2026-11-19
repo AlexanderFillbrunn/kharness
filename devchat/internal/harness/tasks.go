@@ -6,9 +6,10 @@ import (
 	"sync"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // The task here is a goroutine standing in for work that runs somewhere else.
@@ -32,15 +33,15 @@ type localTasks struct {
 	// reports is how a task says what it is doing. It is set after
 	// construction because the ingress is built from an agent, and the agent
 	// is built from the registry these tasks are registered in.
-	reports *agent.TaskReports
+	reports *ingress.TaskReports
 
-	// defs holds the declaration of each running task's kind, keyed by task
+	// defs holds the metadata of each running task's kind, keyed by task
 	// ID, so the coalescer can resolve the class a notification names.
-	defs map[string]agent.TaskDefinition
+	defs map[string]common.TaskMetadata
 
 	// coalescer is this controller's buffer: notifications of each AsMessage
 	// class are coalesced per task, and past the kind's event limit demoted.
-	coalescer *agent.Coalescer
+	coalescer *ingress.Coalescer
 
 	// agentID names the agent that works the arc a report hands over. Devchat
 	// runs one agent and knows which, so it says so when the reports are
@@ -69,22 +70,24 @@ type localTask struct {
 func newLocalTasks() *localTasks {
 	return &localTasks{
 		running:   map[string]*localTask{},
-		defs:      map[string]agent.TaskDefinition{},
-		coalescer: agent.NewCoalescer(),
+		defs:      map[string]common.TaskMetadata{},
+		coalescer: ingress.NewCoalescer(),
 	}
 }
 
 // attach gives the tasks somewhere to report to, once there is one, and names
 // the agent their reports are worked under.
-func (l *localTasks) attach(reports *agent.TaskReports, agentID string, unfiled func(agent.TaskRef, error)) {
+func (l *localTasks) attach(reports *ingress.TaskReports, agentID string, unfiled func(agent.TaskRef, error)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.reports, l.agentID, l.unfiled = reports, agentID, unfiled
 }
 
-// register adds the canned tasks to a registry.
+// register adds the canned tasks to a registry. The declaration is plain
+// metadata — the agent generates the model-facing tool from it — and the
+// starter is the harness's own, since the task runs in this process.
 func (l *localTasks) register(registry *agent.TaskRegistry) error {
-	return registry.RegisterTask(&mcp.Tool{
+	return registry.RegisterTask(common.TaskMetadata{
 		Name: "audit_namespaces",
 		Description: "Audit every namespace for problems. This takes a while, runs on its own, " +
 			"and will ask which namespace to look at in detail.",
@@ -117,10 +120,10 @@ func (l *localTasks) start(_ context.Context, ref agent.TaskRef, args any, regis
 	ctx, cancel := context.WithCancel(context.Background())
 	task := &localTask{input: make(chan string, 1), cancel: cancel}
 
-	definition, _ := registry.Get("audit_namespaces")
+	metadata, _ := registry.Get("audit_namespaces")
 	l.mu.Lock()
 	l.running[ref.ID] = task
-	l.defs[ref.ID] = definition
+	l.defs[ref.ID] = metadata
 	l.mu.Unlock()
 
 	go l.audit(ctx, ref, task)
@@ -194,19 +197,19 @@ func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTa
 	if !l.pause(ctx, ref, "scanning namespaces") {
 		return
 	}
-	l.report(ref, agent.TaskReport{
-		Kind: agent.TaskReportNotification, Class: "progress",
+	l.report(ref, ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "progress",
 		Message: "scanned 41 namespaces, 3 look busy"})
-	l.report(ref, agent.TaskReport{
-		Kind: agent.TaskReportNotification, Class: "detail",
+	l.report(ref, ingress.TaskReport{
+		Kind: ingress.TaskReportNotification, Class: "detail",
 		Message: "audit log follows each namespace as it is checked"})
 
 	// The request is named and taken up before it is filed, because filing it
 	// opens the arc, and the answer can be back before report returns.
 	requestID := agent.NewEventID()
 	l.await(ref.ID, requestID)
-	l.report(ref, agent.TaskReport{
-		Kind: agent.TaskReportInputRequested, RequestID: requestID,
+	l.report(ref, ingress.TaskReport{
+		Kind: ingress.TaskReportInputRequested, RequestID: requestID,
 		Message: "which of kube-system, ingress or data should I look at in detail?"})
 
 	var chosen string
@@ -220,8 +223,8 @@ func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTa
 	if !l.pause(ctx, ref, "auditing "+chosen) {
 		return
 	}
-	l.report(ref, agent.TaskReport{
-		Kind:    agent.TaskReportCompleted,
+	l.report(ref, ingress.TaskReport{
+		Kind:    ingress.TaskReportCompleted,
 		Outcome: events.AsyncTaskOutcomeSuccess,
 		Result:  fmt.Sprintf("%s: 2 pods without resource limits, 1 deployment with a single replica", chosen),
 	})
@@ -240,8 +243,8 @@ func (l *localTasks) pause(ctx context.Context, ref agent.TaskRef, _ string) boo
 }
 
 func (l *localTasks) stopped(ref agent.TaskRef) {
-	l.report(ref, agent.TaskReport{
-		Kind:    agent.TaskReportCompleted,
+	l.report(ref, ingress.TaskReport{
+		Kind:    ingress.TaskReportCompleted,
 		Outcome: events.AsyncTaskOutcomeCancelled,
 		Result:  "stopped before the audit finished",
 	})
@@ -256,10 +259,10 @@ func (l *localTasks) stopped(ref agent.TaskRef) {
 // holds it for its class's group window and files one merged report when the
 // window closes; a report that cannot be filed at all is the exception, since
 // there is nothing to publish and nobody above a task to hand the failure to.
-func (l *localTasks) report(ref agent.TaskRef, report agent.TaskReport) {
+func (l *localTasks) report(ref agent.TaskRef, report ingress.TaskReport) {
 	l.mu.Lock()
 	reports, agentID, unfiled := l.reports, l.agentID, l.unfiled
-	definition, hasDef := l.defs[ref.ID]
+	metadata, hasDef := l.defs[ref.ID]
 	coalescer := l.coalescer
 	l.mu.Unlock()
 
@@ -267,14 +270,14 @@ func (l *localTasks) report(ref agent.TaskRef, report agent.TaskReport) {
 		return
 	}
 
-	file := func(r agent.TaskReport) {
+	file := func(r ingress.TaskReport) {
 		if err := reports.Report(context.Background(), ref, agentID, r); err != nil && unfiled != nil {
 			unfiled(ref, err)
 		}
 	}
 
-	if report.Kind == agent.TaskReportNotification && hasDef && coalescer != nil {
-		coalescer.Offer(ref, definition, report, file)
+	if report.Kind == ingress.TaskReportNotification && hasDef && coalescer != nil {
+		coalescer.Offer(ref, metadata, report, file)
 		return
 	}
 	file(report)

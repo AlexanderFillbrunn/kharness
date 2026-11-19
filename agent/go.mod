@@ -1,8 +1,13 @@
-module fillbrunn.ai/kube-agent
+module fillbrunn.ai/kube-agent/agent
+
+replace fillbrunn.ai/kube-agent/proto => ../proto
 
 go 1.27.1
 
-require github.com/modelcontextprotocol/go-sdk v1.8.0
+require (
+	fillbrunn.ai/kube-agent/proto v0.0.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+)
 
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect

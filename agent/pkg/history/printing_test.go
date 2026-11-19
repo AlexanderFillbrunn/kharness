@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {

@@ -1,7 +1,7 @@
 package events
 
 import (
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 type UserMessagePayload struct {
@@ -241,6 +241,28 @@ func (o AsyncTaskOutcome) Valid() bool {
 	}
 	return false
 }
+
+// TaskStatus is the lifecycle state of an asynchronous task. It is derivable
+// from the log alone — the outcome of the task's result, or a task-addressed
+// cancel — so the vocabulary lives here at the wire level, and the fold and
+// any store query derive it from the same events.
+type TaskStatus string
+
+const (
+	// TaskStatusPending is a task that is running.
+	TaskStatusPending TaskStatus = "PENDING"
+	// TaskStatusSuccess is a task that finished and returned a result.
+	TaskStatusSuccess TaskStatus = "SUCCESS"
+	// TaskStatusFailed is a task that finished and reported an error.
+	TaskStatusFailed TaskStatus = "FAILED"
+	// TaskStatusWaiting is a task that has stopped to ask for input and resumes
+	// once the input arrives.
+	TaskStatusWaiting TaskStatus = "WAITING"
+	// TaskStatusCancelled is a task a runner reported it had stopped.
+	// Cancelling an arc does not set it: the cancel ends the waiting, and what
+	// became of the task is the runner's to report.
+	TaskStatusCancelled TaskStatus = "CANCELLED"
+)
 
 // AsyncTaskResultPayload settles a task. Outcome is a value rather than an
 // error flag, because work that was called off is not work that failed.

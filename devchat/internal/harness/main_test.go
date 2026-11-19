@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"fillbrunn.ai/kube-agent/devchat/pkg/filestore"
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // stubModel serves one scripted stream per request, so a turn can be driven

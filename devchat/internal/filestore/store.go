@@ -24,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // Store is an append-only log of JSON events, one per line.
@@ -201,7 +201,7 @@ func (s *Store) GetEventsForSession(_ context.Context, sessionID string) ([]*eve
 //
 // A file holds one session, so the session in the ref only ever rules events
 // out here. A store that held more than one would partition on it.
-func (s *Store) GetEventsForArc(_ context.Context, ref agent.ArcRef) ([]*events.Event, error) {
+func (s *Store) GetEventsForArc(_ context.Context, ref common.ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -242,7 +242,7 @@ func (s *Store) GetEventsForArc(_ context.Context, ref agent.ArcRef) ([]*events.
 
 // Cancelled returns the cancel recorded against an arc, or nil where there is
 // none. It scans the log, which is what everything here does.
-func (s *Store) Cancelled(_ context.Context, ref agent.ArcRef) (*events.Event, error) {
+func (s *Store) Cancelled(_ context.Context, ref common.ArcRef) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -277,6 +277,20 @@ func (s *Store) CancelledTask(_ context.Context, sessionID, taskID string) (*eve
 	return nil, nil
 }
 
+// TaskState reads what the log says about one task with a scan of the file,
+// the way every other query here works. The scan itself lives in the agent
+// package, so every store answers alike.
+func (s *Store) TaskState(_ context.Context, sessionID, taskID string) (*common.TaskState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	all, err := pointers(readFile(s.path))
+	if err != nil {
+		return nil, err
+	}
+	return common.TaskStateOf(sessionID, taskID, all), nil
+}
+
 func correlatesTo(ev *events.Event, arcID string) bool {
 	return ev.CorrelationID != nil && *ev.CorrelationID == arcID
 }
@@ -284,7 +298,7 @@ func correlatesTo(ev *events.Event, arcID string) bool {
 // belongsTo reports whether an event is part of the arc named, in the session
 // named. An arc ID is unique on its own, so the session only catches a ref
 // that was built wrong.
-func belongsTo(ev *events.Event, ref agent.ArcRef) bool {
+func belongsTo(ev *events.Event, ref common.ArcRef) bool {
 	return ev.SessionID == ref.SessionID && correlatesTo(ev, ref.ArcID)
 }
 

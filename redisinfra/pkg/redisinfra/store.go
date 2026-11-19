@@ -7,8 +7,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // logKey names the list one session's log lives under. The filestore keeps a
@@ -56,9 +56,9 @@ func NewRedisEventStore(client *redis.Client) *RedisEventStore {
 	return &RedisEventStore{client: client}
 }
 
-var _ agent.EventPersistor = (*RedisEventStore)(nil)
-var _ agent.EventSource = (*RedisEventStore)(nil)
-var _ agent.CancelSource = (*RedisEventStore)(nil)
+var _ common.EventPersistor = (*RedisEventStore)(nil)
+var _ common.EventSource = (*RedisEventStore)(nil)
+var _ common.CancelSource = (*RedisEventStore)(nil)
 
 // Persist writes events and returns them as they were stored. The sequence
 // number is the store's to assign, since nothing outside the append knows the
@@ -132,7 +132,7 @@ func (s *RedisEventStore) GetEventsForSession(ctx context.Context, sessionID str
 // carries AsMessage visibility. The cutoff rule is otherwise unchanged. That
 // query is the projection's cutoff, so a store that returned more or less of
 // the arc's own events would change what the model is told. See PROJECTION.md.
-func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref agent.ArcRef) ([]*events.Event, error) {
+func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref common.ArcRef) ([]*events.Event, error) {
 	all, err := s.read(ctx, ref.SessionID)
 	if err != nil {
 		return nil, err
@@ -164,7 +164,7 @@ func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref agent.ArcRef)
 
 // Cancelled returns the cancel recorded against an arc, or nil where there is
 // none. It scans the session, which is what everything here does.
-func (s *RedisEventStore) Cancelled(ctx context.Context, ref agent.ArcRef) (*events.Event, error) {
+func (s *RedisEventStore) Cancelled(ctx context.Context, ref common.ArcRef) (*events.Event, error) {
 	all, err := s.read(ctx, ref.SessionID)
 	if err != nil {
 		return nil, err
@@ -193,6 +193,17 @@ func (s *RedisEventStore) CancelledTask(ctx context.Context, sessionID, taskID s
 	return nil, nil
 }
 
+// TaskState reads what the log says about one task with a scan of the
+// session's list, the way every other query here works. The scan itself lives
+// in the agent package, so every store answers alike.
+func (s *RedisEventStore) TaskState(ctx context.Context, sessionID, taskID string) (*common.TaskState, error) {
+	all, err := s.read(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return common.TaskStateOf(sessionID, taskID, all), nil
+}
+
 // read decodes a session's whole log. A session nothing has been written to is
 // an empty one, since a session starts by writing its first event.
 func (s *RedisEventStore) read(ctx context.Context, sessionID string) ([]*events.Event, error) {
@@ -219,6 +230,6 @@ func correlatesTo(ev *events.Event, arcID string) bool {
 // belongsTo reports whether an event is part of the arc named, in the session
 // named. An arc ID is unique on its own, so the session only catches a ref
 // that was built wrong.
-func belongsTo(ev *events.Event, ref agent.ArcRef) bool {
+func belongsTo(ev *events.Event, ref common.ArcRef) bool {
 	return ev.SessionID == ref.SessionID && correlatesTo(ev, ref.ArcID)
 }

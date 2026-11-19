@@ -3,7 +3,7 @@ package harness
 import (
 	"testing"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 func arcEvent(id string, typ events.EventType, payload events.EventPayload) *events.Event {

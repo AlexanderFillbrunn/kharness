@@ -7,9 +7,9 @@ import (
 	"slices"
 	"strings"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/history"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 var (
@@ -52,21 +52,21 @@ type AgentConfig struct {
 
 // eventLimit resolves the arc-opening notification cap for one task kind:
 // the config's override where one is set, the kind's declaration otherwise.
-func (c *AgentConfig) eventLimit(definition TaskDefinition) int {
+func (c *AgentConfig) eventLimit(meta TaskMetadata) int {
 	if c.TaskEventLimit != nil {
 		return *c.TaskEventLimit
 	}
-	return definition.EventLimit
+	return meta.EventLimit
 }
 
 // inResultTrail resolves how many InResult events one task kind's result
 // message carries: the config's override where one is set, the kind's
 // declaration otherwise.
-func (c *AgentConfig) inResultTrail(definition TaskDefinition) int {
+func (c *AgentConfig) inResultTrail(meta TaskMetadata) int {
 	if c.TaskInResultTrail != nil {
 		return *c.TaskInResultTrail
 	}
-	return definition.InResultTrail
+	return meta.InResultTrail
 }
 
 type Agent struct {
@@ -225,8 +225,8 @@ func (a Agent) resolveTaskResultTrail(h *history.History, arc *history.Arc) {
 	if !ok || task.ResultArc != arc.ID {
 		return
 	}
-	if definition, ok := a.tasks.Get(task.TaskName); ok {
-		h.TaskResultTrail = a.config.inResultTrail(definition)
+	if meta, ok := a.tasks.Get(task.TaskName); ok {
+		h.TaskResultTrail = a.config.inResultTrail(meta)
 	}
 }
 
@@ -357,7 +357,7 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 
 	response, err := a.llm.StreamResponse(ctx, state.history, &LLMOptions{
 		SystemPrompt: a.config.SystemPrompt,
-		Tools:        CombineTools(a.tools, a.tasks),
+		Tools:        CombineTools(a.tools, taskToolSet{a.tasks}),
 	}, state.tokenSink(messageID))
 	if err != nil {
 		return fmt.Errorf("error calling LLM: %w", err)
@@ -469,7 +469,7 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 // runCall hands one call to whatever answers calls by that name. The name
 // decides what the call is before anything runs.
 func (a Agent) runCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
-	switch a.tasks.classify(call.ToolName) {
+	switch classify(a.tasks, call.ToolName) {
 	case opStart:
 		return a.startTask(ctx, call, state)
 	case opCancel:
@@ -568,7 +568,7 @@ func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
 // knows reports whether a call by this name has somewhere to go: a registered
 // tool, a kind of task, or one of the two tools tasks are addressed with.
 func (a Agent) knows(name string) bool {
-	if a.tasks.classify(name) != opTool {
+	if classify(a.tasks, name) != opTool {
 		return true
 	}
 	_, ok := a.tools.Get(name)
@@ -582,7 +582,7 @@ func (a Agent) knows(name string) bool {
 // minted here so the task can be started under it, and the invoke records the
 // actor that started the task, which every event the task later emits carries.
 func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
-	definition, ok := a.tasks.Get(call.ToolName)
+	start, ok := a.tasks.starter(call.ToolName)
 	if !ok {
 		return fmt.Errorf("task not registered: %s", call.ToolName)
 	}
@@ -611,16 +611,17 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 	}
 
 	ref := TaskRef{SessionID: state.history.SessionID, ID: invocationID}
-	if err := definition.Start(ctx, ref, call.Args); err != nil {
+	if err := start(ctx, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
 
 	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 		"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
 			"Anything it says reaches you as a turn of its own, a question included, so there is "+
-			"nothing here to wait for and nothing to poll. Answer a question of its with %s once "+
-			"you have been given one, and stop it with %s. Both take that id.",
-		call.ToolName, ref.ID, ProvideTaskInputTool, CancelTaskTool)}, state)
+			"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
+			"it yourself with %s, or put the question to the user first and then answer with %s "+
+			"once you have their reply; stop it with %s. All take that id.",
+		call.ToolName, ref.ID, ProvideTaskInputTool, ProvideTaskInputTool, CancelTaskTool)}, state)
 }
 
 // taskActor is the actor a task's events carry: the one whose message opened

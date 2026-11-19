@@ -22,7 +22,7 @@ What is already there
 A refusal settles the call `REFUSED` and carries the human's words as the
 call's result. An approval leaves the call pending, so it runs.
 
-    agent/pkg/events/payloads.go      InterruptPayload, InterruptResponsePayload
+    proto/pkg/events/payloads.go      InterruptPayload, InterruptResponsePayload
     agent/pkg/history/history.go      applyInterrupt, applyInterruptResponse
     agent/pkg/history/history.go      ToolCallPhaseAwaitingApproval, ArcStatusInterrupted
     agent/pkg/history/projection.go   projectInterrupt, the ask and approval notes

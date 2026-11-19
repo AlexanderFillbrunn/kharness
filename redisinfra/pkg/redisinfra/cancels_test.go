@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // cancelledSoonerThan reports whether a watcher's channel closed within the

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"fillbrunn.ai/kube-agent/pkg/events"
-	"fillbrunn.ai/kube-agent/pkg/users"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
 // ToolCallStatus is the lifecycle state of a ToolCall. Every state other than
@@ -140,23 +140,18 @@ func (c *ToolCall) Phase() ToolCallPhase {
 	}
 }
 
-// AsyncTaskStatus is the lifecycle state of an asynchronous task.
-type AsyncTaskStatus string
+// AsyncTaskStatus is the lifecycle state of an asynchronous task. The
+// vocabulary is defined in the events package, next to the outcome it is
+// derived from, so a store query and the fold read the same one; history
+// re-exports it under its own name.
+type AsyncTaskStatus = events.TaskStatus
 
 const (
-	// AsyncTaskPending is a task that is running.
-	AsyncTaskPending AsyncTaskStatus = "PENDING"
-	// AsyncTaskSuccess is a task that finished and returned a result.
-	AsyncTaskSuccess AsyncTaskStatus = "SUCCESS"
-	// AsyncTaskFailed is a task that finished and reported an error.
-	AsyncTaskFailed AsyncTaskStatus = "FAILED"
-	// AsyncTaskWaiting is a task that has stopped to ask for input and resumes
-	// once the input arrives.
-	AsyncTaskWaiting AsyncTaskStatus = "WAITING"
-	// AsyncTaskCancelled is a task a runner reported it had stopped.
-	// Cancelling an arc does not set it: the cancel ends the waiting, and what
-	// became of the task is the runner's to report.
-	AsyncTaskCancelled AsyncTaskStatus = "CANCELLED"
+	AsyncTaskPending   = events.TaskStatusPending
+	AsyncTaskSuccess   = events.TaskStatusSuccess
+	AsyncTaskFailed    = events.TaskStatusFailed
+	AsyncTaskWaiting   = events.TaskStatusWaiting
+	AsyncTaskCancelled = events.TaskStatusCancelled
 )
 
 // AsyncTaskEventType distinguishes task notifications from blocking input
@@ -962,6 +957,24 @@ func taskArcContent(task *AsyncTask, note, body string) string {
 	return fmt.Sprintf("Task %s with id %s (%s)\n%s", task.TaskName, task.ID, note, body)
 }
 
+// TaskInputToolName names the tool a waiting task's question is answered
+// with. The name is protocol vocabulary defined in the events package, since
+// it appears in text the fold composes for the model; the agent registers its
+// input tool under the same name.
+const TaskInputToolName = events.ProvideTaskInputToolName
+
+// taskAskContent composes the opening content of the arc an ask opens: the
+// usual task note, then a header line that says plainly the question comes
+// from a background task and not from the user, and that it may be answered
+// directly through the input tool or put to the user first; then the task's
+// own message. The header is what keeps the model from reading the question
+// as the user's own words.
+func taskAskContent(task *AsyncTask, message string) string {
+	return fmt.Sprintf("Task %s with id %s (asks a question)\n"+
+		"[background task, not the user — answer it with %s, or ask the user first and then call %s with their answer]\n%s",
+		task.TaskName, task.ID, TaskInputToolName, TaskInputToolName, message)
+}
+
 // applyAsyncTaskResult settles a running task as successful or failed. A
 // result for a task that already finished is dropped, so a cancelled task
 // keeps that outcome. A result written AsMessage opens an arc of its own
@@ -1064,7 +1077,7 @@ func (h *History) applyAsyncTaskInputRequested(ev *events.Event, state *FoldStat
 	visibility := pl.LLMVisibility.Effective()
 	if visibility == events.LLMVisibilityAsMessage {
 		if arc == nil {
-			arc = h.mintTaskArc(ev, state, task, taskArcContent(task, "asks a question", pl.Message))
+			arc = h.mintTaskArc(ev, state, task, taskAskContent(task, pl.Message))
 		}
 		waiting := arc.ID
 		task.WaitingArc = &waiting
