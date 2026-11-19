@@ -928,7 +928,8 @@ snapshot plus the events after it — is separate work, and not specified
 here.
 
 PROJECTION.md gains a section for the compacted transcript and one for
-thinned tool results, and loses the sentence saying a note is one line. Rendering follows: `RenderChat` and devchat's transcript draw a
+thinned tool results, and loses the sentence saying a note is one
+line. Rendering follows: `RenderChat` and devchat's transcript draw a
 session as a sequence of arcs, and a compacted session is a summary block
 followed by arcs.
 
