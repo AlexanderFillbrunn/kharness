@@ -84,9 +84,11 @@ Desired state
   Placement in a transcript is still decided from correlation and
   sequence number, as for every record; the payload field records the
   same decision explicitly for readers, replay and validation.
-- D4  Asks and results are always `AsMessage`: an ask that opened no arc
-  could never be answered, and a result that opened none would never be
-  worked on. A notification's `LLMVisibility` — `None`, `AsMessage` or
+- D4  Asks and results reported by a runner are always `AsMessage`: an
+  ask that opened no arc could never be answered, and a result that
+  opened none would never be worked on. The one exception is the startup
+  reaper: `SettleAbandonedTasks` writes its settle as `None`, correlated
+  to the task, opening no arc. A notification's `LLMVisibility` — `None`, `AsMessage` or
   `InResult` — is declared per class: every notification carries a class
   name in its payload, and the registry declares each class of a task
   kind. `AsMessage` opens an arc. `InResult` folds the event into the
@@ -99,21 +101,37 @@ Desired state
 - D5  The controller coalesces the notifications of each `AsMessage`
   class into at most one report per group window and class; asks and
   results are always written whole, since an ask merged into another
-  report could never be answered. The window is declared per class at
-  registration. Coalescing happens before the log; nothing about it is
-  recorded. `None` and `InResult` notifications flow as they are.
+  report could never be answered. The first notification of a window
+  opens it, and when the window closes one merged report is written whose
+  payload is an object with an `events` property containing the window's
+  notification payloads as a list, the accompanying text prepended with a
+  line saying the notifications were merged (how many, which class); the
+  window is fixed from the first notification and declared per class at
+  registration. The buffer is the controller's memory, so coalescing is
+  per controller instance. Coalescing happens before the log; nothing
+  about it is recorded. `None` and `InResult` notifications flow as they
+  are.
 - D6  The actor is copied forward. The invoke records the actor that started
   the task; every event the task emits carries the same one, so every arc
   one of them opens inherits it. The actor is not the correlation ID and
   not a live grant of authority: it records who started the work.
 - D7  An ask always opens an arc, and in that arc the model decides: it
   either puts the question to the user, or answers the ask itself through
-  the input tool (`provide_task_input`), under the invocation's actor; the
-  answer is written correlated to the ask's arc, so the cutoff includes
-  it. This is the model's decision per ask, not a setting of the task.
+  the input tool (`provide_task_input`), under the invocation's actor.
+  Answered by the model, its words are an ordinary assistant message in
+  the ask's arc and the `ASYNC_TASK_INPUT_PROVIDED` record is written
+  correlated to that same arc — an arc that exists, so the fold attaches
+  the event and it opens no other — which is why the cutoff includes it
+  at any point. Put to the user, the ask's arc closes (D1) and the
+  human's reply opens a new arc; in that arc the model calls
+  `provide_task_input`, and the INPUT_PROVIDED still correlates to the
+  question's arc. This is the model's decision per ask, not a setting of
+  the task.
 - D8  Cancellation gains a second axis addressed to the task. A cancel naming
-  a task ID reaches the runner through the controller and settles the task
-  in the log, with who cancelled it and when. The guard follows the same
+  a task ID is written as a `CANCEL` event whose correlation ID is the task
+  ID; it reaches the runner through the controller and settles the task
+  in the log, with who cancelled it (the event's actor) and when (its seq
+  and timestamp). The guard follows the same
   axis: a write whose causation reaches a cancelled task is refused. The
   arc-scoped cancel and guard are unchanged. "Cancel every task this arc
   started" is a loop over the task table in the harness, not a mechanism;
@@ -166,35 +184,44 @@ Events — pkg/events
   apart. There are no new event types; the codec gains nothing beyond the
   new fields.
 - R2  `CancelPayload` gains an optional task ID. Set, the cancel is
-  task-addressed; unset, arc-addressed exactly as today.
+  task-addressed: the event's correlation ID is the task ID and the fold
+  settles the task, not an arc; unset, arc-addressed exactly as today.
 
 Fold — pkg/history
 - R3  `History` gains a session-level task table: every task in the session,
   keyed by task ID, in log order. `FoldStateFromHistory` rebuilds it. The
   task record keeps status, events, actor, name (from
   `AsyncTaskInvokePayload.TaskName`) and origin arc
-  (`AsyncTask.CorrelationID`).
+  (`AsyncTask.CorrelationID`). `Arc.AsyncTasks` is removed: the session
+  table is the only home for a task, and the invoke event's place in the
+  origin arc is its correlation, not a nested record.
 - R4  Arc opening becomes a kind: `applyUserMessage` and an opening task
-  event are its two instances; both mint an arc with ID, seq and actor
-  taken from the event, and content — the user's words, or for a
-  task-opened arc the note and payload composed per D9.
+  event are its two instances. At the write path every opening event is
+  given a fresh arc ID (R10); in the fold, an opening-kind event whose
+  correlation names no arc yet mints one, and one whose correlation names
+  an existing arc — the INPUT_PROVIDED answer correlated to the ask's arc
+  (D7) — attaches to it. Both mint an arc with ID, seq and actor taken
+  from the event, and content — the user's words, or for a task-opened
+  arc the note and payload composed per D9.
 - R5  Task events validate against the session task table: a report naming
   an unknown task ID is rejected by the fold.
 - R6  Correlation routes the fold: an arc-correlated event attaches to that
   arc; a task-correlated event attaches to the task's transcript. The fold
   cross-checks the payload's `LLMVisibility` against the correlation —
   `AsMessage` must correlate to an arc, `None` and `InResult` to a task —
-  and rejects a mismatch.
+  and rejects a mismatch. An empty `LLMVisibility`, from a log line written
+  before this spec, reads as `AsMessage`.
 - R7  The read model for a run includes the session's task-correlated
   events, so the fold builds the task table; they enter no arc's
   transcript. Implementation choice: load the whole log, or extend the arc
   query with task-correlated events.
 
 Store — EventSource, devchat/filestore
-- R8  `GetEventsForArc` finds an arc by its opening event of any
-  arc-opening kind, not only `USER_MESSAGE`. The cutoff rule is unchanged:
-  everything up to and including the opening event, plus everything
-  correlated to the arc.
+- R8  `GetEventsForArc` finds an arc by its opening event — the earliest
+  event correlated to the arc ID whose kind is opening (`USER_MESSAGE`,
+  or a task event whose payload carries `AsMessage`), not only
+  `USER_MESSAGE`. The cutoff rule is unchanged: everything up to and
+  including the opening event, plus everything correlated to the arc.
 
 Registry — pkg/agent/tasks.go
 - R9  `TaskDefinition` gains, per named notification class: the
@@ -208,7 +235,11 @@ Registry — pkg/agent/tasks.go
   N and the limit.
 
 Ingress — pkg/agent/reports.go
-- R10 `TaskReports.Report` resolves the event's `LLMVisibility` from the
+- R10 `TaskReports.Report` names the session and the task ID — `TaskRef`
+  loses `ArcRef` and `Name` and is `{SessionID, ID}`; the origin arc and
+  the kind are read from the task table — and validates the report by
+  whether the task exists in the session, reading the session's log rather
+  than one arc's slice. It resolves the event's `LLMVisibility` from the
   declaration on the write path and writes it into the payload: an ask, a
   result, or a notification of an `AsMessage` class gets a fresh arc ID
   as its correlation; `None` and `InResult` events correlate to the task.
@@ -219,11 +250,18 @@ Ingress — pkg/agent/reports.go
   in the same queue user arcs are served from; the origin arc is not
   re-worked, and the caller does not retry when the arc's lease is held.
   Work items interleave in arrival order across arcs and users (D11); the
-  per-arc lease still serializes the runs of one arc.
+  per-arc lease still serializes the runs of one arc. The enqueue goes
+  through a minimal interface defined in pkg/agent —
+  `Enqueue(ctx, ArcRef, agentID)` — which redisinfra's WorkQueue
+  satisfies, so pkg/agent does not import redisinfra.
 - R12 Coalescing lives in the controller: per task and notification class,
   at most one report per group window for `AsMessage` classes, using the
-  window declared at registration (D5). Asks and results are written
-  whole; `None` and `InResult` notifications are written as they arrive.
+  window declared at registration (D5): the first notification of a
+  window is held and one merged report is flushed when it closes — payload
+  `{"events": [...]}` with the window's notifications in order, the text
+  prepended with the merge note. Asks and results
+  are written whole; `None` and `InResult` notifications are written as
+  they arrive.
   The controller also enforces the event limit (D12): past it, an
   `AsMessage`-class notification is demoted per the overflow policy and
   opens no arc.
@@ -234,12 +272,24 @@ Agent loop — pkg/agent/agent.go
   finished-sequence wait go. `closeArc` is unchanged.
 
 Guard and cancel — pkg/agent/cancellation.go, pkg/history
-- R14 A task-addressed cancel is folded by `applyCancel`: the task is
-  validated against the session table and settled (`CANCELLED`, actor,
-  seq), and the runner is reached through `TaskController.Cancel`.
+- R14 A task-addressed cancel (correlation ID = task ID, R2) is folded by
+  `applyCancel`: the task is validated against the session table and
+  settled — status `CANCELLED`, `FinishedAt`/`FinishedSeq` from the event,
+  the actor on the event — and no arc is touched: no `Arc.Cancel`, no
+  `TerminatedWork`. The runner is reached through `TaskController.Cancel`
+  by whichever caller wrote the cancel (the devchat command or the model's
+  `cancel_task` tool), not by the fold. A later report from that runner is
+  dropped by the fold (the task is finished) and refused at the write path
+  (R15).
 - R15 `GuardCancellation` refuses a write whose causation reaches a
-  cancelled task (a report or invocation naming it), in addition to the
-  arc-scoped `startsWork` check, which stays.
+  cancelled task, in addition to the arc-scoped `startsWork` check, which
+  stays. On every batch the guard checks two axes: a `startsWork` event
+  correlated to a cancelled arc is refused as today, and any task-emitted
+  event whose payload `CausationID` names a task the log shows settled
+  `CANCELLED` is refused the same way — the whole batch, `ErrCancelled`,
+  nothing written. The task-axis lookup hangs off `CancelSource`, which
+  gains a method answering a task ID (filestore scans the log for the
+  `CANCEL` correlated to that task ID); the arc lookup is unchanged.
 
 Projection — pkg/history/projection.go, docs/PROJECTION.md
 - R16 Placement is decided from correlation and seq for every record, and
@@ -265,9 +315,12 @@ Rendering — pkg/history/chat.go, devchat
 Harness — devchat
 - R20 The owed-turn mechanism is deleted: `taskOwedMsg`, `m.owed`,
   `settleOwed`, and the `deferred` callback. `taskUnfiledMsg` stays.
-- R21 `/cancel` keeps stopping the run. A command naming a task ID cancels
-  that task through the task axis. A status line or task list is built from
-  the fold's task table. `SettleAbandonedTasks` on start-up is unchanged.
+- R21 `/cancel` keeps stopping the run. A command naming a task ID writes
+  the `CANCEL` event correlated to that task ID (R2, D8) and calls
+  `TaskController.Cancel` on it. A status line or task list is built from
+  the fold's task table. `SettleAbandonedTasks` on start-up settles what
+  it always settled; its result events are written with `None`
+  visibility, correlated to the task (D4's reaper exception).
 - R22 `localTasks` keeps start, cancel and input, minus the deferred-turn
   callback.
 
@@ -285,9 +338,9 @@ Acceptance criteria
   the model either puts the question to the user or answers it with
   `provide_task_input` under the invoke's actor, and the answer is in the
   ask arc's own transcript at any cutoff.
-- AC5  A cancel naming a task ID settles the task in the log with actor and
-  seq, reaches `TaskController.Cancel`, and a late report naming that task
-  is refused.
+- AC5  A cancel naming a task ID is written with the task ID as its
+  correlation, settles the task in the log with actor and seq, reaches
+  `TaskController.Cancel`, and a late report naming that task is refused.
 - AC6  A notification declared `None` appears in no arc's `ModelTranscript`
   under any modes, and one declared `InResult` appears only folded into
   the result message; `Modes` has no `async_events` / `async_input`; a
