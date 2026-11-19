@@ -59,6 +59,11 @@ payload is along these lines.
         Usage   *TokenUsage
     }
 
+Where a provider rejects a transcript as over budget, a non-fatal `Error`
+is appended before the arc suspends, so the rejection is in the log and the
+resumed turn reads it as a note; see Overflow recovery under When compaction
+runs.
+
 `ThroughSeq` is the watermark. Which compaction is in force, what a reader
 loads and whether two workers conflict are all answered by comparing
 watermarks.
@@ -591,9 +596,37 @@ picks the arc up.
 suspends onto the compaction its own earlier rounds triggered; no second
 compaction is produced.
 
-One residual case: if even the compacted transcript is over the higher
-budget, the resumed round is rejected by the provider. The budgets were
-set wrong; it is a condition to alert on, not a mechanism to build.
+*Overflow recovery.* The budgets and the estimate are the proactive
+mechanism; the provider's rejection is the backstop, for the case where the
+estimate was wrong. A run whose call the provider rejects as over budget —
+or whose reply ends early on a length stop — recovers the way case 4
+suspends: it writes a non-fatal `Error` correlated to the arc, carrying the
+provider's reason, so the rejection is in the log and the resumed turn
+reads it as a note; then, where no request stands unsatisfied, a
+`COMPACTION_REQUESTED`; then an `ARC_SUSPENDED` causally naming the
+request; and the run ends its in-flight period. The completion scan
+resumes the arc on the compacted transcript.
+
+Recognising the rejection is the vendor's job at the `LLM` boundary, not
+the loop's: the interface gains a typed error carrying the status, type,
+code and message of the provider's complaint, a stop reason on the reply,
+and a classifier saying whether an error or a stop is a budget rejection.
+Each vendor maps its own wire format — a status with a context code
+(OpenAI's `context_length_exceeded`), a 413 where a gateway uses one, a
+message pattern where no code exists (Anthropic's "prompt is too long"),
+an error object inside an otherwise-200 stream, and a final length stop,
+never an output-limit stop such as `max_tokens`. Never the status alone. A
+vendor with no reliable signal classifies nothing, its rejections stay
+fatal, and the proactive budgets carry it: the backstop simply never fires
+for that vendor.
+
+The recovery is bounded to one per arc, and the bound is derived, not
+recorded: the fold already derives the suspension states, so a classified
+rejection on an arc whose suspension is already resolved writes the `Error`
+fatal and suspends nothing. One residual case remains: if even the
+compacted transcript is over the provider's limit, that second rejection
+is the alert — the budgets were set wrong, and no mechanism is built for
+it.
 
 Parallelism modes
 --------------------
@@ -700,14 +733,15 @@ case: the landing is not in force under the run. Blocking: none.
       the run writes its reply
       the next run of any arc reads the summary
 
-*Case 6: the compacted transcript is still over the higher budget.* The
-residual case of When compaction runs: the budgets were set wrong.
-Blocking: none built in.
+*Case 6: the compacted transcript is still over the provider's limit.*
+The residual case of When compaction runs. Blocking: the tail of the
+window, once.
 
       the compaction lands; the suspended arc is requeued
       the run resumes, reading the summary
       the provider rejects the round: even the compacted transcript
-      is over the higher budget
+      is over the limit
+      overflow recovery fires once; a second rejection is fatal
       an alert, not a mechanism
 
 The window and admission control
@@ -825,7 +859,10 @@ What would have to change
 --------------------
 `pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
 — `COMPACTED` carrying the method that ran — and `ARC_SUSPENDED`, which
-carries no payload of its own; the codec gains their cases.
+carries no payload of its own; the codec gains their cases. `ErrorPayload`
+needs nothing for overflow recovery: `IsFatal` and `CausationID` already
+exist, and a non-fatal error already folds without ending the arc and
+projects as a note.
 
 `pkg/history` gains `LastCompaction` on `History`, the apply function that
 sets it by coverage rather than arrival, `CompactionDue`, and the derived
@@ -854,8 +891,13 @@ the write of an `ARC_SUSPENDED` by a suspending run and by the admission
 check, the completion scan that requeues every arc with an outstanding
 suspension, the higher-budget check before a run and between rounds, and
 the autoclaim that reaps an expired item so that a dead worker's compaction
-is taken up by another. `TaskReports` is unchanged, since a report is never
-held.
+is taken up by another; and the LLM-boundary classification for overflow
+recovery — a typed error with the status, type, code and message, a stop
+reason on the reply, and an `IsContextOverflow`-style classifier each vendor
+fills in — with the loop's handling of a classified rejection: the
+non-fatal `Error`, the request where none stands, the `ARC_SUSPENDED`, and
+the one-recovery-per-arc bound read off the derived suspension states.
+`TaskReports` is unchanged, since a report is never held.
 `GuardCancellation` needs no change: `startsWork` covers dispatches and
 task invocations, and a compaction is neither.
 
@@ -906,4 +948,5 @@ rather than as a round number under the context limit.
 set well, a run rarely suspends, and the higher-budget check and the
 completion scan are machinery for a case that rarely arises. They should
 be built and then measured, and the measurement decides whether they
-stay.
+stay. Overflow recovery is that machinery reacting to a classified
+rejection rather than an estimate; measure the two together.
