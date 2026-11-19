@@ -91,7 +91,7 @@ func (t *transcript) fromHistory(h *history.History) {
 			author = arc.Actor.UserID
 		}
 		stopped := arc.Status() == history.ArcStatusCancelled || arc.Status() == history.ArcStatusError
-		t.blocks = append(t.blocks, &block{kind: blockUser, author: author, text: arc.Content})
+		t.blocks = append(t.blocks, &block{kind: blockUser, author: author, text: h.OpeningContent(arc)})
 
 		for _, response := range arc.Responses {
 			if response.Content != "" {
@@ -110,8 +110,10 @@ func (t *transcript) fromHistory(h *history.History) {
 		}
 
 		// Tasks come after the arc's replies rather than in the order they
-		// were invoked, since a task is shown as where it has got to now.
-		for _, task := range arc.AsyncTasks {
+		// were invoked, since a task is shown as where it has got to now. They
+		// are read from the session's task table, grouped by the arc that
+		// started them.
+		for _, task := range h.TasksOfArc(arc.ID) {
 			shown := &block{
 				kind:  blockTask,
 				id:    task.ID,

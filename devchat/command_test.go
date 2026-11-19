@@ -18,7 +18,7 @@ func modelOver(t *testing.T, store *filestore.Store) model {
 	t.Helper()
 	s := &session{id: "session", store: store, actor: users.Actor{UserID: "dev"}}
 	settings := agent.AgentSettings{Model: agent.ModelRef{Source: "openai", Name: "gpt-5"}}
-	return newModel(s, &sender{}, settings, filepath.Join(t.TempDir(), "agents.json"), newTranscript(), nil).resize(80, 24)
+	return newModel(s, &sender{}, settings, filepath.Join(t.TempDir(), "agents.json"), newTranscript()).resize(80, 24)
 }
 
 // Clearing has to reach the log, or the next turn replays a conversation the

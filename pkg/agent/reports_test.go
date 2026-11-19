@@ -11,10 +11,12 @@ import (
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"
 	"fillbrunn.ai/kube-agent/pkg/users"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // logStore is a persistor that is also readable, which is what the inbound
-// half needs: it writes a report and then reads the arc back to work it.
+// half needs: it writes a report and then reads the session back to validate
+// and work it.
 type logStore struct {
 	mu     sync.Mutex
 	events []*events.Event
@@ -41,32 +43,117 @@ func (s *logStore) Persist(_ context.Context, evs ...*events.Event) ([]*events.E
 	return stored, nil
 }
 
+// GetEventsForSession returns the whole log, the way a store that holds many
+// sessions returns one session's slice.
+func (s *logStore) GetEventsForSession(_ context.Context, sessionID string) ([]*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*events.Event
+	for _, ev := range s.events {
+		if ev.SessionID == sessionID {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
 // GetEventsForArc applies the projection's cutoff the way the real store does:
-// everything up to the arc's own opening, plus everything correlated to it.
+// everything up to the arc's own opening event, plus everything correlated to
+// it or to a task afterwards.
 func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	taskIDs := map[string]bool{}
 	opening := -1
 	for _, ev := range s.events {
-		if ev.Typ == events.UserMessageEventType && ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID {
-			opening = ev.Seq
-			break
+		if ev.Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[ev.ID] = true
 		}
+		if opening < 0 && ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID && events.OpensArc(ev) {
+			opening = ev.Seq
+		}
+	}
+	if opening < 0 {
+		return nil, errors.New("no arc " + ref.ArcID)
 	}
 	var selected []*events.Event
 	for _, ev := range s.events {
-		if ev.Seq <= opening || (ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID) {
+		if ev.Seq <= opening || (ev.CorrelationID != nil && (*ev.CorrelationID == ref.ArcID || taskIDs[*ev.CorrelationID])) {
 			selected = append(selected, ev)
 		}
 	}
 	return selected, nil
 }
 
+func (s *logStore) Cancelled(_ context.Context, ref ArcRef) (*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ev := range s.events {
+		if ev.Typ == events.CancelEventType && ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID {
+			return ev, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *logStore) CancelledTask(_ context.Context, _, taskID string) (*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ev := range s.events {
+		if ev.Typ == events.CancelEventType && ev.CorrelationID != nil && *ev.CorrelationID == taskID {
+			return ev, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *logStore) types() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return typesOf(s.events)
+}
+
+// recordingEnqueuer is the work queue the report path hands arcs to: it records
+// them, and works them through the worker when the test wants that.
+type recordingEnqueuer struct {
+	mu       sync.Mutex
+	enqueued []ArcRef
+	work     func(ctx context.Context, ref ArcRef, agentID string)
+}
+
+func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref ArcRef, agentID string) error {
+	e.mu.Lock()
+	e.enqueued = append(e.enqueued, ref)
+	work := e.work
+	e.mu.Unlock()
+	if work != nil {
+		work(ctx, ref, agentID)
+	}
+	return nil
+}
+
+func (e *recordingEnqueuer) refs() []ArcRef {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]ArcRef(nil), e.enqueued...)
+}
+
+// taskRegistry declares the one kind of task the fixtures run, with a
+// coalescible AsMessage class and a None class.
+func taskRegistry(t *testing.T) *TaskRegistry {
+	t.Helper()
+	registry := NewTaskRegistry()
+	err := registry.RegisterTask(&mcp.Tool{Name: "auditor"}, func(context.Context, TaskRef, any) error {
+		return nil
+	}, WithNotificationClasses(map[string]NotificationClass{
+		"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: time.Hour},
+		"detail":   {Visibility: events.LLMVisibilityNone},
+	}))
+	if err != nil {
+		t.Fatalf("RegisterTask: %v", err)
+	}
+	return registry
 }
 
 // runningTaskStore is a log holding one arc that started a task and answered
@@ -82,7 +169,7 @@ func runningTaskStore(t *testing.T) *logStore {
 		{SessionID: testSessionID, AgentID: testAgentID, ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
 		{SessionID: testSessionID, AgentID: testAgentID, ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+			Actor: actor, Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
 	} {
 		if _, err := store.Persist(context.Background(), ev); err != nil {
 			t.Fatalf("persist: %v", err)
@@ -94,8 +181,14 @@ func runningTaskStore(t *testing.T) *logStore {
 	return store
 }
 
-func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskReports {
+// reportsFor builds the ingress over the store, with an enqueuer that works
+// whatever it is handed through the worker, so a report's arc is served the
+// way the queue would serve it.
+func reportsFor(t *testing.T, store *logStore, enqueuer *recordingEnqueuer, replies ...*LLMResponse) *TaskReports {
 	t.Helper()
+	if enqueuer == nil {
+		enqueuer = &recordingEnqueuer{}
+	}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: replies})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
@@ -104,7 +197,10 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	reports, err := NewTaskReports(worker)
+	enqueuer.work = func(ctx context.Context, ref ArcRef, agentID string) {
+		_, _ = worker.Work(ctx, ref, agentID)
+	}
+	reports, err := NewTaskReports(store, store, taskRegistry(t), enqueuer)
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
@@ -112,77 +208,100 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 }
 
 func taskRef() TaskRef {
-	return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"}
+	return TaskRef{SessionID: testSessionID, ID: "task-1"}
 }
 
-// A completion is recorded and the arc worked, so the model says what came of
-// the work it started.
-func TestACompletionIsRecordedAndGetsTheModelATurn(t *testing.T) {
+// AC2: a completion reported after the origin arc closed is persisted with a
+// fresh arc ID as its correlation, the fold mints that arc, and the new arc is
+// handed to the work queue as a work item — the owed list is not involved.
+func TestACompletionIsRecordedAndOpensANewArc(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "the audit found 3 things"})
+	enqueuer := &recordingEnqueuer{}
+	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "the audit found 3 things"})
 
-	worked, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess})
-	if err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess}); err != nil {
 		t.Fatalf("Report: %v", err)
-	}
-	if !worked {
-		t.Error("the arc was not worked")
 	}
 
 	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, ASYNC_TASK_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
 	if got := store.types(); got != want {
 		t.Fatalf("log = %s, want %s", got, want)
 	}
+
+	var result *events.Event
+	for _, ev := range store.events {
+		if ev.Typ == events.AsyncTaskResultEventType {
+			result = ev
+		}
+	}
+	if result == nil {
+		t.Fatal("no result was written")
+	}
+	payload := result.Payload.(events.AsyncTaskResultPayload)
+	if payload.LLMVisibility != events.LLMVisibilityAsMessage {
+		t.Errorf("visibility = %q, want AS_MESSAGE", payload.LLMVisibility)
+	}
+	if result.CorrelationID == nil || *result.CorrelationID == testArcID {
+		t.Errorf("the result correlates to %v, want a fresh arc ID", result.CorrelationID)
+	}
+	// The actor is copied forward from the invoke.
+	if result.Actor.UserID != "alice" {
+		t.Errorf("the result's actor = %q, want the invoke's actor", result.Actor.UserID)
+	}
+	// The new arc went to the queue as a work item.
+	refs := enqueuer.refs()
+	if len(refs) != 1 || refs[0].ArcID != *result.CorrelationID || refs[0].SessionID != testSessionID {
+		t.Errorf("enqueued = %v, want the one new arc", refs)
+	}
 }
 
-// An ask gets a turn too, because putting the question to a person is the only
-// thing that can move the task on.
-func TestAnInputRequestGetsTheModelATurn(t *testing.T) {
+// An ask is always written AsMessage under the name the task gave it, and the
+// arc it opens is worked: putting the question to a person is the only thing
+// that can move the task on.
+func TestAnInputRequestOpensAnArcUnderTheNameTheTaskGaveIt(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
+	enqueuer := &recordingEnqueuer{}
+	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
 
-	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"})
-	if err != nil {
-		t.Fatalf("Report: %v", err)
-	}
-
-	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, ASYNC_TASK_INPUT_REQUESTED, ASSISTANT_MESSAGE"
-	if got := store.types(); got != want {
-		t.Fatalf("log = %s, want %s", got, want)
-	}
-}
-
-// The question is written under the name the task gave it, which is how an
-// answer that names a request can be matched against the request outstanding.
-func TestAnInputRequestIsWrittenUnderTheNameTheTaskGaveIt(t *testing.T) {
-	store := runningTaskStore(t)
-	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
-
-	if _, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, ASYNC_TASK_INPUT_REQUESTED, ASSISTANT_MESSAGE, ARC_CLOSED"
+	if got := store.types(); got != want {
+		t.Fatalf("log = %s, want %s", got, want)
+	}
+
+	var ask *events.Event
 	for _, ev := range store.events {
 		if ev.Typ == events.AsyncTaskInputRequestedEventType {
-			if ev.ID != "ask-1" {
-				t.Fatalf("the question is %q, want the name the task minted", ev.ID)
-			}
-			return
+			ask = ev
 		}
 	}
-	t.Fatal("no question was written")
+	if ask == nil {
+		t.Fatal("no question was written")
+	}
+	if ask.ID != "ask-1" {
+		t.Errorf("the question is %q, want the name the task minted", ask.ID)
+	}
+	payload := ask.Payload.(events.AsyncTaskInputRequestedPayload)
+	if payload.LLMVisibility != events.LLMVisibilityAsMessage {
+		t.Errorf("visibility = %q, want AS_MESSAGE: an ask that opened no arc could never be answered", payload.LLMVisibility)
+	}
+	if ask.CorrelationID == nil || *ask.CorrelationID == testArcID {
+		t.Errorf("the ask correlates to %v, want a fresh arc ID", ask.CorrelationID)
+	}
 }
 
 // A task that asks without naming the request is refused. Nothing but the task
 // can mint that name, since it has to recognise the answer when it comes back.
 func TestAnInputRequestWithoutARequestIDIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store)
+	reports := reportsFor(t, store, nil)
 
-	if _, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportInputRequested, Message: "which namespace?"}); err == nil {
 		t.Fatal("an unnamed request was accepted")
 	}
@@ -193,17 +312,16 @@ func TestAnInputRequestWithoutARequestIDIsRefused(t *testing.T) {
 	}
 }
 
-// A notification is recorded and the arc is worked all the same. There is
-// nothing for the model to do, and it is the log that says so rather than a
-// second opinion here: the run reads the arc, finds nothing owed, and writes
-// nothing.
-func TestANotificationIsRecordedAndSaysNothing(t *testing.T) {
+// A notification of a None class is written correlated to the task and opens
+// no arc: it is in the log for the frontend and replay, and the queue is not
+// involved.
+func TestANoneNotificationIsRecordedAgainstTheTaskAndOpensNoArc(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store)
+	enqueuer := &recordingEnqueuer{}
+	reports := reportsFor(t, store, enqueuer)
 
-	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportNotification, Message: "scanned 40 namespaces"})
-	if err != nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+		Kind: TaskReportNotification, Class: "detail", Message: "scanned 40 namespaces"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
 
@@ -211,19 +329,84 @@ func TestANotificationIsRecordedAndSaysNothing(t *testing.T) {
 	if got := store.types(); got != want {
 		t.Fatalf("log = %s, want %s", got, want)
 	}
+
+	var notification *events.Event
+	for _, ev := range store.events {
+		if ev.Typ == events.AsyncTaskEventEventType {
+			notification = ev
+		}
+	}
+	payload := notification.Payload.(events.AsyncTaskEventPayload)
+	if payload.Class != "detail" || payload.LLMVisibility != events.LLMVisibilityNone {
+		t.Errorf("payload = %#v, want class detail and NONE visibility", payload)
+	}
+	if notification.CorrelationID == nil || *notification.CorrelationID != "task-1" {
+		t.Errorf("the notification correlates to %v, want the task", notification.CorrelationID)
+	}
+	if refs := enqueuer.refs(); len(refs) != 0 {
+		t.Errorf("enqueued = %v, want nothing: a None event opens no arc", refs)
+	}
 }
 
-// The arc in a reference arrives from outside, so it says where to look and
-// never what is true. A report about a task that arc does not own is refused
-// before anything is written.
-func TestAReportNamingTheWrongArcIsRefused(t *testing.T) {
+// A notification of an AsMessage class is written with a fresh arc ID as its
+// correlation and the new arc is enqueued.
+func TestAnAsMessageNotificationOpensAnArc(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store)
+	enqueuer := &recordingEnqueuer{}
+	reports := reportsFor(t, store, enqueuer, &LLMResponse{ModelID: "gpt-5", Content: "noted"})
 
-	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one"}, testAgentID, TaskReport{
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+		Kind: TaskReportNotification, Class: "progress", Message: "3 namespaces look busy"}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	var notification *events.Event
+	for _, ev := range store.events {
+		if ev.Typ == events.AsyncTaskEventEventType {
+			notification = ev
+		}
+	}
+	payload := notification.Payload.(events.AsyncTaskEventPayload)
+	if payload.LLMVisibility != events.LLMVisibilityAsMessage {
+		t.Errorf("visibility = %q, want AS_MESSAGE", payload.LLMVisibility)
+	}
+	if notification.CorrelationID == nil || *notification.CorrelationID == testArcID || *notification.CorrelationID == "task-1" {
+		t.Errorf("the notification correlates to %v, want a fresh arc ID", notification.CorrelationID)
+	}
+	refs := enqueuer.refs()
+	if len(refs) != 1 || refs[0].ArcID != *notification.CorrelationID {
+		t.Errorf("enqueued = %v, want the arc the notification opened", refs)
+	}
+}
+
+// AC11: a notification naming a class the task kind has not declared is
+// refused at the write path and nothing is logged.
+func TestANotificationNamingAnUndeclaredClassIsRefused(t *testing.T) {
+	store := runningTaskStore(t)
+	reports := reportsFor(t, store, nil)
+
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+		Kind: TaskReportNotification, Class: "undeclared", Message: "news"}); err == nil {
+		t.Fatal("a notification of an undeclared class was accepted")
+	}
+
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE"
+	if got := store.types(); got != want {
+		t.Errorf("log = %s, want nothing written", got)
+	}
+}
+
+// A report is validated by whether the task exists in the session, not by
+// whether an arc holds it: a report naming an unknown task is refused before
+// anything is written.
+func TestAReportNamingAnUnknownTaskIsRefused(t *testing.T) {
+	store := runningTaskStore(t)
+	reports := reportsFor(t, store, nil)
+
+	err := reports.Report(context.Background(), TaskRef{SessionID: testSessionID, ID: "not-this-one"}, testAgentID, TaskReport{
 		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
-		t.Fatal("a report about a task the arc does not hold was accepted")
+		t.Fatal("a report about a task the session does not hold was accepted")
 	}
 	if got := store.types(); strings.Contains(got, "ASYNC_TASK_RESULT") {
 		t.Errorf("log = %s, want nothing written", got)
@@ -233,52 +416,33 @@ func TestAReportNamingTheWrongArcIsRefused(t *testing.T) {
 // A completion that does not say how it ended is not a completion.
 func TestACompletionWithoutAnOutcomeIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store)
+	reports := reportsFor(t, store, nil)
 
-	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{Kind: TaskReportCompleted, Result: "done"})
-	if err == nil {
+	if err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{Kind: TaskReportCompleted, Result: "done"}); err == nil {
 		t.Fatal("a completion with no outcome was accepted")
 	}
 }
 
-// An arc somebody else is working is left to them. The report is in the log,
-// which is where whoever holds the arc will read it.
-func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
+// AC5/R15: a report arriving after the task was settled — cancelled, say — is
+// refused at the write path.
+func TestALateReportOnASettledTaskIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
-	lease := NewLocalLease()
-	agent, err := NewAgent(nil, nil, &scriptedLLM{})
-	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+	taskID := "task-1"
+	if _, err := store.Persist(context.Background(), &events.Event{
+		SessionID: testSessionID, Typ: events.CancelEventType, CorrelationID: &taskID,
+		Payload: events.CancelPayload{TaskID: &taskID},
+	}); err != nil {
+		t.Fatalf("persist the cancel: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), lease)
-	if err != nil {
-		t.Fatalf("NewArcWorker: %v", err)
-	}
-	reports, err := NewTaskReports(worker)
-	if err != nil {
-		t.Fatalf("NewTaskReports: %v", err)
-	}
+	reports := reportsFor(t, store, nil)
 
-	release, ok, err := lease.Acquire(context.Background(), testRef())
-	if err != nil || !ok {
-		t.Fatalf("Acquire: held=%v err=%v, want the arc free", !ok, err)
+	err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
+		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
+	if err == nil {
+		t.Fatal("a report on a cancelled task was accepted")
 	}
-	defer release()
-
-	// The model is scripted with no replies, so a run here would fail rather
-	// than quietly do the wrong thing.
-	worked, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
-		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess})
-	if err != nil {
-		t.Fatalf("Report: %v", err)
-	}
-	if worked {
-		t.Error("an arc somebody else held was worked anyway")
-	}
-
-	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, ASYNC_TASK_RESULT"
-	if got := store.types(); got != want {
-		t.Fatalf("log = %s, want %s", got, want)
+	if got := store.types(); strings.Contains(got, "ASYNC_TASK_RESULT") {
+		t.Errorf("log = %s, want no result after the cancel", got)
 	}
 }
 
@@ -290,8 +454,10 @@ func TestALeaseIsReleased(t *testing.T) {
 
 	release, ok, err := lease.Acquire(ctx, first)
 	if err != nil || !ok {
-		t.Fatalf("a free arc could not be taken: held=%v err=%v", !ok, err)
+		t.Fatalf("Acquire: held=%v err=%v, want the arc free", !ok, err)
 	}
+	defer release()
+
 	if _, again, _ := lease.Acquire(ctx, first); again {
 		t.Error("a held arc was taken twice")
 	}
@@ -365,9 +531,9 @@ func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
 	}
 }
 
-// A task whose runner died with its process is settled, or its arc stays open
-// for ever and every later turn is told work is in flight that will never
-// report.
+// A task whose runner died with its process is settled, or nobody ever reports
+// on it. The settle is written with None visibility, correlated to the task,
+// which is the reaper's exception to results always opening an arc.
 func TestAbandonedTasksAreSettledAsUnknown(t *testing.T) {
 	store := runningTaskStore(t)
 	h, err := history.Replay("session", valuesOf(store.events))
@@ -391,6 +557,12 @@ func TestAbandonedTasksAreSettledAsUnknown(t *testing.T) {
 	if payload.Outcome != events.AsyncTaskOutcomeFailed {
 		t.Errorf("outcome = %s, want it settled as failed rather than cancelled: nobody stopped it", payload.Outcome)
 	}
+	if payload.LLMVisibility != events.LLMVisibilityNone {
+		t.Errorf("visibility = %q, want NONE: the reaper's settle opens no arc", payload.LLMVisibility)
+	}
+	if recorded.CorrelationID == nil || *recorded.CorrelationID != "task-1" {
+		t.Errorf("the settle correlates to %v, want the task", recorded.CorrelationID)
+	}
 	if text, _ := payload.Result.(string); !strings.Contains(text, "not known") {
 		t.Errorf("result = %q, want it to say whether the work happened is not known", text)
 	}
@@ -399,11 +571,12 @@ func TestAbandonedTasksAreSettledAsUnknown(t *testing.T) {
 // A task that already reported is not settled a second time.
 func TestSettlingAbandonedTasksLeavesFinishedOnesAlone(t *testing.T) {
 	store := runningTaskStore(t)
-	arc := testArcID
+	taskID := "task-1"
 	if _, err := store.Persist(context.Background(), &events.Event{
-		Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
+		Typ: events.AsyncTaskResultEventType, CorrelationID: &taskID,
 		Payload: events.AsyncTaskResultPayload{
-			CausationID: "task-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess},
+			CausationID: "task-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess,
+			LLMVisibility: events.LLMVisibilityNone},
 	}); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -429,17 +602,16 @@ func valuesOf(stored []*events.Event) []events.Event {
 	return out
 }
 
-// A report that names no agent has nobody to hand the arc to, and it is
-// refused rather than worked by a guess: the caller that hands a report over
-// is where the agent is known, so one that cannot name it has nothing to
-// hand the worker.
+// A report that names no agent has nobody to hand the arc it opens to, and it
+// is refused rather than worked by a guess: the caller that hands a report
+// over is where the agent is known, so one that cannot name it has nothing to
+// hand the queue.
 func TestAReportNamingNoAgentIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
-	reports := reportsFor(t, store)
+	reports := reportsFor(t, store, nil)
 
-	ref := TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"}
-	if _, err := reports.Report(context.Background(), ref, "", TaskReport{
-		Kind: TaskReportNotification, Message: "half through",
+	if err := reports.Report(context.Background(), taskRef(), "", TaskReport{
+		Kind: TaskReportNotification, Class: "detail", Message: "half through",
 	}); err == nil {
 		t.Error("a report naming no agent was accepted")
 	}

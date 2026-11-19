@@ -190,12 +190,15 @@ func taskConversation(t *testing.T, waiting bool) *history.History {
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &first,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
-		{ID: "task-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &first,
-			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+		{ID: "task-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &first, Actor: actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
 	}
 	if waiting {
-		log = append(log, events.Event{ID: "ask-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &first,
-			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "which namespace?"}})
+		// An ask is always AsMessage, so it opens an arc of its own, which is
+		// where the answer is later recorded.
+		askArc := "arc-ask"
+		log = append(log, events.Event{ID: "ask-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
+			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage}})
 	}
 	log = append(log, events.Event{ID: second, Seq: 4, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &second, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "kube-system", Actor: actor}})
@@ -264,17 +267,27 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	persistor := runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{
 		VendorID: "call_1", ToolName: "auditor", Args: map[string]any{"namespace": "kube-system"}})
 
-	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, ASYNC_TASK_INVOKE, TOOL_RESULT, ASSISTANT_MESSAGE"
+	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, ASYNC_TASK_INVOKE, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
 	if got := typesOf(persistor.persisted); got != want {
 		t.Fatalf("wrote %s, want %s", got, want)
 	}
 
-	task := h.Arcs[0].AsyncTasks[0]
-	if started.ID != task.ID {
-		t.Errorf("the task was started as %q, want the id of the record that named it (%q)", started.ID, task.ID)
+	task := h.Tasks[started.ID]
+	if task == nil {
+		t.Fatalf("no task %q in the session's task table", started.ID)
 	}
-	if started.ArcID != testArcID || started.Name != "auditor" {
-		t.Errorf("ref = %#v, want it to carry the arc and the kind of task", started)
+	if started.SessionID != testSessionID {
+		t.Errorf("ref = %#v, want it to name the session, not an arc", started)
+	}
+	// The invoke records the actor that started the task, and the task table
+	// carries it forward for every event the task later emits.
+	if task.Actor == nil || task.Actor.UserID != "alice" {
+		t.Errorf("task actor = %v, want alice, whose message opened the arc", task.Actor)
+	}
+	for _, ev := range persistor.persisted {
+		if ev.Typ == events.AsyncTaskInvokeEventType && ev.Actor.UserID != "alice" {
+			t.Errorf("invoke event actor = %v, want alice", ev.Actor)
+		}
 	}
 
 	// The model is told the id, because it is the only way it can answer the
@@ -284,14 +297,23 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	}
 }
 
-// A task the arc started keeps the arc open.
-func TestAStartedTaskLeavesTheArcOpen(t *testing.T) {
+// AC3: a running task does not hold its arc open. The arc closes on the last
+// response that requested no tool calls, while the task runs on as an object
+// of the session.
+func TestAStartedTaskDoesNotHoldTheArcOpen(t *testing.T) {
 	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
 	h := userArcHistory(t)
-	runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
+	persistor := runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
-	if status := h.Arcs[0].Status(); status != history.ArcStatusPending {
-		t.Errorf("arc is %s, want it held open by the task it started", status)
+	if status := h.Arcs[0].Status(); status != history.ArcStatusDone {
+		t.Errorf("arc is %s, want it closed while its task runs on", status)
+	}
+	if got := typesOf(persistor.persisted); !strings.Contains(got, "ARC_CLOSED") {
+		t.Errorf("wrote %s, want the close (KX) recorded", got)
+	}
+	tasks2 := h.TasksInOrder()
+	if len(tasks2) != 1 || tasks2[0].Status != history.AsyncTaskPending {
+		t.Errorf("tasks = %+v, want the one started task still pending", tasks2)
 	}
 }
 
@@ -306,17 +328,19 @@ func TestATaskThatCouldNotBeStartedIsSettledAsUnknown(t *testing.T) {
 	if got := typesOf(persistor.persisted); got != want {
 		t.Fatalf("wrote %s, want %s", got, want)
 	}
-	if status := h.Arcs[0].AsyncTasks[0].Status; status != history.AsyncTaskFailed {
-		t.Errorf("task is %s, want it settled", status)
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task is %s, want it settled", task.Status)
 	}
 	if text := resultText(t, lastCallIn(t, h, testArcID)); !strings.Contains(text, "not known") {
 		t.Errorf("result = %q, want it to say the effect is unknown", text)
 	}
 }
 
-// A cancel asks the task to stop and writes nothing about it. What became of
-// work already under way is the runner's to report.
-func TestCancellingATaskWritesNothingAboutIt(t *testing.T) {
+// A cancel naming a task is written as a CANCEL event whose correlation is the
+// task ID — which is what settles the task in the log, with who and when — and
+// then reaches the runner through the controller. What became of work already
+// under way is the runner's to report.
+func TestCancellingATaskWritesACancelAgainstTheTask(t *testing.T) {
 	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, false)
@@ -325,26 +349,45 @@ func TestCancellingATaskWritesNothingAboutIt(t *testing.T) {
 		VendorID: "call_2", ToolName: CancelTaskTool,
 		Args: map[string]any{"task_id": "task-1", "reason": "no longer needed"}})
 
-	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
+	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, CANCEL, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
 	if got := typesOf(persistor.persisted); got != want {
 		t.Fatalf("wrote %s, want %s", got, want)
 	}
 	if len(controller.cancelled) != 1 || controller.cancelled[0].ID != "task-1" {
 		t.Fatalf("cancelled = %#v, want the one task named", controller.cancelled)
 	}
-	// The ref carries the arc that owns the task, not the arc the call was
-	// made in, since that is where a report about it has to land.
-	if got := controller.cancelled[0].ArcID; got != testArcID {
-		t.Errorf("cancelled arc = %q, want the task's own arc %q", got, testArcID)
+	if got := controller.cancelled[0].SessionID; got != testSessionID {
+		t.Errorf("cancelled session = %q, want %q", got, testSessionID)
 	}
-	if status := h.Arcs[0].AsyncTasks[0].Status; status != history.AsyncTaskPending {
-		t.Errorf("task is %s, want it left for its runner to settle", status)
+
+	// The CANCEL correlates to the task and names it in the payload, and the
+	// fold settles the task from it — actor and seq included.
+	cancel := persistor.persisted[3]
+	if cancel.Typ != events.CancelEventType || cancel.CorrelationID == nil || *cancel.CorrelationID != "task-1" {
+		t.Fatalf("cancel event = %+v, want correlation task-1", cancel)
+	}
+	if payload, ok := cancel.Payload.(events.CancelPayload); !ok || payload.TaskID == nil || *payload.TaskID != "task-1" {
+		t.Errorf("cancel payload = %#v, want TaskID task-1", cancel.Payload)
+	}
+	if cancel.Actor.UserID != "alice" {
+		t.Errorf("cancel actor = %v, want the arc's actor", cancel.Actor)
+	}
+	task := h.Tasks["task-1"]
+	if task == nil || task.Status != history.AsyncTaskCancelled {
+		t.Fatalf("task = %+v, want it settled cancelled", task)
+	}
+	if task.CancelledBy == nil || task.CancelledBy.UserID != "alice" {
+		t.Errorf("cancelled by %v, want alice", task.CancelledBy)
+	}
+	if task.FinishedSeq == nil || *task.FinishedSeq != cancel.Seq {
+		t.Errorf("finished seq = %v, want the cancel's seq %d", task.FinishedSeq, cancel.Seq)
 	}
 }
 
 // Input reaches the task before the log says it did, and the record lands on
-// the arc that owns the task rather than the one the call was made in — that
-// arc is the one waiting on the answer.
+// the arc the task's question opened rather than the one the call was made in —
+// that arc is the one waiting on the answer, and the cutoff includes the record
+// there at any point.
 func TestInputIsGivenToTheTaskBeforeItIsRecorded(t *testing.T) {
 	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
 	controller := &fakeController{}
@@ -367,10 +410,14 @@ func TestInputIsGivenToTheTaskBeforeItIsRecorded(t *testing.T) {
 	}
 
 	recorded := persistor.persisted[3]
-	if recorded.CorrelationID == nil || *recorded.CorrelationID != testArcID {
-		t.Errorf("the record landed on %v, want the arc that owns the task", recorded.CorrelationID)
+	if recorded.CorrelationID == nil || *recorded.CorrelationID != "arc-ask" {
+		t.Errorf("the record landed on %v, want the arc the ask opened", recorded.CorrelationID)
 	}
-	if status := h.Arcs[0].AsyncTasks[0].Status; status != history.AsyncTaskPending {
+	// The answer is given under the actor the invoke recorded.
+	if recorded.Actor.UserID != "alice" {
+		t.Errorf("record actor = %v, want the task's actor alice", recorded.Actor)
+	}
+	if status := h.Tasks["task-1"].Status; status != history.AsyncTaskPending {
 		t.Errorf("task is %s, want it running again", status)
 	}
 }
@@ -390,7 +437,7 @@ func TestInputThatNeverReachedTheTaskIsNotRecorded(t *testing.T) {
 	if got := typesOf(persistor.persisted); strings.Contains(got, "ASYNC_TASK_INPUT_PROVIDED") {
 		t.Fatalf("wrote %s, want no record of input the task never got", got)
 	}
-	if status := h.Arcs[0].AsyncTasks[0].Status; status != history.AsyncTaskWaiting {
+	if status := h.Tasks["task-1"].Status; status != history.AsyncTaskWaiting {
 		t.Errorf("task is %s, want it still waiting", status)
 	}
 	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "did not take the input") {
@@ -466,12 +513,12 @@ func TestCancellingAFinishedTaskSaysSo(t *testing.T) {
 // settleTask folds a completion into a history that is already built.
 func settleTask(t *testing.T, h *history.History, taskID string) {
 	t.Helper()
-	arc := testArcID
 	ev := &events.Event{
 		ID: "result-" + taskID, Seq: 5, Timestamp: time.Unix(0, 0),
-		Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
+		Typ: events.AsyncTaskResultEventType, CorrelationID: ptr(taskID),
 		Payload: events.AsyncTaskResultPayload{
-			CausationID: taskID, Result: "14 findings", Outcome: events.AsyncTaskOutcomeSuccess},
+			CausationID: taskID, Result: "14 findings", Outcome: events.AsyncTaskOutcomeSuccess,
+			LLMVisibility: events.LLMVisibilityNone},
 	}
 	if err := h.Update(ev, history.FoldStateFromHistory(h)); err != nil {
 		t.Fatalf("fold: %v", err)

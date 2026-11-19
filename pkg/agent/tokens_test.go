@@ -152,12 +152,15 @@ func TestAWorkerAddressesTheTokensItStreams(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	// The task is settled first, since an arc with one still running has no
-	// turn for the model to take.
+	// The task's result opens an arc of its own (AsMessage, fresh correlation),
+	// and that arc is what gets worked: the origin arc closed on its last
+	// reply, so it has no turn for the model to take.
+	resultArc := "arc-result"
 	if _, err := store.Persist(context.Background(), &events.Event{
-		SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr(testArcID),
+		SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: &resultArc,
 		Payload: events.AsyncTaskResultPayload{
-			CausationID: "task-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess},
+			CausationID: "task-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess,
+			LLMVisibility: events.LLMVisibilityAsMessage},
 	}); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
@@ -167,7 +170,7 @@ func TestAWorkerAddressesTheTokensItStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	if _, err := worker.Work(context.Background(), testRef(), testAgentID); err != nil {
+	if _, err := worker.Work(context.Background(), ArcRef{SessionID: testSessionID, ArcID: resultArc}, testAgentID); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 
@@ -175,8 +178,8 @@ func TestAWorkerAddressesTheTokensItStreams(t *testing.T) {
 		t.Fatalf("collected %d tokens, want the two the model wrote", len(collected.tokens))
 	}
 	for _, tok := range collected.tokens {
-		if tok.SessionID != testSessionID || tok.ArcID != testArcID {
-			t.Errorf("token %q came from %s/%s, want %s", tok.Content, tok.SessionID, tok.ArcID, testRef())
+		if tok.SessionID != testSessionID || tok.ArcID != resultArc {
+			t.Errorf("token %q came from %s/%s, want %s/%s", tok.Content, tok.SessionID, tok.ArcID, testSessionID, resultArc)
 		}
 		if tok.MessageID == "" {
 			t.Errorf("token %q names no message", tok.Content)

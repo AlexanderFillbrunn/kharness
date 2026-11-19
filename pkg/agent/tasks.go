@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
+	"fillbrunn.ai/kube-agent/pkg/events"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -21,19 +23,14 @@ const (
 )
 
 // TaskRef names one running task well enough to reach it from outside this
-// process. ID alone is the task's identity, and the rest is addressing.
+// process. ID alone is the task's identity; the session is where its log lives.
 type TaskRef struct {
-	// ArcRef is the arc that owns the task, and the session that arc is in. A
-	// report quoting an arc that does not own the task named is rejected, and
-	// a report arriving from another process has no other way to say which log
-	// to write it to.
-	ArcRef
+	// SessionID is the session whose log holds the task. A report naming a
+	// task reads that session's log, so the session has to travel with the ID.
+	SessionID string
 
-	// ID identifies the task in the log.
+	// ID identifies the task in the log: the ID of its invoke event.
 	ID string
-
-	// Name is the kind of task, as the registry knows it.
-	Name string
 }
 
 // Starter launches one kind of task and returns as soon as the work is under
@@ -67,8 +64,37 @@ type TaskController interface {
 	ProvideInput(ctx context.Context, ref TaskRef, requestID, input string) error
 }
 
-// TaskDefinition is one kind of task: how the model is offered it, and how one
-// is started.
+// NotificationClass is the declaration of one named class of notification a
+// task kind may emit. Every notification carries its class in the payload, and
+// the class decides how the event reaches the model and whether it is
+// coalesced.
+type NotificationClass struct {
+	// Visibility is how events of this class reach the model: None, AsMessage
+	// or InResult. AsMessage opens an arc, which costs a run, so the
+	// declaration is the control on that cost.
+	Visibility events.LLMVisibility
+
+	// GroupWindow is the coalescing window for an AsMessage class: at most one
+	// report per window is written. It is zero for classes that are never
+	// coalesced, which is every class but AsMessage ones.
+	GroupWindow time.Duration
+}
+
+// OverflowPolicy names what happens to an AsMessage-class notification past the
+// task's event limit.
+type OverflowPolicy string
+
+const (
+	// OverflowIgnore demotes a past-limit notification to None: it is logged
+	// and opens no arc.
+	OverflowIgnore OverflowPolicy = "IGNORE"
+	// OverflowFold demotes a past-limit notification to InResult: it is folded
+	// into the task's result message instead of opening an arc.
+	OverflowFold OverflowPolicy = "FOLD"
+)
+
+// TaskDefinition is one kind of task: how the model is offered it, how one is
+// started, and what its notifications mean.
 type TaskDefinition struct {
 	// Tool is the surface the model sees. Its name is the task's name and its
 	// schema is what the arguments are checked against, exactly as for a tool.
@@ -76,6 +102,65 @@ type TaskDefinition struct {
 
 	// Start launches the task.
 	Start Starter
+
+	// Notifications declares each named class of notification the kind may
+	// emit. A report naming a class the kind has not declared is refused at
+	// the write path, not defaulted.
+	Notifications map[string]NotificationClass
+
+	// InResultTrail is how many InResult events the task's result message
+	// carries, or -1 for the whole trail.
+	InResultTrail int
+
+	// EventLimit caps the arc-opening (AsMessage) notification events per
+	// task. Zero means no limit. Past the limit a notification is demoted per
+	// OverflowPolicy instead of opening an arc.
+	EventLimit int
+
+	// OverflowPolicy says what a past-limit AsMessage notification is demoted
+	// to: ignored (None) or folded as InResult.
+	OverflowPolicy OverflowPolicy
+}
+
+// withDefaults fills in the declarations a registration left unset.
+func (d TaskDefinition) withDefaults() TaskDefinition {
+	if d.InResultTrail == 0 {
+		d.InResultTrail = -1
+	}
+	if d.OverflowPolicy == "" {
+		d.OverflowPolicy = OverflowIgnore
+	}
+	if d.Notifications == nil {
+		d.Notifications = map[string]NotificationClass{}
+	}
+	return d
+}
+
+// TaskOption configures one kind of task beyond its tool and starter.
+type TaskOption func(*TaskDefinition)
+
+// WithNotificationClasses declares the named notification classes the kind may
+// emit.
+func WithNotificationClasses(classes map[string]NotificationClass) TaskOption {
+	return func(d *TaskDefinition) { d.Notifications = classes }
+}
+
+// WithInResultTrail sets how many InResult events the task's result message
+// carries; -1 is the whole trail.
+func WithInResultTrail(n int) TaskOption {
+	return func(d *TaskDefinition) { d.InResultTrail = n }
+}
+
+// WithEventLimit caps the arc-opening notification events per task of this
+// kind; zero means no limit.
+func WithEventLimit(n int) TaskOption {
+	return func(d *TaskDefinition) { d.EventLimit = n }
+}
+
+// WithOverflowPolicy declares what a past-limit AsMessage notification is
+// demoted to.
+func WithOverflowPolicy(policy OverflowPolicy) TaskOption {
+	return func(d *TaskDefinition) { d.OverflowPolicy = policy }
 }
 
 // TaskRegistry holds the kinds of task an agent may start. It is written
@@ -90,7 +175,7 @@ func NewTaskRegistry() *TaskRegistry {
 }
 
 // RegisterTask adds one kind of task.
-func (r *TaskRegistry) RegisterTask(tool *mcp.Tool, start Starter) error {
+func (r *TaskRegistry) RegisterTask(tool *mcp.Tool, start Starter, options ...TaskOption) error {
 	if tool == nil || tool.Name == "" {
 		return errors.New("a task needs a tool with a name")
 	}
@@ -104,7 +189,16 @@ func (r *TaskRegistry) RegisterTask(tool *mcp.Tool, start Starter) error {
 		return fmt.Errorf("task name %s is one of the tools every task registry offers", tool.Name)
 	}
 
-	r.tasks[tool.Name] = TaskDefinition{Tool: tool, Start: start}
+	definition := TaskDefinition{Tool: tool, Start: start}
+	for _, option := range options {
+		option(&definition)
+	}
+	for class, classDef := range definition.Notifications {
+		if classDef.Visibility == "" || !classDef.Visibility.Valid() {
+			return fmt.Errorf("notification class %s of task %s declares no visibility", class, tool.Name)
+		}
+	}
+	r.tasks[tool.Name] = definition.withDefaults()
 	return nil
 }
 

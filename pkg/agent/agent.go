@@ -9,6 +9,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"
+	"fillbrunn.ai/kube-agent/pkg/users"
 )
 
 var (
@@ -37,6 +38,35 @@ type Token struct {
 // EventSink and docs/EVENT-SINK.md.
 type AgentConfig struct {
 	SystemPrompt string
+
+	// TaskEventLimit is the global override of the per-kind cap on
+	// arc-opening notification events per task. Nil leaves each kind's own
+	// declaration standing; a kind's zero means no limit.
+	TaskEventLimit *int
+
+	// TaskInResultTrail is the global override of how many InResult events a
+	// task's result message carries, -1 for the whole trail. Nil leaves each
+	// kind's own declaration standing.
+	TaskInResultTrail *int
+}
+
+// eventLimit resolves the arc-opening notification cap for one task kind:
+// the config's override where one is set, the kind's declaration otherwise.
+func (c *AgentConfig) eventLimit(definition TaskDefinition) int {
+	if c.TaskEventLimit != nil {
+		return *c.TaskEventLimit
+	}
+	return definition.EventLimit
+}
+
+// inResultTrail resolves how many InResult events one task kind's result
+// message carries: the config's override where one is set, the kind's
+// declaration otherwise.
+func (c *AgentConfig) inResultTrail(definition TaskDefinition) int {
+	if c.TaskInResultTrail != nil {
+		return *c.TaskInResultTrail
+	}
+	return definition.InResultTrail
 }
 
 type Agent struct {
@@ -170,11 +200,10 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 		tokens:    run.Tokens,
 	}
 
-	// A cancelled arc has no agent work left, but the tasks it started might
-	// still be running, so closing here.
-	if state.arc.Cancel != nil {
-		return a.stopArcTasks(ctx, state)
-	}
+	// The result message of an arc this run opened by a task's result carries
+	// the task kind's InResult trail, under the config's override where one
+	// is set.
+	a.resolveTaskResultTrail(run.History, arc)
 
 	if err := a.steps(ctx, state); err != nil {
 		return a.recordFailure(ctx, err, state)
@@ -182,36 +211,23 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 	return nil
 }
 
-// stopArcTasks asks the tasks a cancelled arc started to stop.
-//
-// It writes nothing. The cancel ends the waiting, and what became of work
-// already under way is the runner's to report, so the log learns the outcome
-// when the task says what it was.
-//
-// A task that could not be reached fails the run, so whoever handed the arc
-// over comes back with it. Asking a task to stop twice is harmless, which is
-// what makes coming back safe.
-func (a Agent) stopArcTasks(ctx context.Context, state *agentState) error {
-	if a.controller == nil {
-		return nil
+// resolveTaskResultTrail sets how many InResult task events the result message
+// of the arc being run carries, when that arc was opened by a task's result.
+func (a Agent) resolveTaskResultTrail(h *history.History, arc *history.Arc) {
+	if a.config.TaskInResultTrail != nil {
+		h.TaskResultTrail = *a.config.TaskInResultTrail
+		return
 	}
-
-	reason := ""
-	if state.arc.Cancel != nil && state.arc.Cancel.Reason != nil {
-		reason = *state.arc.Cancel.Reason
+	if arc.OpenedByTask == "" {
+		return
 	}
-
-	var unreached []error
-	for _, task := range state.arc.AsyncTasks {
-		if task.FinishedSeq != nil {
-			continue
-		}
-		ref := TaskRef{ArcRef: state.ref(), ID: task.ID, Name: task.TaskName}
-		if err := a.controller.Cancel(ctx, ref, reason); err != nil {
-			unreached = append(unreached, fmt.Errorf("stop task %s: %w", task.TaskName, err))
-		}
+	task, ok := h.Tasks[arc.OpenedByTask]
+	if !ok || task.ResultArc != arc.ID {
+		return
 	}
-	return errors.Join(unreached...)
+	if definition, ok := a.tasks.Get(task.TaskName); ok {
+		h.TaskResultTrail = a.config.inResultTrail(definition)
+	}
 }
 
 // recordFailure closes an arc the agent could not finish, and returns the
@@ -505,6 +521,10 @@ func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *a
 
 // deriveArcState decides what the agent does next from the arc alone, so a run
 // picking up an arc another run left behind reaches the same decision.
+//
+// An arc closes when the agent has nothing synchronous left to do: a response
+// with no tool calls closes it, whatever tasks are unfinished. A running task
+// does not hold its arc open — its later events open arcs of their own.
 func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
 	if arc.Status() != history.ArcStatusPending {
 		return ArcStateDone, nil
@@ -527,49 +547,9 @@ func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
 
 	last := arc.Responses[len(arc.Responses)-1]
 	if len(last.ToolCalls) == 0 {
-		// A task that spoke after the last response gets the model a turn.
-		for _, task := range arc.AsyncTasks {
-			if unreportedTaskNews(task, last.Seq) {
-				return ArcStateLLM, nil
-			}
-		}
-
-		// A task outlives the response that started it, so an arc holding one
-		// is not finished however final that response reads.
-		for _, task := range arc.AsyncTasks {
-			if task.FinishedSeq == nil {
-				return ArcStateDone, nil
-			}
-		}
 		return ArcStateClose, nil
 	}
 	return ArcStateLLM, nil
-}
-
-// unreportedTaskNews reports whether a task has said something the arc's last
-// response predates: a result nobody has accounted for, or a question still
-// waiting on an answer. Both are decided by sequence number, so a turn already
-// taken is not taken again.
-//
-// A task's own notifications do not count, since whether they reach the model
-// at all is a projection setting.
-func unreportedTaskNews(task *history.AsyncTask, respondedSeq int) bool {
-	if task.FinishedSeq != nil && *task.FinishedSeq > respondedSeq {
-		return true
-	}
-	// Only a question still outstanding is worth a turn. One that has been
-	// answered is the task's to get on with, and the answer reaches the model
-	// with whatever the task makes of it.
-	return task.Status == history.AsyncTaskWaiting && lastInputRequestSeq(task) > respondedSeq
-}
-
-// lastInputRequestSeq is where the task last stopped to ask, or -1 for a task
-// that never has.
-func lastInputRequestSeq(task *history.AsyncTask) int {
-	if request := lastInputRequest(task); request != nil {
-		return request.Seq
-	}
-	return -1
 }
 
 // lastInputRequest is the question the task last stopped at, or nil for a task
@@ -599,7 +579,8 @@ func (a Agent) knows(name string) bool {
 //
 // The dispatch and the invocation are written before the task starts, in one
 // write, because the record is what names the task. The invocation ID is
-// minted here so the task can be started under it.
+// minted here so the task can be started under it, and the invoke records the
+// actor that started the task, which every event the task later emits carries.
 func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	definition, ok := a.tasks.Get(call.ToolName)
 	if !ok {
@@ -607,23 +588,29 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 	}
 
 	invocationID := NewEventID()
+	invoke := &events.Event{
+		ID:            invocationID,
+		Typ:           events.AsyncTaskInvokeEventType,
+		CorrelationID: &state.arc.ID,
+		Payload: events.AsyncTaskInvokePayload{
+			TaskName: call.ToolName,
+			Args:     call.Args,
+			Actor:    taskActor(state.arc),
+		},
+	}
+	invoke.Actor = taskActor(state.arc)
 	if _, err := a.persistAndFold(ctx, state,
 		&events.Event{
 			Typ:           events.ToolDispatchedEventType,
 			CorrelationID: &state.arc.ID,
 			Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
 		},
-		&events.Event{
-			ID:            invocationID,
-			Typ:           events.AsyncTaskInvokeEventType,
-			CorrelationID: &state.arc.ID,
-			Payload:       events.AsyncTaskInvokePayload{TaskName: call.ToolName, Args: call.Args},
-		},
+		invoke,
 	); err != nil {
 		return err
 	}
 
-	ref := TaskRef{ArcRef: state.ref(), ID: invocationID, Name: call.ToolName}
+	ref := TaskRef{SessionID: state.history.SessionID, ID: invocationID}
 	if err := definition.Start(ctx, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
@@ -633,24 +620,38 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 			"Anything it says reaches you as a turn of its own, a question included, so there is "+
 			"nothing here to wait for and nothing to poll. Answer a question of its with %s once "+
 			"you have been given one, and stop it with %s. Both take that id.",
-		ref.Name, ref.ID, ProvideTaskInputTool, CancelTaskTool)}, state)
+		call.ToolName, ref.ID, ProvideTaskInputTool, CancelTaskTool)}, state)
+}
+
+// taskActor is the actor a task's events carry: the one whose message opened
+// the arc the task started in.
+func taskActor(arc *history.Arc) users.Actor {
+	if arc.Actor != nil {
+		return *arc.Actor
+	}
+	return users.Actor{}
 }
 
 // settleUnstartedTask closes off a task whose launch failed. The task and its
 // call are settled as failed, since nothing will report on them, and the text
 // says the work may be running anyway.
+//
+// The settle is written with None visibility, correlated to the task: the run
+// that is still in flight reports the failure to the model through the call's
+// own result, so the settle opens no arc.
 func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, ref TaskRef, cause error, state *agentState) error {
 	reason := fmt.Sprintf(
 		"task %s could not be started: %s. Whether it took hold before the failure is not known, "+
-			"so check before starting it again.", ref.Name, cause)
+			"so check before starting it again.", call.ToolName, cause)
 
 	if _, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.AsyncTaskResultEventType,
-		CorrelationID: &state.arc.ID,
+		CorrelationID: &ref.ID,
 		Payload: events.AsyncTaskResultPayload{
-			CausationID: ref.ID,
-			Result:      reason,
-			Outcome:     events.AsyncTaskOutcomeFailed,
+			CausationID:   ref.ID,
+			Result:        reason,
+			Outcome:       events.AsyncTaskOutcomeFailed,
+			LLMVisibility: events.LLMVisibilityNone,
 		},
 	}); err != nil {
 		return err
@@ -658,8 +659,11 @@ func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, 
 	return a.settleCall(ctx, call, ToolOutcome{Result: reason, IsError: true}, state)
 }
 
-// cancelTask asks a running task to stop. It writes nothing about the task,
-// since what became of work already under way is the runner's to report.
+// cancelTask asks a running task to stop. The cancel is written as a CANCEL
+// event whose correlation ID is the task ID, which is what settles the task in
+// the log, with who cancelled it and when; the runner is then reached through
+// the controller. What became of work already under way is the runner's to
+// report.
 func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	if err := a.recordDispatch(ctx, call, state); err != nil {
 		return err
@@ -676,11 +680,21 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 	}
 
 	reason, _ := stringArg(call.Args, "reason")
-	ref := TaskRef{
-		ArcRef: ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
-		ID:     task.ID,
-		Name:   task.TaskName,
+	taskID := task.ID
+	cancel := &events.Event{
+		Typ:           events.CancelEventType,
+		CorrelationID: &taskID,
+		Actor:         taskActor(state.arc),
+		Payload:       events.CancelPayload{TaskID: &taskID},
 	}
+	if reason != "" {
+		cancel.Payload = events.CancelPayload{TaskID: &taskID, Reason: &reason}
+	}
+	if _, err := a.persistAndFold(ctx, state, cancel); err != nil {
+		return err
+	}
+
+	ref := TaskRef{SessionID: state.history.SessionID, ID: task.ID}
 	if err := a.controller.Cancel(ctx, ref, reason); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s could not be reached to stop it: %s", task.TaskName, err), IsError: true}, state)
@@ -694,6 +708,11 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 // provideTaskInput hands a waiting task the answer it asked for. The task is
 // given the input before the log is told, so the log cannot claim input the
 // task never received.
+//
+// The INPUT_PROVIDED record is written correlated to the arc the ask opened, so
+// the answer is in that arc's own transcript at any cutoff; the fold attaches it
+// there and it opens no other arc. The event carries the actor the invoke
+// recorded, since the answer is given under that actor.
 func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	if err := a.recordDispatch(ctx, call, state); err != nil {
 		return err
@@ -727,12 +746,7 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 			task.TaskName), IsError: true}, state)
 	}
 
-	ref := TaskRef{
-		SessionID: state.history.SessionID,
-		ArcID:     task.CorrelationID,
-		ID:        task.ID,
-		Name:      task.TaskName,
-	}
+	ref := TaskRef{SessionID: state.history.SessionID, ID: task.ID}
 	// A task somebody else answered first refuses this answer, and a task that
 	// cannot be reached at all fails the same way. Nothing here tells the two
 	// apart, so the text covers both.
@@ -743,40 +757,43 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 			task.TaskName, err), IsError: true}, state)
 	}
 
+	// The record lands on the arc the ask opened, which is where the answer
+	// belongs: that arc exists, so the event attaches to it and opens no
+	// other.
+	answerArc := task.CorrelationID
+	if task.WaitingArc != nil {
+		answerArc = *task.WaitingArc
+	}
+	provided := &events.Event{
+		Typ:           events.AsyncTaskInputProvidedEventType,
+		CorrelationID: &answerArc,
+		Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
+	}
+	if task.Actor != nil {
+		provided.Actor = *task.Actor
+	}
+
 	// Both events say the same already-settled thing, that the input reached
 	// the task, so neither may survive without the other.
-	//
-	// The record of the input belongs to the arc that owns the task, so the
-	// arc waiting on this answer is the one that reads it. It is the only
-	// event the agent writes outside the arc it is working on, and so the
-	// only write that needs the persistor to be atomic across two arcs.
 	_, err := a.persistAndFold(ctx, state,
-		&events.Event{
-			Typ:           events.AsyncTaskInputProvidedEventType,
-			CorrelationID: &task.CorrelationID,
-			Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
-		},
+		provided,
 		callResult(call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s was given the input and is running again.", task.TaskName)}, state),
 	)
 	return err
 }
 
-// addressedTask finds the task a call names, or says why it could not. The
-// reason is written for the model to act on.
+// addressedTask finds the task a call names in the session's task table, or
+// says why it could not. The reason is written for the model to act on.
 func (a Agent) addressedTask(call *history.ToolCall, state *agentState) (*history.AsyncTask, string) {
 	id, ok := stringArg(call.Args, "task_id")
 	if !ok {
 		return nil, "no task id was given"
 	}
-	for _, arc := range state.history.Arcs {
-		for _, task := range arc.AsyncTasks {
-			if task.ID == id {
-				return task, ""
-			}
-		}
+	if task, ok := state.history.Tasks[id]; ok {
+		return task, ""
 	}
-	// A task outside this conversation is as absent as one never started.
+	// A task outside this session is as absent as one never started.
 	return nil, fmt.Sprintf("no task with id %s is part of this conversation", id)
 }
 

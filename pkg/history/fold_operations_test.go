@@ -28,19 +28,19 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 		{ID: "tool-call-3", Seq: 10, Timestamp: start.Add(10 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "delete", Args: "namespace"}},
 		{ID: "interrupt-2", Seq: 11, Timestamp: start.Add(11 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{ToolCallID: "tool-call-3", Reason: "deletion needs approval"}},
 		{ID: "interrupt-response-2", Seq: 12, Timestamp: start.Add(12 * time.Second), Typ: events.InterruptResponseEventType, CorrelationID: &arc, Payload: events.InterruptResponsePayload{CausationID: "interrupt-2", IsRejected: true, Actor: user}},
-		{ID: "task-1", Seq: 13, Timestamp: start.Add(13 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Payload: events.AsyncTaskInvokePayload{TaskName: "researcher", Args: "status"}},
-		{ID: "task-event-1", Seq: 14, Timestamp: start.Add(14 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &arc, Payload: events.AsyncTaskEventPayload{CausationID: "task-1", Payload: "looking up status"}},
-		{ID: "task-input-request-1", Seq: 15, Timestamp: start.Add(15 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &arc, Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "Which cluster?"}},
-		{ID: "task-input-provided-1", Seq: 16, Timestamp: start.Add(16 * time.Second), Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &arc, Payload: events.AsyncTaskInputProvidedPayload{CausationID: "task-1", Message: "production"}},
-		{ID: "task-result-1", Seq: 17, Timestamp: start.Add(17 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: &arc, Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "healthy", Outcome: events.AsyncTaskOutcomeSuccess}},
-		{ID: "task-2", Seq: 18, Timestamp: start.Add(18 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Payload: events.AsyncTaskInvokePayload{TaskName: "failing-task"}},
-		{ID: "task-result-2", Seq: 19, Timestamp: start.Add(19 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: &arc, Payload: events.AsyncTaskResultPayload{CausationID: "task-2", Result: "unavailable", Outcome: events.AsyncTaskOutcomeFailed}},
+		{ID: "task-1", Seq: 13, Timestamp: start.Add(13 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: user, Payload: events.AsyncTaskInvokePayload{TaskName: "researcher", Args: "status", Actor: user}},
+		{ID: "task-event-1", Seq: 14, Timestamp: start.Add(14 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: ptr("task-1"), Payload: events.AsyncTaskEventPayload{CausationID: "task-1", Class: "progress", Payload: "looking up status", LLMVisibility: events.LLMVisibilityNone}},
+		{ID: "task-input-request-1", Seq: 15, Timestamp: start.Add(15 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: ptr("ask-arc-1"), Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "Which cluster?", LLMVisibility: events.LLMVisibilityAsMessage}},
+		{ID: "task-input-provided-1", Seq: 16, Timestamp: start.Add(16 * time.Second), Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: ptr("ask-arc-1"), Payload: events.AsyncTaskInputProvidedPayload{CausationID: "task-1", Message: "production"}},
+		{ID: "task-result-1", Seq: 17, Timestamp: start.Add(17 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("result-arc-1"), Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "healthy", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityAsMessage}},
+		{ID: "task-2", Seq: 18, Timestamp: start.Add(18 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: user, Payload: events.AsyncTaskInvokePayload{TaskName: "failing-task", Actor: user}},
+		{ID: "task-result-2", Seq: 19, Timestamp: start.Add(19 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("task-2"), Payload: events.AsyncTaskResultPayload{CausationID: "task-2", Result: "unavailable", Outcome: events.AsyncTaskOutcomeFailed, LLMVisibility: events.LLMVisibilityNone}},
 		{ID: "error-1", Seq: 20, Timestamp: start.Add(20 * time.Second), Typ: events.ErrorEventType, CorrelationID: &arc, Payload: events.ErrorPayload{Message: "recorded failure", CausationID: stringPtr("tool-call-1")}},
 	}
 
 	history := foldEvents(t, "session-1", log)
-	if len(history.Arcs) != 1 {
-		t.Fatalf("arcs = %#v, want a single arc opened by the user message", history.Arcs)
+	if len(history.Arcs) != 3 {
+		t.Fatalf("arcs = %d, want the origin arc plus the ask and result arcs the task opened", len(history.Arcs))
 	}
 	got := history.Arcs[0]
 	if got.ID != arc || got.Content != "Check status" || got.Actor == nil || got.Actor.UserID != user.UserID {
@@ -52,6 +52,18 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 
 	if got.Closed != nil {
 		t.Errorf("arc closed = %#v, want nil for an arc the agent never closed", got.Closed)
+	}
+
+	// The ask and the result each opened an arc of their own, with content
+	// composed from the task and the event's own payload.
+	askArc, resultArc := history.Arcs[1], history.Arcs[2]
+	if askArc.ID != "ask-arc-1" || askArc.OpenedByTask != "task-1" ||
+		askArc.Content != "Task researcher with id task-1 (asks a question)\nWhich cluster?" {
+		t.Errorf("ask arc = %#v, want the note naming the task followed by the question", askArc)
+	}
+	if resultArc.ID != "result-arc-1" || resultArc.OpenedByTask != "task-1" ||
+		resultArc.Content != "Task researcher with id task-1 (returned results)\nhealthy" {
+		t.Errorf("result arc = %#v, want the note naming the task followed by the result", resultArc)
 	}
 
 	if len(got.Responses) != 1 {
@@ -78,17 +90,30 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 		t.Errorf("tool interrupt = %#v, want nil for a call nobody was asked about", tool.Interrupt)
 	}
 
-	if len(got.AsyncTasks) != 2 {
-		t.Fatalf("async tasks = %#v, want two tasks nested under the arc", got.AsyncTasks)
+	// The session task table holds both tasks, keyed by ID, with their origin
+	// arc, actor and events.
+	if len(history.Tasks) != 2 {
+		t.Fatalf("tasks = %#v, want the two tasks in the session table", history.Tasks)
 	}
-	if got.AsyncTasks[0].Status != AsyncTaskSuccess || got.AsyncTasks[0].Result != "healthy" {
-		t.Errorf("successful task = %#v", got.AsyncTasks[0])
+	task1 := history.Tasks["task-1"]
+	if task1.Status != AsyncTaskSuccess || task1.Result != "healthy" {
+		t.Errorf("successful task = %#v", task1)
 	}
-	if transcript := got.AsyncTasks[0].Events; len(transcript) != 3 || transcript[0].Type != AsyncTaskEventNotification || transcript[1].Type != AsyncTaskEventInputRequested || transcript[2].Type != AsyncTaskEventInputProvided {
+	if task1.CorrelationID != arc || task1.Actor == nil || task1.Actor.UserID != user.UserID {
+		t.Errorf("task = %#v, want its origin arc and the actor that started it", task1)
+	}
+	if task1.ResultArc != "result-arc-1" || task1.WaitingArc != nil {
+		t.Errorf("task arcs = %q/%v, want the result arc and no waiting arc once answered", task1.ResultArc, task1.WaitingArc)
+	}
+	if transcript := task1.Events; len(transcript) != 3 || transcript[0].Type != AsyncTaskEventNotification || transcript[1].Type != AsyncTaskEventInputRequested || transcript[2].Type != AsyncTaskEventInputProvided {
 		t.Errorf("task event transcript = %#v, want notification, request, provided", transcript)
 	}
-	if got.AsyncTasks[1].Status != AsyncTaskFailed || got.AsyncTasks[1].Result != "unavailable" {
-		t.Errorf("failed task = %#v", got.AsyncTasks[1])
+	if transcript := task1.Events; transcript[0].Class != "progress" || transcript[0].Visibility != events.LLMVisibilityNone {
+		t.Errorf("notification event = %#v, want its class and visibility carried", transcript[0])
+	}
+	task2 := history.Tasks["task-2"]
+	if task2.Status != AsyncTaskFailed || task2.Result != "unavailable" || task2.ResultArc != "" {
+		t.Errorf("failed task = %#v, want it settled without opening an arc", task2)
 	}
 
 	// An interrupt hangs off the call it held up, and only a refusal settles
@@ -127,13 +152,13 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 		{ID: "pending-tool", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "pending", VendorID: "vendor"}},
 		{ID: "interrupt-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{ToolCallID: "pending-tool", Reason: "approval"}},
 		{ID: "task-1", Seq: 6, Timestamp: start.Add(6 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Payload: events.AsyncTaskInvokePayload{TaskName: "researcher"}},
-		{ID: "input-request-1", Seq: 7, Timestamp: start.Add(7 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &arc, Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "Need input"}},
+		{ID: "input-request-1", Seq: 7, Timestamp: start.Add(7 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: ptr("ask-arc-1"), Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "Need input", LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "cancel-1", Seq: 8, Timestamp: start.Add(8 * time.Second), Typ: events.CancelEventType, CorrelationID: &arc, Actor: user, Payload: events.CancelPayload{Reason: stringPtr("user stopped")}},
 	}
 
 	history := foldEvents(t, "session-1", log)
-	if len(history.Arcs) != 1 {
-		t.Fatalf("arcs = %#v, want a single arc", history.Arcs)
+	if len(history.Arcs) != 2 {
+		t.Fatalf("arcs = %#v, want the origin arc and the ask's arc", history.Arcs)
 	}
 	got := history.Arcs[0]
 
@@ -151,8 +176,8 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 	}
 	// The task was invoked, so it started, and it runs where the cancel cannot
 	// reach it. Cancelling ends the waiting, not the task.
-	if got.AsyncTasks[0].Status != AsyncTaskWaiting || got.AsyncTasks[0].FinishedAt != nil {
-		t.Errorf("task after the cancel = %#v, want it left unsettled", got.AsyncTasks[0])
+	if task := history.Tasks["task-1"]; task.Status != AsyncTaskWaiting || task.FinishedAt != nil {
+		t.Errorf("task after the cancel = %#v, want it left unsettled", task)
 	}
 	if interrupt := calls[1].Interrupt; interrupt == nil || interrupt.Status != InterruptCancelled {
 		t.Errorf("interrupt = %#v, want it cancelled with the call it held up", calls[1].Interrupt)
@@ -181,20 +206,20 @@ func TestHistoryFoldRetainsAsyncTaskNotificationsAndInputInteractions(t *testing
 			Payload: events.AsyncTaskInvokePayload{TaskName: "researcher", Args: "topic"},
 		},
 		{
-			ID: "task-event-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskEventPayload{CausationID: taskID, Payload: notification},
+			ID: "task-event-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &taskID,
+			Payload: events.AsyncTaskEventPayload{CausationID: taskID, Class: "progress", Payload: notification, LLMVisibility: events.LLMVisibilityNone},
 		},
 		{
-			ID: "input-request-1", Seq: 3, Timestamp: start.Add(3 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskInputRequestedPayload{CausationID: taskID, Message: "Which namespace?"},
+			ID: "input-request-1", Seq: 3, Timestamp: start.Add(3 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: ptr("ask-arc-1"),
+			Payload: events.AsyncTaskInputRequestedPayload{CausationID: taskID, Message: "Which namespace?", LLMVisibility: events.LLMVisibilityAsMessage},
 		},
 		{
-			ID: "input-provided-1", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &arc,
+			ID: "input-provided-1", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: ptr("ask-arc-1"),
 			Payload: events.AsyncTaskInputProvidedPayload{CausationID: taskID, Message: "production"},
 		},
 		{
-			ID: "task-result-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskResultPayload{CausationID: taskID, Result: "complete", Outcome: events.AsyncTaskOutcomeSuccess},
+			ID: "task-result-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("result-arc-1"),
+			Payload: events.AsyncTaskResultPayload{CausationID: taskID, Result: "complete", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityAsMessage},
 		},
 	}
 
@@ -206,22 +231,22 @@ func TestHistoryFoldRetainsAsyncTaskNotificationsAndInputInteractions(t *testing
 		}
 		switch i {
 		case 3:
-			if got := history.Arcs[0].AsyncTasks[0].Status; got != AsyncTaskWaiting {
+			if got := history.Tasks[taskID].Status; got != AsyncTaskWaiting {
 				t.Errorf("status after input request = %s, want %s", got, AsyncTaskWaiting)
 			}
 		case 4:
-			if got := history.Arcs[0].AsyncTasks[0].Status; got != AsyncTaskPending {
+			if got := history.Tasks[taskID].Status; got != AsyncTaskPending {
 				t.Errorf("status after input provided = %s, want %s", got, AsyncTaskPending)
 			}
 		}
 	}
-	if len(history.Arcs) != 1 {
-		t.Fatalf("arcs count = %d, want 1", len(history.Arcs))
+	if len(history.Arcs) != 3 {
+		t.Fatalf("arcs count = %d, want the origin arc plus the ask and result arcs", len(history.Arcs))
 	}
-	if len(history.Arcs[0].AsyncTasks) != 1 {
-		t.Fatalf("AsyncTasks count = %d, want 1", len(history.Arcs[0].AsyncTasks))
+	if len(history.Tasks) != 1 {
+		t.Fatalf("tasks count = %d, want 1 in the session table", len(history.Tasks))
 	}
-	task := history.Arcs[0].AsyncTasks[0]
+	task := history.Tasks[taskID]
 	if task.CorrelationID != arc {
 		t.Errorf("task correlation ID = %s, want %s", task.CorrelationID, arc)
 	}
@@ -284,8 +309,8 @@ func TestHistoryFoldNestsEachUserMessageInItsOwnArc(t *testing.T) {
 		t.Errorf("second arc responses = %#v, want only the reply to the second message", history.Arcs[1].Responses)
 	}
 	// A late event still lands on the arc it correlates to, not on the newest one.
-	if len(history.Arcs[0].AsyncTasks) != 1 || len(history.Arcs[1].AsyncTasks) != 0 {
-		t.Errorf("async tasks = %#v / %#v, want the task on the arc it correlates to", history.Arcs[0].AsyncTasks, history.Arcs[1].AsyncTasks)
+	if tasks := history.TasksOfArc(first); len(tasks) != 1 || len(history.TasksOfArc(second)) != 0 {
+		t.Errorf("tasks = %#v / %#v, want the task on the arc that started it", history.TasksOfArc(first), history.TasksOfArc(second))
 	}
 }
 
@@ -294,7 +319,9 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 	now := time.Date(2026, time.September, 17, 15, 0, 0, 0, time.UTC)
 	user := users.Actor{UserID: "user-1"}
 	history := &History{
-		LastSeq: 0,
+		LastSeq:         0,
+		Tasks:           map[string]*AsyncTask{"task-1": {ID: "task-1", CorrelationID: arc, Status: AsyncTaskPending}},
+		TaskResultTrail: -1,
 		Arcs: []*Arc{{
 			ID: "arc-1", Seq: 0, Content: "Check status", Timestamp: now, Actor: &user,
 			Responses: []*AssistantMessage{{
@@ -304,14 +331,13 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 					Interrupt: &Interrupt{ID: "interrupt-1", CorrelationID: arc, ToolCallID: "tool-1", Timestamp: now, Status: InterruptPending},
 				}},
 			}},
-			AsyncTasks: []*AsyncTask{{ID: "task-1", CorrelationID: arc, Status: AsyncTaskPending}},
 		}},
 	}
 	state := FoldStateFromHistory(history)
 	updates := []events.Event{
 		{ID: "tool-result-1", Seq: 1, Timestamp: now, Typ: events.ToolResultEventType, CorrelationID: &arc, Payload: events.ToolResultPayload{CausationID: "tool-1", Result: "done"}},
 		{ID: "interrupt-response-1", Seq: 2, Timestamp: now, Typ: events.InterruptResponseEventType, CorrelationID: &arc, Actor: user, Payload: events.InterruptResponsePayload{CausationID: "interrupt-1", Response: "approved", Actor: user}},
-		{ID: "task-result-1", Seq: 3, Timestamp: now, Typ: events.AsyncTaskResultEventType, CorrelationID: &arc, Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess}},
+		{ID: "task-result-1", Seq: 3, Timestamp: now, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("task-1"), Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityNone}},
 		{ID: "tool-call-2", Seq: 4, Timestamp: now, Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "lookup"}},
 		{ID: "tool-dispatched-1", Seq: 5, Timestamp: now, Typ: events.ToolDispatchedEventType, CorrelationID: &arc, Payload: events.ToolDispatchedPayload{CausationID: "tool-call-2"}},
 		{ID: "error-1", Seq: 6, Timestamp: now, Typ: events.ErrorEventType, CorrelationID: &arc, Payload: events.ErrorPayload{Message: "recorded failure"}},
@@ -335,8 +361,8 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 	if interrupt := got.Responses[0].ToolCalls[0].Interrupt; interrupt.Status != InterruptApproved {
 		t.Errorf("existing interrupt was not indexed for updates: %#v", interrupt)
 	}
-	if got.AsyncTasks[0].Status != AsyncTaskSuccess {
-		t.Errorf("existing async task was not indexed for updates: %#v", got.AsyncTasks[0])
+	if history.Tasks["task-1"].Status != AsyncTaskSuccess {
+		t.Errorf("existing async task was not indexed for updates: %#v", history.Tasks["task-1"])
 	}
 	if len(got.Errors) != 1 {
 		t.Errorf("existing arc was not indexed for new errors: %#v", got.Errors)
@@ -436,6 +462,10 @@ func foldEvents(t *testing.T, sessionID string, log []events.Event) *History {
 }
 
 func stringPtr(value string) *string {
+	return &value
+}
+
+func ptr[T any](value T) *T {
 	return &value
 }
 
@@ -667,9 +697,159 @@ func TestFoldRefusesAnEventItCannotAttach(t *testing.T) {
 				t.Errorf("arcs = %d, want the one arc that was opened", len(history.Arcs))
 			}
 			if len(history.Arcs[0].Responses) != 0 || len(history.Arcs[0].Errors) != 0 ||
-				len(history.Arcs[0].AsyncTasks) != 0 {
+				len(history.Tasks) != 0 {
 				t.Errorf("arc = %#v, want nothing attached to it", history.Arcs[0])
 			}
 		})
+	}
+}
+
+// AC1: a log with an invoke in arc A and a later notification correlates the
+// notification to the task, not to arc A. Replay succeeds and the session task
+// table holds the task with its events and its origin arc.
+func TestATaskEventCorrelatesToTheTaskNotItsOriginArc(t *testing.T) {
+	start := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	arc := "arc-1"
+	user := users.Actor{UserID: "user-1"}
+	taskID := "task-1"
+	log := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: user}},
+		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+			Actor: user, Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: user}},
+		{ID: "ae-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &taskID,
+			Payload: events.AsyncTaskEventPayload{CausationID: taskID, Class: "progress", Payload: "halfway", LLMVisibility: events.LLMVisibilityNone}},
+	}
+
+	h, err := Replay("session-1", log)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(h.Arcs) != 1 {
+		t.Fatalf("arcs = %d, want the one arc the notification did not open", len(h.Arcs))
+	}
+	task, ok := h.Tasks[taskID]
+	if !ok {
+		t.Fatalf("the session task table holds no task %s", taskID)
+	}
+	if task.CorrelationID != arc {
+		t.Errorf("task origin arc = %s, want %s", task.CorrelationID, arc)
+	}
+	if len(task.Events) != 1 || task.Events[0].Payload != "halfway" {
+		t.Errorf("task events = %#v, want the one notification", task.Events)
+	}
+	if task.Actor == nil || task.Actor.UserID != user.UserID {
+		t.Errorf("task actor = %v, want the actor the invoke recorded", task.Actor)
+	}
+}
+
+// R5: a task event naming a task the session does not hold is rejected by the
+// fold.
+func TestATaskEventForAnUnknownTaskIsRejected(t *testing.T) {
+	start := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	arc := "arc-1"
+	user := users.Actor{UserID: "user-1"}
+	unknown := "task-nobody-started"
+	log := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
+		{ID: "ae-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &unknown,
+			Payload: events.AsyncTaskEventPayload{CausationID: unknown, Payload: "news", LLMVisibility: events.LLMVisibilityNone}},
+	}
+	if _, err := Replay("session-1", log); err == nil {
+		t.Fatal("a task event for an unknown task was folded")
+	}
+}
+
+// AC12: the fold rejects an event whose payload visibility disagrees with its
+// correlation — AsMessage correlated to a task, None or InResult to an arc.
+func TestTheFoldRejectsAVisibilityCorrelationMismatch(t *testing.T) {
+	start := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	arc := "arc-1"
+	taskID := "task-1"
+	user := users.Actor{UserID: "user-1"}
+	opening := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
+		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+	}
+
+	cases := []struct {
+		name    string
+		typ     events.EventType
+		corr    *string
+		payload events.EventPayload
+	}{
+		{"AsMessage correlated to a task", events.AsyncTaskEventEventType, &taskID,
+			events.AsyncTaskEventPayload{CausationID: taskID, Payload: "x", LLMVisibility: events.LLMVisibilityAsMessage}},
+		{"None correlated to an arc", events.AsyncTaskEventEventType, &arc,
+			events.AsyncTaskEventPayload{CausationID: taskID, Payload: "x", LLMVisibility: events.LLMVisibilityNone}},
+		{"InResult correlated to an arc", events.AsyncTaskResultEventType, &arc,
+			events.AsyncTaskResultPayload{CausationID: taskID, Result: "r", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityInResult}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := foldEvents(t, "session-1", opening)
+			ev := events.Event{ID: "bad-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: tc.typ, CorrelationID: tc.corr, Actor: user, Payload: tc.payload}
+			if err := h.Update(&ev, FoldStateFromHistory(h)); err == nil {
+				t.Fatalf("Update(%s) error = nil, want the mismatch refused", tc.name)
+			}
+			if len(h.Arcs) != 1 {
+				t.Errorf("a refused %s minted or attached an arc", tc.name)
+			}
+		})
+	}
+}
+
+// AC5/R14: a cancel naming a task ID is folded as settling the task — with
+// who cancelled it and when — and touches no arc.
+func TestATaskAddressedCancelSettlesTheTask(t *testing.T) {
+	start := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	arc := "arc-1"
+	taskID := "task-1"
+	user := users.Actor{UserID: "user-1"}
+	reason := "no longer needed"
+	log := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
+		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+		{ID: "c-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.CancelEventType, CorrelationID: &taskID,
+			Actor: user, Payload: events.CancelPayload{TaskID: &taskID, Reason: &reason}},
+	}
+
+	h := foldEvents(t, "session-1", log)
+	task := h.Tasks[taskID]
+	if task.Status != AsyncTaskCancelled {
+		t.Errorf("task status = %s, want CANCELLED", task.Status)
+	}
+	if task.FinishedSeq == nil || *task.FinishedSeq != 2 {
+		t.Errorf("task finished seq = %v, want 2", task.FinishedSeq)
+	}
+	if task.CancelledBy == nil || task.CancelledBy.UserID != user.UserID {
+		t.Errorf("task cancelled by = %v, want the event's actor", task.CancelledBy)
+	}
+	if h.Arcs[0].Cancel != nil {
+		t.Errorf("the arc was cancelled too: %#v", h.Arcs[0].Cancel)
+	}
+}
+
+// AC5: a cancel naming an unknown task is rejected, and a task-addressed
+// cancel whose correlation is not the task ID is rejected.
+func TestATaskCancelForAnUnknownTaskIsRejected(t *testing.T) {
+	start := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	arc := "arc-1"
+	user := users.Actor{UserID: "user-1"}
+	unknown := "task-nobody-started"
+	opening := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
+	}
+	h := foldEvents(t, "session-1", opening)
+	bad := events.Event{ID: "c-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.CancelEventType,
+		CorrelationID: &unknown, Actor: user, Payload: events.CancelPayload{TaskID: &unknown}}
+	if err := h.Update(&bad, FoldStateFromHistory(h)); err == nil {
+		t.Fatal("a task-addressed cancel for an unknown task was folded")
 	}
 }

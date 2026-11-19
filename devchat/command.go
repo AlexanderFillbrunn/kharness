@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -34,10 +33,15 @@ type slashCommand struct {
 var commands = []slashCommand{
 	{
 		name:       "/cancel",
-		arg:        "[why]",
-		summary:    "stop the run",
+		arg:        "[task-id | why]",
+		summary:    "stop the run, or a task by id",
 		duringTurn: true,
 		run:        cancelTurn,
+	},
+	{
+		name:    "/tasks",
+		summary: "list tasks",
+		run:     listTasks,
 	},
 	{
 		name:    "/model",
@@ -89,20 +93,44 @@ func runCommand(m model, line string) (model, tea.Cmd) {
 	return m.refresh(), nil
 }
 
-// cancelTurn withdraws the run in progress. The record goes down before the
-// run is stopped, so the log never shows an arc being worked on after the run
-// has ended.
+// cancelTurn withdraws the run in progress, or a task when the argument names
+// one in the fold's task table. The record goes down before the run is
+// stopped, so the log never shows an arc being worked on after the run has
+// ended.
+//
+// Cancelling an arc also stops every task that arc started: that is a loop
+// over the task table, not a mechanism of its own. A cancel naming a task ID
+// writes the CANCEL event correlated to that task ID and reaches the runner
+// through the controller.
 //
 // Nothing is printed here: stopping the run brings the turn back through
 // turnDoneMsg, which says so once.
-func cancelTurn(m model, reason string) (model, tea.Cmd) {
+func cancelTurn(m model, argument string) (model, tea.Cmd) {
+	ctx := context.Background()
+
+	// A task named by ID is cancelled on its own axis, whether or not a run is
+	// in flight.
+	if argument != "" {
+		if h, err := m.session.fullHistory(ctx); err == nil {
+			if _, ok := h.Tasks[argument]; ok {
+				if err := m.session.cancelTask(ctx, argument, ""); err != nil {
+					m.transcript.fail(err)
+					return m.refresh(), nil
+				}
+				m.transcript.note(fmt.Sprintf("task %s cancelled", argument))
+				return m.refresh(), nil
+			}
+		}
+	}
+
 	if !m.running() {
 		m.transcript.note("nothing is running")
 		return m.refresh(), nil
 	}
 
 	arc := m.arc
-	if err := m.session.cancel(context.Background(), arc, reason); err != nil {
+	reason := argument
+	if err := m.session.cancel(ctx, arc, reason); err != nil {
 		// The run is left alone. A cancel that was not recorded would stop the
 		// run and leave the log saying the arc is still being worked on, and a
 		// stuck run is easier to explain than a log that disagrees with it.
@@ -111,12 +139,32 @@ func cancelTurn(m model, reason string) (model, tea.Cmd) {
 	}
 	m.cancel()
 
-	// The arc is owed one more run. The tasks it started have not been told to
-	// stop, and the worker is what tells them.
-	if !slices.Contains(m.owed, arc) {
-		m.owed = append(m.owed, arc)
+	// Every task this arc started is stopped as well, each with its own
+	// task-addressed cancel.
+	if err := m.session.cancelArcTasks(ctx, arc, reason); err != nil {
+		m.transcript.fail(err)
 	}
 
+	return m.refresh(), nil
+}
+
+// listTasks shows the fold's task table: every task in the session with its
+// status, which is what the log says rather than what the screen remembers.
+func listTasks(m model, _ string) (model, tea.Cmd) {
+	h, err := m.session.fullHistory(context.Background())
+	if err != nil {
+		m.transcript.fail(err)
+		return m.refresh(), nil
+	}
+	tasks := h.TasksInOrder()
+	if len(tasks) == 0 {
+		m.transcript.note("no tasks")
+		return m.refresh(), nil
+	}
+	for _, task := range tasks {
+		m.transcript.note(fmt.Sprintf("task %s (id %s) %s, started in arc %s",
+			task.TaskName, task.ID, task.Status, task.CorrelationID))
+	}
 	return m.refresh(), nil
 }
 

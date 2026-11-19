@@ -19,20 +19,21 @@ func (h *History) RenderChat() string {
 	var sections []string
 	sections = append(sections, fmt.Sprintf("Chat · session %s", h.SessionID))
 	for _, arc := range h.Arcs {
-		sections = append(sections, renderArc(arc))
+		sections = append(sections, renderArc(h, arc))
 	}
 	return strings.Join(sections, "\n\n") + "\n"
 }
 
-// renderArc renders the user message that opened the arc followed by every
-// response the agent gave under it.
-func renderArc(arc *Arc) string {
+// renderArc renders the record that opened the arc — the user's message or a
+// task-opened arc's composed note — followed by every response the agent gave
+// under it.
+func renderArc(h *History, arc *Arc) string {
 	author := string(MessageRoleUser)
 	if arc.Actor != nil {
 		author = arc.Actor.UserID
 	}
 
-	parts := []string{renderBubble(author, arc.Timestamp, arc.Content)}
+	parts := []string{renderBubble(author, arc.Timestamp, h.OpeningContent(arc))}
 	for _, response := range arc.Responses {
 		parts = append(parts, renderAssistantMessage(response))
 	}

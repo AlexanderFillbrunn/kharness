@@ -13,12 +13,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// cancelledArcs reports a cancel for the arcs it was told about.
+// cancelledArcs reports a cancel for the arcs it was told about, and for the
+// tasks it was told about.
 type cancelledArcs struct {
-	mu   sync.Mutex
-	arcs map[string]*events.Event
-	err  error
-	asks int
+	mu    sync.Mutex
+	arcs  map[string]*events.Event
+	tasks map[string]*events.Event
+	err   error
+	asks  int
 }
 
 func (c *cancelledArcs) Cancelled(_ context.Context, ref ArcRef) (*events.Event, error) {
@@ -29,6 +31,15 @@ func (c *cancelledArcs) Cancelled(_ context.Context, ref ArcRef) (*events.Event,
 		return nil, c.err
 	}
 	return c.arcs[ref.ArcID], nil
+}
+
+func (c *cancelledArcs) CancelledTask(_ context.Context, _ string, taskID string) (*events.Event, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.tasks[taskID], nil
 }
 
 // cancelOf is the record a cancel leaves, as a store would hand it back.
@@ -263,10 +274,11 @@ func workerOver(t *testing.T, store *logStore, controller TaskController, option
 	return worker
 }
 
-// Nobody who cancels can reach work running somewhere else, and an arc whose
-// only unfinished work is a task has no run on it to notice. So the reach
-// happens when a worker is next given the arc.
-func TestWorkingACancelledArcStopsItsTasks(t *testing.T) {
+// Cancelling an arc does not reach its tasks from the worker: "cancel every
+// task this arc started" is the harness's loop over the task table, not a
+// mechanism in the run. Working the cancelled arc writes nothing and stops
+// nothing.
+func TestWorkingACancelledArcLeavesItsTasksToTheHarness(t *testing.T) {
 	store := cancelledTaskArc(t, "changed my mind")
 	controller := &recordingController{}
 
@@ -278,53 +290,72 @@ func TestWorkingACancelledArcStopsItsTasks(t *testing.T) {
 		t.Fatal("the arc was not worked")
 	}
 
-	if len(controller.stopped) != 1 {
-		t.Fatalf("stopped %d tasks, want the one that was running", len(controller.stopped))
+	if len(controller.stopped) != 0 {
+		t.Errorf("stopped %+v, want the worker to leave the task to the harness", controller.stopped)
 	}
-	if got := controller.stopped[0]; got.ID != "task-1" || got.ArcRef != testRef() {
-		t.Errorf("stopped %+v, want task-1 under %s", got, testRef())
-	}
-	// The reason the human gave travels to the runner, which is the only place
-	// it can say why the work was called off.
-	if got := controller.reasons[0]; got != "changed my mind" {
-		t.Errorf("stopped with reason %q, want the one the cancel carried", got)
-	}
-
-	// Nothing is written. The cancel ends the waiting, and what became of work
-	// already under way is the runner's to report.
 	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, CANCEL"
 	if got := store.types(); got != want {
 		t.Errorf("log = %s, want %s", got, want)
 	}
 }
 
-// A task that could not be reached fails the run, so whoever handed the arc
-// over comes back with it. It is not recorded as a failure: the arc is already
-// closed by the cancel, and a controller nobody could reach is not a second
-// thing to put in the log.
-func TestATaskThatCannotBeStoppedFailsTheRunWithoutRecordingIt(t *testing.T) {
-	store := cancelledTaskArc(t, "changed my mind")
-	controller := &recordingController{err: errors.New("the runner is unreachable")}
+// taskCancelOf is the record a task-addressed cancel leaves: correlation ID
+// the task ID, and the payload naming it too.
+func taskCancelOf(taskID, reason string) *events.Event {
+	corr := taskID
+	payload := events.CancelPayload{TaskID: &taskID}
+	if reason != "" {
+		payload.Reason = &reason
+	}
+	return &events.Event{
+		ID: "cancel-" + taskID, Typ: events.CancelEventType, CorrelationID: &corr,
+		Payload: payload,
+	}
+}
 
-	_, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID)
-	if err == nil {
-		t.Fatal("Work reported success although the task was never told")
+// A write whose causation reaches a cancelled task is refused like a write that
+// starts work on a cancelled arc: the whole batch, ErrCancelled, nothing
+// written. A late report from a cancelled task's runner is exactly this.
+func TestTheGuardRefusesAWritingAboutACancelledTask(t *testing.T) {
+	cancels := &cancelledArcs{tasks: map[string]*events.Event{"task-1": taskCancelOf("task-1", "not needed")}}
+	inner := &fakePersistor{next: 1}
+	guarded := GuardCancellation(inner, cancels)
+	arc := testArcID
+
+	batch := []*events.Event{
+		{SessionID: testSessionID, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "wrapping up"}},
+		{SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("task-1"),
+			Payload: events.AsyncTaskResultPayload{
+				CausationID: "task-1", Result: "too late", Outcome: events.AsyncTaskOutcomeSuccess,
+				LLMVisibility: events.LLMVisibilityNone}},
+	}
+	if _, err := guarded.Persist(context.Background(), batch...); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Persist returned %v, want the whole batch refused", err)
+	}
+	if len(inner.persisted) != 0 {
+		t.Errorf("wrote %s, want nothing", typesOf(inner.persisted))
 	}
 
-	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, CANCEL"
-	if got := store.types(); got != want {
-		t.Errorf("log = %s, want %s", got, want)
+	// A batch that reaches no task is untouched by the task axis.
+	if _, err := guarded.Persist(context.Background(), &events.Event{
+		SessionID: testSessionID, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+		Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "all good"},
+	}); err != nil {
+		t.Fatalf("Persist: %v", err)
 	}
 }
 
 // An arc cancelled with nothing running is the cheap no-op the queue deals in.
 func TestWorkingACancelledArcWithNoTasksDoesNothing(t *testing.T) {
 	store := cancelledTaskArc(t, "")
-	// Settle the task, so the arc is cancelled with nothing left to reach.
+	// Settle the task with None visibility, correlated to the task, so the arc
+	// is cancelled with nothing left to reach.
 	if _, err := store.Persist(context.Background(), &events.Event{
-		SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr(testArcID),
+		SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("task-1"),
 		Payload: events.AsyncTaskResultPayload{
-			CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess},
+			CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess,
+			LLMVisibility: events.LLMVisibilityNone},
 	}); err != nil {
 		t.Fatalf("persist: %v", err)
 	}

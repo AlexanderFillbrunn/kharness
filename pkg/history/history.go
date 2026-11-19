@@ -3,6 +3,8 @@ package history
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"fillbrunn.ai/kube-agent/pkg/events"
@@ -173,25 +175,50 @@ type AsyncTaskEvent struct {
 	Seq       int                `json:"seq"`
 	Timestamp time.Time          `json:"timestamp"`
 	Type      AsyncTaskEventType `json:"type"`
-	Payload   any                `json:"payload"`
+
+	// Class is the notification's own name for NOTIFICATION entries, and
+	// Visibility is the LLMVisibility the event was written with.
+	Class      string               `json:"class,omitempty"`
+	Visibility events.LLMVisibility `json:"visibility,omitempty"`
+
+	Payload any `json:"payload"`
 }
 
 // AsyncTask is a unit of work that runs outside the agent's turn and reports
-// back through events.
+// back through events. A task belongs to the session, not to its origin arc:
+// the session-level task table is its only home, and the invoke event's place
+// in the origin arc is its correlation.
 type AsyncTask struct {
 	ID string `json:"id"`
 
 	// Seq is the sequence number of the event that invoked the task.
 	Seq int `json:"seq"`
 
-	// CorrelationID is the arc that owns this task. Cancelling that arc stops
-	// the task.
+	// CorrelationID is the arc that started this task: the task's origin arc.
 	CorrelationID string `json:"correlation_id"`
 
 	TaskName string          `json:"task_name"`
 	Status   AsyncTaskStatus `json:"status"`
 	Args     any             `json:"args,omitempty"`
 	Result   any             `json:"result,omitempty"`
+
+	// Actor is who started the task, recorded on the invoke and copied
+	// forward onto every event the task emits. It records who started the
+	// work; it is not a live grant of authority.
+	Actor *users.Actor `json:"actor,omitempty"`
+
+	// CancelledBy is who cancelled the task, set by a task-addressed cancel.
+	CancelledBy *users.Actor `json:"cancelled_by,omitempty"`
+
+	// WaitingArc names the arc the task's outstanding question opened, and is
+	// nil while the task is not waiting. An answer is written correlated to
+	// that arc.
+	WaitingArc *string `json:"waiting_arc,omitempty"`
+
+	// ResultArc names the arc the task's result opened, where the result was
+	// written AsMessage. The completion of such a task is that arc of its own
+	// rather than a note in the origin arc.
+	ResultArc string `json:"result_arc,omitempty"`
 
 	// Events is the full transcript of the task: notifications it emitted and
 	// every input interaction it went through.
@@ -221,22 +248,29 @@ const (
 	ArcStatusError ArcStatus = "ERROR"
 )
 
-// Arc represents one user message in the conversation, including its responses
-// and other events. Every other record carries the arc's ID as its correlation
-// ID, which is what nests it here.
+// Arc represents one opening record in the conversation — a user message or a
+// task event written AsMessage — including its responses and other events.
+// Every other record carries the arc's ID as its correlation ID, which is what
+// nests it here.
 type Arc struct {
 	// ID is the correlation ID every record in this arc is tagged with.
 	ID string `json:"id"`
 
 	Seq int `json:"seq"`
 
-	// Content is what the user said to open the arc.
+	// Content is what opened the arc: the user's words, or for a task-opened
+	// arc the note naming the task followed by the event's own content.
 	Content string `json:"content"`
 
 	Timestamp time.Time `json:"timestamp"`
 
-	// Actor is who sent the user message.
+	// Actor is who opened the arc: the user who sent the message, or the
+	// actor the task event carried.
 	Actor *users.Actor `json:"actor,omitempty"`
+
+	// OpenedByTask names the task whose event opened this arc, and is empty
+	// for an arc a user message opened.
+	OpenedByTask string `json:"opened_by_task,omitempty"`
 
 	// Cancel is set once the arc has been cancelled, and is nil otherwise. An
 	// arc can only be cancelled once.
@@ -250,8 +284,7 @@ type Arc struct {
 	// produce several, since each round of tool calls yields another message.
 	Responses []*AssistantMessage `json:"responses"`
 
-	Errors     []*Error     `json:"errors"`
-	AsyncTasks []*AsyncTask `json:"async_tasks"`
+	Errors []*Error `json:"errors"`
 }
 
 // Status computes the status of an arc. It is not a field lookup and should be
@@ -428,8 +461,19 @@ type Error struct {
 type History struct {
 	SessionID string
 
-	// Arcs holds one arc per user message, in the order the user sent them.
+	// Arcs holds one arc per opening record, in the order they were opened.
 	Arcs []*Arc
+
+	// Tasks is the session-level task table: every task in the session, keyed
+	// by task ID. A task is an object of the session, not of its origin arc;
+	// the invoke event's place in the origin arc is its correlation.
+	Tasks map[string]*AsyncTask
+
+	// TaskResultTrail is how many InResult task events the result message of
+	// a result-opened arc carries, or -1 for the whole trail. It is set by
+	// whoever builds the read model, from the task kind's declaration with the
+	// agent config's override.
+	TaskResultTrail int
 
 	// LastSeq is the sequence number of the last event applied. Events arrive
 	// in increasing sequence order and may skip numbers, since a history holds
@@ -441,9 +485,60 @@ type History struct {
 // that the log's first event, numbered 0, is accepted.
 func NewHistory(id string) *History {
 	return &History{
-		SessionID: id,
-		LastSeq:   -1,
+		SessionID:       id,
+		Tasks:           map[string]*AsyncTask{},
+		TaskResultTrail: -1,
+		LastSeq:         -1,
 	}
+}
+
+// TasksInOrder returns the session's tasks in log order.
+func (h *History) TasksInOrder() []*AsyncTask {
+	tasks := make([]*AsyncTask, 0, len(h.Tasks))
+	for _, task := range h.Tasks {
+		tasks = append(tasks, task)
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Seq < tasks[j].Seq })
+	return tasks
+}
+
+// TasksOfArc returns the tasks an arc started, in log order.
+func (h *History) TasksOfArc(arcID string) []*AsyncTask {
+	var tasks []*AsyncTask
+	for _, task := range h.TasksInOrder() {
+		if task.CorrelationID == arcID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+// OpeningContent returns what an arc's opening record says: its Content, with
+// the InResult trail of its task folded in where the arc was opened by a
+// task's result. The trail carries the last TaskResultTrail InResult events,
+// or all of them at -1.
+func (h *History) OpeningContent(arc *Arc) string {
+	if arc.OpenedByTask == "" {
+		return arc.Content
+	}
+	task, ok := h.Tasks[arc.OpenedByTask]
+	if !ok || task.ResultArc != arc.ID {
+		return arc.Content
+	}
+
+	var trail []string
+	for _, event := range task.Events {
+		if event.Type == AsyncTaskEventNotification && event.Visibility.Effective() == events.LLMVisibilityInResult {
+			trail = append(trail, resultText(event.Payload))
+		}
+	}
+	if h.TaskResultTrail >= 0 && len(trail) > h.TaskResultTrail {
+		trail = trail[len(trail)-h.TaskResultTrail:]
+	}
+	if len(trail) == 0 {
+		return arc.Content
+	}
+	return arc.Content + "\n" + strings.Join(trail, "\n")
 }
 
 // FoldStateFromHistory rebuilds the lookup index for an already-folded
@@ -463,9 +558,9 @@ func FoldStateFromHistory(h *History) *FoldState {
 				}
 			}
 		}
-		for _, task := range arc.AsyncTasks {
-			state.asyncTasks[task.ID] = task
-		}
+	}
+	for _, task := range h.Tasks {
+		state.asyncTasks[task.ID] = task
 	}
 	return state
 }
@@ -546,8 +641,8 @@ func (h *History) applyEvent(ev *events.Event, state *FoldState) error {
 	return nil
 }
 
-// applyUserMessage opens a new arc. This is the only event that creates one;
-// every other event attaches to an arc that already exists.
+// applyUserMessage opens a new arc. It is one of the two kinds of opening
+// record; the other is a task event written AsMessage.
 func (h *History) applyUserMessage(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.UserMessagePayload)
 	if !ok {
@@ -764,7 +859,9 @@ func (h *History) applyInterruptResponse(ev *events.Event, state *FoldState) err
 	return nil
 }
 
-// applyAsyncTaskInvoke starts a task under the arc that launched it.
+// applyAsyncTaskInvoke starts a task in the session's task table, under the
+// arc that launched it. The invoke is recorded inside the invoking arc; every
+// later task event names the task by ID in its payload.
 func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.AsyncTaskInvokePayload)
 	if !ok {
@@ -777,6 +874,7 @@ func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error
 	if !ok {
 		return fmt.Errorf("no arc with ID=%s found for async task invoke", *ev.CorrelationID)
 	}
+	_ = arc
 
 	task := &AsyncTask{
 		ID:            ev.ID,
@@ -787,30 +885,118 @@ func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error
 		Args:          pl.Args,
 		Events:        make([]AsyncTaskEvent, 0),
 	}
+	if pl.Actor != (users.Actor{}) {
+		actor := pl.Actor
+		task.Actor = &actor
+	}
 
-	arc.AsyncTasks = append(arc.AsyncTasks, task)
+	h.Tasks[task.ID] = task
 	state.asyncTasks[task.ID] = task
 	return nil
 }
 
+// routeTaskEvent decides where a task-emitted event goes from its correlation
+// and its payload's LLMVisibility, and cross-checks the two: AsMessage must
+// correlate to an arc, None and InResult to the task. It returns the arc the
+// event attaches to or opens, which is nil for a task-correlated event.
+func (h *History) routeTaskEvent(ev *events.Event, state *FoldState, causationID string) (*Arc, error) {
+	if ev.CorrelationID == nil {
+		return nil, fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
+	}
+	corr := *ev.CorrelationID
+	visibility := events.LLMVisibilityOf(ev.Payload).Effective()
+
+	// The task the event is about has to be in the session table already.
+	if _, ok := state.asyncTasks[causationID]; !ok {
+		return nil, fmt.Errorf("no async task with ID=%s found for %s", causationID, ev.Typ)
+	}
+
+	if visibility == events.LLMVisibilityAsMessage {
+		// AsMessage correlates to an arc. Naming a task is a mismatch.
+		if _, isTask := state.asyncTasks[corr]; isTask {
+			return nil, fmt.Errorf("%s event %q carries AsMessage visibility but correlates to task %s", ev.Typ, ev.ID, corr)
+		}
+		if arc, ok := state.arcs[corr]; ok {
+			// The correlation names an arc that exists — the INPUT_PROVIDED
+			// answer correlated to the ask's arc — so the event attaches to it
+			// and opens no other.
+			return arc, nil
+		}
+		return nil, nil // minted by the caller, which composes the content
+	}
+
+	// None and InResult correlate to the task. Naming an arc is a mismatch.
+	if _, isArc := state.arcs[corr]; isArc {
+		return nil, fmt.Errorf("%s event %q carries %s visibility but correlates to arc %s", ev.Typ, ev.ID, visibility, corr)
+	}
+	if corr != causationID {
+		return nil, fmt.Errorf("%s event %q correlates to task %s but names task %s", ev.Typ, ev.ID, corr, causationID)
+	}
+	if _, isTask := state.asyncTasks[corr]; !isTask {
+		return nil, fmt.Errorf("no async task with ID=%s found for %s", corr, ev.Typ)
+	}
+	return nil, nil
+}
+
+// mintTaskArc opens the arc an AsMessage task event opens, with ID, seq and
+// actor taken from the event, and content composed from the task and the
+// event's own payload.
+func (h *History) mintTaskArc(ev *events.Event, state *FoldState, task *AsyncTask, content string) *Arc {
+	arc := &Arc{
+		ID:           *ev.CorrelationID,
+		Seq:          ev.Seq,
+		Timestamp:    ev.Timestamp,
+		Content:      content,
+		OpenedByTask: task.ID,
+	}
+	actor := ev.Actor
+	arc.Actor = &actor
+	h.Arcs = append(h.Arcs, arc)
+	state.arcs[arc.ID] = arc
+	return arc
+}
+
+// taskArcContent composes the opening content of a task-opened arc: a note
+// naming the task, followed by the event's own content.
+func taskArcContent(task *AsyncTask, note, body string) string {
+	return fmt.Sprintf("Task %s with id %s (%s)\n%s", task.TaskName, task.ID, note, body)
+}
+
 // applyAsyncTaskResult settles a running task as successful or failed. A
 // result for a task that already finished is dropped, so a cancelled task
-// keeps that outcome.
+// keeps that outcome. A result written AsMessage opens an arc of its own
+// carrying the task's result; one written None or InResult correlates to the
+// task and opens none.
 func (h *History) applyAsyncTaskResult(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.AsyncTaskResultPayload)
 	if !ok {
 		return errors.New("expected payload type to be AsyncTaskResultPayload")
 	}
-	task, ok := state.asyncTasks[pl.CausationID]
-	if !ok {
-		return fmt.Errorf("no async task with ID=%s found for async task result", pl.CausationID)
+	if !pl.LLMVisibility.Valid() {
+		return fmt.Errorf("async task result for %s carries no valid visibility", pl.CausationID)
 	}
+	arc, err := h.routeTaskEvent(ev, state, pl.CausationID)
+	if err != nil {
+		return err
+	}
+	task := state.asyncTasks[pl.CausationID]
 	if task.FinishedAt != nil {
+		// A later report from a runner whose task is already settled is
+		// dropped, so the first report sticks.
 		return nil
 	}
 	if !pl.Outcome.Valid() {
 		return fmt.Errorf("async task result for %s carries no outcome", pl.CausationID)
 	}
+
+	visibility := pl.LLMVisibility.Effective()
+	if visibility == events.LLMVisibilityAsMessage && arc == nil {
+		arc = h.mintTaskArc(ev, state, task, taskArcContent(task, "returned results", resultText(pl.Result)))
+	}
+	if arc != nil {
+		task.ResultArc = arc.ID
+	}
+
 	task.Result = pl.Result
 	task.FinishedAt = &ev.Timestamp
 	task.FinishedSeq = &ev.Seq
@@ -833,48 +1019,88 @@ func taskStatusOf(outcome events.AsyncTaskOutcome) AsyncTaskStatus {
 }
 
 // applyAsyncTaskEvent appends a notification to the task's transcript without
-// changing its status.
+// changing its status. A notification written AsMessage opens an arc of its
+// own carrying the notification's payload; one written None or InResult
+// correlates to the task and opens none.
 func (h *History) applyAsyncTaskEvent(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.AsyncTaskEventPayload)
 	if !ok {
 		return errors.New("expected payload type to be AsyncTaskEventPayload")
 	}
-	task, ok := state.asyncTasks[pl.CausationID]
-	if !ok {
-		return fmt.Errorf("no async task with ID=%s found for async task event", pl.CausationID)
+	if !pl.LLMVisibility.Valid() {
+		return fmt.Errorf("async task event for %s carries no valid visibility", pl.CausationID)
 	}
-	appendAsyncTaskEvent(task, ev, AsyncTaskEventNotification, pl.Payload)
+	arc, err := h.routeTaskEvent(ev, state, pl.CausationID)
+	if err != nil {
+		return err
+	}
+	task := state.asyncTasks[pl.CausationID]
+
+	visibility := pl.LLMVisibility.Effective()
+	if visibility == events.LLMVisibilityAsMessage && arc == nil {
+		h.mintTaskArc(ev, state, task, taskArcContent(task, "emitted an event", resultText(pl.Payload)))
+	}
+	appendAsyncTaskEvent(task, ev, AsyncTaskEventNotification, pl.Payload, pl.Class, visibility)
 	return nil
 }
 
-// applyAsyncTaskInputRequested parks a task on the input it is asking for.
+// applyAsyncTaskInputRequested parks a task on the input it is asking for. An
+// ask is always written AsMessage, so it always opens an arc of its own — an
+// ask that opened no arc could never be answered.
 func (h *History) applyAsyncTaskInputRequested(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.AsyncTaskInputRequestedPayload)
 	if !ok {
 		return errors.New("expected payload type to be AsyncTaskInputRequestedPayload")
 	}
-	task, ok := state.asyncTasks[pl.CausationID]
-	if !ok {
-		return fmt.Errorf("no async task with ID=%s found for async task input request", pl.CausationID)
+	if !pl.LLMVisibility.Valid() {
+		return fmt.Errorf("async task input request for %s carries no valid visibility", pl.CausationID)
 	}
+	arc, err := h.routeTaskEvent(ev, state, pl.CausationID)
+	if err != nil {
+		return err
+	}
+	task := state.asyncTasks[pl.CausationID]
+
+	visibility := pl.LLMVisibility.Effective()
+	if visibility == events.LLMVisibilityAsMessage {
+		if arc == nil {
+			arc = h.mintTaskArc(ev, state, task, taskArcContent(task, "asks a question", pl.Message))
+		}
+		waiting := arc.ID
+		task.WaitingArc = &waiting
+	} else if arc != nil {
+		return fmt.Errorf("async task input request %q carries %s visibility but correlates to arc %s", ev.ID, visibility, arc.ID)
+	}
+
 	task.Status = AsyncTaskWaiting
-	appendAsyncTaskEvent(task, ev, AsyncTaskEventInputRequested, pl.Message)
+	appendAsyncTaskEvent(task, ev, AsyncTaskEventInputRequested, pl.Message, "", visibility)
 	return nil
 }
 
 // applyAsyncTaskInputProvided delivers the requested input and puts the task
-// back to running.
+// back to running. The record is correlated to the arc the ask opened, which
+// exists by then, so the fold attaches it there and opens no other.
 func (h *History) applyAsyncTaskInputProvided(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.AsyncTaskInputProvidedPayload)
 	if !ok {
 		return errors.New("expected payload type to be AsyncTaskInputProvidedPayload")
+	}
+	if ev.CorrelationID == nil {
+		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
+	}
+	if _, isTask := state.asyncTasks[*ev.CorrelationID]; isTask {
+		return fmt.Errorf("async task input %q correlates to task %s, want the arc the ask opened", ev.ID, *ev.CorrelationID)
+	}
+	if _, ok := state.arcs[*ev.CorrelationID]; !ok {
+		return fmt.Errorf("no arc with ID=%s found for async task input", *ev.CorrelationID)
 	}
 	task, ok := state.asyncTasks[pl.CausationID]
 	if !ok {
 		return fmt.Errorf("no async task with ID=%s found for async task input", pl.CausationID)
 	}
 	task.Status = AsyncTaskPending
-	appendAsyncTaskEvent(task, ev, AsyncTaskEventInputProvided, pl.Message)
+	task.WaitingArc = nil
+	appendAsyncTaskEvent(task, ev, AsyncTaskEventInputProvided, pl.Message, "", "")
 	return nil
 }
 
@@ -928,6 +1154,10 @@ func (h *History) applyGuardrailBlocked(ev *events.Event, state *FoldState) erro
 // applyCancel closes an arc, stopping its pending tool calls, unanswered
 // interrupts and unfinished async tasks. The first cancel an arc receives is
 // the one that sticks.
+//
+// A cancel whose payload names a task is task-addressed instead: its
+// correlation ID is the task ID, and the fold settles the task — status, who
+// cancelled it and when — without touching any arc.
 func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.CancelPayload)
 	if !ok {
@@ -936,6 +1166,25 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 	if ev.CorrelationID == nil {
 		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
 	}
+
+	if pl.TaskID != nil {
+		if *ev.CorrelationID != *pl.TaskID {
+			return fmt.Errorf("task-addressed cancel %q correlates to %s, want the task ID %s", ev.ID, *ev.CorrelationID, *pl.TaskID)
+		}
+		task, ok := state.asyncTasks[*pl.TaskID]
+		if !ok {
+			return fmt.Errorf("no async task with ID=%s found for cancel", *pl.TaskID)
+		}
+		if task.FinishedSeq == nil {
+			task.Status = AsyncTaskCancelled
+			task.FinishedAt = &ev.Timestamp
+			task.FinishedSeq = &ev.Seq
+			actor := ev.Actor
+			task.CancelledBy = &actor
+		}
+		return nil
+	}
+
 	arc, ok := state.arcs[*ev.CorrelationID]
 	if !ok {
 		return fmt.Errorf("no arc with ID=%s found for cancel", *ev.CorrelationID)
@@ -971,7 +1220,7 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 		}
 	}
 
-	for _, task := range arc.AsyncTasks {
+	for _, task := range h.TasksOfArc(arc.ID) {
 		if task.Status != AsyncTaskPending && task.Status != AsyncTaskWaiting {
 			continue
 		}
@@ -1028,12 +1277,14 @@ func (h *History) applyArcClosed(ev *events.Event, state *FoldState) error {
 }
 
 // appendAsyncTaskEvent adds one entry to a task's transcript.
-func appendAsyncTaskEvent(task *AsyncTask, ev *events.Event, typ AsyncTaskEventType, payload any) {
+func appendAsyncTaskEvent(task *AsyncTask, ev *events.Event, typ AsyncTaskEventType, payload any, class string, visibility events.LLMVisibility) {
 	task.Events = append(task.Events, AsyncTaskEvent{
-		ID:        ev.ID,
-		Seq:       ev.Seq,
-		Timestamp: ev.Timestamp,
-		Type:      typ,
-		Payload:   payload,
+		ID:         ev.ID,
+		Seq:        ev.Seq,
+		Timestamp:  ev.Timestamp,
+		Type:       typ,
+		Class:      class,
+		Visibility: visibility,
+		Payload:    payload,
 	})
 }

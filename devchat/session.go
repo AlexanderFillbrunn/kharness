@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"fillbrunn.ai/kube-agent/devchat/filestore"
@@ -32,6 +33,10 @@ type session struct {
 	// reaches a tool already running. It is nil for a session that only stops
 	// runs between steps.
 	cancels agent.CancelNotifier
+
+	// controller reaches the tasks this harness runs, for the cancels a
+	// command writes.
+	controller agent.TaskController
 
 	actor users.Actor
 }
@@ -83,10 +88,6 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 // and may fail: a run that hears nothing stops at its next guarded write
 // anyway.
 //
-// The tasks the arc started are not stopped here. Nobody who cancels is in a
-// position to reach work running somewhere else, so that is the worker's, and
-// the arc is owed a run for it.
-//
 // The context here is not the run's, which is about to be cancelled.
 func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	payload := events.CancelPayload{}
@@ -107,6 +108,50 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 		return nil
 	}
 	return s.cancels.NotifyCancel(ctx, s.ref(arcID))
+}
+
+// cancelTask records that the user withdrew a task, and reaches the runner
+// through the controller. The CANCEL event's correlation ID is the task ID,
+// which is what settles the task in the log, with who cancelled it and when.
+func (s *session) cancelTask(ctx context.Context, taskID, reason string) error {
+	payload := events.CancelPayload{TaskID: &taskID}
+	if reason != "" {
+		payload.Reason = &reason
+	}
+	if _, err := s.persistor.Persist(ctx, &events.Event{
+		SessionID:     s.id,
+		AgentID:       localAgentID,
+		Typ:           events.CancelEventType,
+		CorrelationID: &taskID,
+		Actor:         s.actor,
+		Payload:       payload,
+	}); err != nil {
+		return err
+	}
+	if s.controller == nil {
+		return nil
+	}
+	return s.controller.Cancel(ctx, agent.TaskRef{SessionID: s.id, ID: taskID}, reason)
+}
+
+// cancelArcTasks stops every unfinished task the arc started: a loop over the
+// fold's task table, which is what cancelling an arc's tasks is. Each one gets
+// its own task-addressed CANCEL and its own call to the controller.
+func (s *session) cancelArcTasks(ctx context.Context, arcID, reason string) error {
+	h, err := s.fullHistory(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, task := range h.TasksOfArc(arcID) {
+		if task.FinishedSeq != nil {
+			continue
+		}
+		if err := s.cancelTask(ctx, task.ID, reason); err != nil {
+			failures = append(failures, fmt.Errorf("stop task %s: %w", task.ID, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 // arcHistory loads and folds the events one arc is run from.

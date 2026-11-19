@@ -116,23 +116,36 @@ func (s *RedisEventStore) Events(ctx context.Context, sessionID string) ([]*even
 	return s.read(ctx, sessionID)
 }
 
-// GetEventsForArc returns the events one arc is projected from: everything in
-// its session up to and including the user message that opened it, plus
-// everything correlated to it afterwards.
+// GetEventsForSession returns a session's whole log in the order it was
+// written.
+func (s *RedisEventStore) GetEventsForSession(ctx context.Context, sessionID string) ([]*events.Event, error) {
+	return s.read(ctx, sessionID)
+}
+
+// GetEventsForArc returns the events one arc is run from: everything in its
+// session up to and including the event that opened the arc, plus everything
+// correlated to the arc afterwards, plus the session's task-correlated events,
+// so the fold builds the session's task table.
 //
-// That query is the projection's cutoff. A store that returned more, or less,
-// would change what the model is told. See PROJECTION.md.
+// An arc is found by its opening event — the earliest event correlated to the
+// arc ID whose kind is opening: a USER_MESSAGE, or a task event whose payload
+// carries AsMessage visibility. The cutoff rule is otherwise unchanged. That
+// query is the projection's cutoff, so a store that returned more or less of
+// the arc's own events would change what the model is told. See PROJECTION.md.
 func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref agent.ArcRef) ([]*events.Event, error) {
 	all, err := s.read(ctx, ref.SessionID)
 	if err != nil {
 		return nil, err
 	}
 
+	taskIDs := map[string]bool{}
 	opening := -1
 	for _, ev := range all {
-		if ev.Typ == events.UserMessageEventType && belongsTo(ev, ref) {
+		if ev.Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[ev.ID] = true
+		}
+		if opening < 0 && correlatesTo(ev, ref.ArcID) && events.OpensArc(ev) {
 			opening = ev.Seq
-			break
 		}
 	}
 	if opening < 0 {
@@ -141,7 +154,8 @@ func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref agent.ArcRef)
 
 	var selected []*events.Event
 	for _, ev := range all {
-		if ev.Seq <= opening || correlatesTo(ev, ref.ArcID) {
+		if ev.Seq <= opening || correlatesTo(ev, ref.ArcID) ||
+			(ev.CorrelationID != nil && taskIDs[*ev.CorrelationID]) {
 			selected = append(selected, ev)
 		}
 	}
@@ -157,6 +171,22 @@ func (s *RedisEventStore) Cancelled(ctx context.Context, ref agent.ArcRef) (*eve
 	}
 	for _, ev := range all {
 		if ev.Typ == events.CancelEventType && belongsTo(ev, ref) {
+			return ev, nil
+		}
+	}
+	return nil, nil
+}
+
+// CancelledTask returns the task-addressed cancel recorded against the task
+// named — a CANCEL whose correlation ID is the task ID — or nil where there is
+// none.
+func (s *RedisEventStore) CancelledTask(ctx context.Context, sessionID, taskID string) (*events.Event, error) {
+	all, err := s.read(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for _, ev := range all {
+		if ev.Typ == events.CancelEventType && ev.SessionID == sessionID && correlatesTo(ev, taskID) {
 			return ev, nil
 		}
 	}

@@ -196,12 +196,6 @@ type Modes struct {
 	// ToolEvents governs progress notifications emitted by a running call.
 	ToolEvents Treatment // note | elide
 
-	// AsyncEvents governs notifications a running task emitted.
-	AsyncEvents Treatment // note | elide
-
-	// AsyncInput governs a task stopping to ask a human for input.
-	AsyncInput Treatment // note | elide
-
 	// Error governs a non-fatal error the arc survived.
 	Error Treatment // note | elide
 
@@ -225,14 +219,12 @@ const DefaultQuoteLimit = 32
 // DefaultModes returns the defaults PROJECTION.md marks with `*`.
 func DefaultModes() Modes {
 	return Modes{
-		ForeignArc:  TreatmentKeep,
-		Pending:     TreatmentStandIn,
-		ToolEvents:  TreatmentElide,
-		AsyncEvents: TreatmentNote,
-		AsyncInput:  TreatmentNote,
-		Error:       TreatmentElide,
-		Interrupt:   TreatmentElide,
-		QuoteLimit:  DefaultQuoteLimit,
+		ForeignArc: TreatmentKeep,
+		Pending:    TreatmentStandIn,
+		ToolEvents: TreatmentElide,
+		Error:      TreatmentElide,
+		Interrupt:  TreatmentElide,
+		QuoteLimit: DefaultQuoteLimit,
 	}
 }
 
@@ -249,8 +241,6 @@ func (m Modes) Validate() error {
 		{"foreign_arc", m.ForeignArc, 1<<TreatmentKeep | noteOrElide},
 		{"pending", m.Pending, 1<<TreatmentStandIn | noteOrElide},
 		{"tool_events", m.ToolEvents, noteOrElide},
-		{"async_events", m.AsyncEvents, noteOrElide},
-		{"async_input", m.AsyncInput, noteOrElide},
 		{"error", m.Error, noteOrElide},
 		{"interrupt", m.Interrupt, noteOrElide},
 	} {
@@ -448,7 +438,7 @@ func planArc(arc *Arc, modes Modes, isTarget bool) arcPlan {
 
 // keepArc emits an arc's own records.
 func (p *projector) keepArc(arc *Arc) {
-	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: ModelRoleUser, Content: arc.Content})
+	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: ModelRoleUser, Content: p.history.OpeningContent(arc)})
 
 	// An arc that was cancelled or died is not coming back, which changes what
 	// an unanswered call under it means: not "no result yet" but "no result,
@@ -458,7 +448,7 @@ func (p *projector) keepArc(arc *Arc) {
 		p.projectResponse(message, stopped)
 	}
 	p.projectErrors(arc)
-	p.projectAsyncTasks(arc, stoppedSeq, stopped)
+	p.projectTasks(arc, stoppedSeq, stopped)
 }
 
 // projectResponse emits one assistant message with its calls, their results
@@ -604,8 +594,6 @@ func askNote(interrupt *Interrupt) string {
 	return note + "]"
 }
 
-// projectAsyncTasks emits the two notes every task gets, plus whatever its
-// transcript is allowed to say.
 // arcEnd reports where an arc stopped and whether it stopped at all. An arc
 // that closed normally did not stop: it finished.
 func arcEnd(arc *Arc) (int, bool) {
@@ -628,40 +616,29 @@ func taskLabel(task *AsyncTask) string {
 	return fmt.Sprintf("%s (id %s)", task.TaskName, task.ID)
 }
 
-func (p *projector) projectAsyncTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
-	for _, task := range arc.AsyncTasks {
-		// Fixed rule: a task is always two notes, one at invocation and one
-		// at completion.
+// projectTasks emits the invocation note for every task the arc started. The
+// completion of a task whose result opened an arc of its own is that arc — it
+// reaches the transcript as the arc's opening message — so no completion note
+// is emitted here for it; a task settled without opening an arc (a cancel, or
+// the startup reaper) gets its completion note where it finished.
+func (p *projector) projectTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
+	for _, task := range p.history.TasksOfArc(arc.ID) {
+		// Fixed rule: the invocation note stays in the origin arc.
 		p.emitNote(task.Seq, 0, "[task %s started: %s]", taskLabel(task), formatValue(task.Args))
 
-		for _, event := range task.Events {
-			switch event.Type {
-			case AsyncTaskEventNotification:
-				if p.modes.AsyncEvents == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s reported: %s]", taskLabel(task), formatValue(event.Payload))
-				}
-			case AsyncTaskEventInputRequested:
-				if p.modes.AsyncInput == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s is waiting for input: %s]", taskLabel(task), resultText(event.Payload))
-				}
-			case AsyncTaskEventInputProvided:
-				if p.modes.AsyncInput == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s was given input: %s]", taskLabel(task), resultText(event.Payload))
-				}
-			}
-		}
-
 		if task.FinishedSeq == nil {
-			// A task always gets its second note. An arc that is over will
-			// produce no result, so the note says what the log knows: the
-			// task was running and nobody reported what became of it.
+			// An arc that is over will produce no result for the task, so the
+			// note says what the log knows: the task was running and nobody
+			// reported what became of it. The note belongs where the arc ended,
+			// which is after everything the task managed to report.
 			if arcStopped {
-				// The note belongs where the arc ended, which is after
-				// everything the task managed to report.
 				p.emitNote(stoppedSeq, 1,
 					"[task %s was still running when this request was stopped. Whether it finished is not known.]",
 					taskLabel(task))
 			}
+			continue
+		}
+		if task.ResultArc != "" {
 			continue
 		}
 		switch task.Status {

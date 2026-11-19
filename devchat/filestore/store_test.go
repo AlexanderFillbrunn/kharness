@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/pkg/history"
 	"fillbrunn.ai/kube-agent/pkg/users"
 )
 
@@ -246,5 +248,115 @@ func TestOpenToleratesAMissingFile(t *testing.T) {
 	}
 	if len(stored) != 0 {
 		t.Errorf("a fresh log holds %d events", len(stored))
+	}
+}
+
+// AC7: GetEventsForArc finds a task-opened arc by its opening event — a task
+// event carrying AsMessage visibility, not a user message — and returns that
+// event, everything before it, and everything correlated to the arc or to a
+// task afterwards. Replay folds the arc and RenderChat shows it.
+func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
+	store := openTemp(t)
+	ctx := context.Background()
+
+	arc1, taskArc, taskID := "arc-1", "arc-task", "task-1"
+	actor := users.Actor{UserID: "dev", TenantID: "dev"}
+	invoke := &events.Event{
+		SessionID: "session", ID: taskID, Timestamp: time.Now().UTC(),
+		Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc1, Actor: actor,
+		Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor},
+	}
+	noise := &events.Event{
+		SessionID: "session", ID: "n-1", Timestamp: time.Now().UTC(),
+		Typ: events.AsyncTaskEventEventType, CorrelationID: &taskID,
+		Payload: events.AsyncTaskEventPayload{
+			CausationID: taskID, Class: "detail", Payload: "noise",
+			LLMVisibility: events.LLMVisibilityNone},
+	}
+	ask := &events.Event{
+		SessionID: "session", ID: "ask-1", Timestamp: time.Now().UTC(),
+		Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &taskArc, Actor: actor,
+		Payload: events.AsyncTaskInputRequestedPayload{
+			CausationID: taskID, Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage},
+	}
+	answer := &events.Event{
+		SessionID: "session", ID: "ap-1", Timestamp: time.Now().UTC(),
+		Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &taskArc, Actor: actor,
+		Payload: events.AsyncTaskInputProvidedPayload{CausationID: taskID, Message: "kube-system"},
+	}
+
+	var stored []events.Event
+	for _, ev := range []*events.Event{
+		userMessage(arc1, "audit the cluster"),       // seq 0
+		assistantMessage(arc1, "starting the audit"), // seq 1
+		invoke, // seq 2
+		noise,  // seq 3, correlated to the task
+		ask,    // seq 4, opens the task arc
+		assistantMessage(taskArc, "looking at it"), // seq 5
+		answer,                                 // seq 6, correlated to the task arc
+		userMessage("arc-2", "what happened?"), // seq 7, after the cutoff
+	} {
+		persisted, err := store.Persist(ctx, ev)
+		if err != nil {
+			t.Fatalf("Persist: %v", err)
+		}
+		stored = append(stored, *persisted[0])
+	}
+
+	selected, err := store.GetEventsForArc(ctx, ref(taskArc))
+	if err != nil {
+		t.Fatalf("GetEventsForArc: %v", err)
+	}
+	var seqs []int
+	for _, ev := range selected {
+		seqs = append(seqs, ev.Seq)
+	}
+	// Everything up to and including the opening ask, plus what correlates to
+	// the arc afterwards; the later user message is not in it.
+	want := []int{0, 1, 2, 3, 4, 5, 6}
+	if len(seqs) != len(want) {
+		t.Fatalf("selected seqs %v, want %v", seqs, want)
+	}
+	for i := range want {
+		if seqs[i] != want[i] {
+			t.Fatalf("selected seqs %v, want %v", seqs, want)
+		}
+	}
+
+	// The origin arc's read includes the task-correlated event, so a run sees
+	// the task table the session holds.
+	selected, err = store.GetEventsForArc(ctx, ref(arc1))
+	if err != nil {
+		t.Fatalf("GetEventsForArc: %v", err)
+	}
+	if len(selected) != 4 {
+		t.Errorf("arc-1 selected %d events, want its own three plus the task's notification", len(selected))
+	}
+
+	// Replay folds the task-opened arc, and RenderChat shows it.
+	h, err := history.Replay("session", stored)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	var opened *history.Arc
+	for _, arc := range h.Arcs {
+		if arc.ID == taskArc {
+			opened = arc
+		}
+	}
+	if opened == nil {
+		t.Fatal("replay minted no arc for the ask")
+	}
+	if opened.OpenedByTask != taskID {
+		t.Errorf("arc opened by %q, want task %s", opened.OpenedByTask, taskID)
+	}
+	if !strings.Contains(opened.Content, "asks a question") || !strings.Contains(opened.Content, "which namespace?") {
+		t.Errorf("arc content = %q, want the task note and the question", opened.Content)
+	}
+	if h.Tasks[taskID] == nil {
+		t.Error("the session task table holds no task-1")
+	}
+	if out := h.RenderChat(); !strings.Contains(out, "asks a question") {
+		t.Errorf("RenderChat does not show the task-opened arc:\n%s", out)
 	}
 }

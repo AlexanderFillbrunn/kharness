@@ -40,12 +40,15 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 			Errors: []*Error{{
 				ID: "error-1", Seq: 9, CorrelationID: "arc-1", Timestamp: now, Message: "request failed", CausationID: &causationID,
 			}},
-			AsyncTasks: []*AsyncTask{{
+		}},
+		Tasks: map[string]*AsyncTask{
+			"task-1": {
 				ID: "task-1", CorrelationID: "arc-1", TaskName: "researcher", Status: AsyncTaskSuccess,
 				Args: "topic", Result: "answer", FinishedAt: &now,
 				Events: []AsyncTaskEvent{{ID: "task-event-1", Timestamp: now, Type: AsyncTaskEventNotification, Payload: "Need input"}},
-			}},
-		}},
+			},
+		},
+		TaskResultTrail: -1,
 	}
 
 	var output bytes.Buffer

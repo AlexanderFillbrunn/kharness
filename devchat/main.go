@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -143,25 +144,30 @@ func run(storePath, settingsPath, userID string) error {
 		return err
 	}
 
+	// The work queue in this harness is the worker itself: an arc a report
+	// opened becomes a work item served from the same place a person's turn
+	// is, in arrival order, and the lease keeps two runs off one arc.
+	enqueuer := &arcEnqueuer{worker: worker, relay: relay}
+
 	session := &session{
-		id:        storePath,
-		store:     store,
-		persistor: persistor,
-		worker:    worker,
-		cancels:   cancels,
-		actor:     users.Actor{UserID: userID, TenantID: "dev"},
+		id:         storePath,
+		store:      store,
+		persistor:  persistor,
+		worker:     worker,
+		cancels:    cancels,
+		controller: runner,
+		actor:      users.Actor{UserID: userID, TenantID: "dev"},
 	}
 
 	// The inbound half. A task calls this rather than writing to the log, which
 	// is the path a job somewhere else would have to take, so the harness
 	// exercises it rather than going around it.
-	reports, err := agent.NewTaskReports(worker)
+	reports, err := agent.NewTaskReports(persistor, store, tasks, enqueuer)
 	if err != nil {
 		return err
 	}
 	runner.attach(reports, localAgentID,
 		func(ref agent.TaskRef, err error) { relay.send(taskUnfiledMsg{ref: ref, err: err}) },
-		func(arcID string) { relay.send(taskOwedMsg{arcID: arcID}) },
 	)
 
 	// The conversation already on disk is shown before anything is asked, so
@@ -187,11 +193,38 @@ func run(storePath, settingsPath, userID string) error {
 	existing := newTranscript()
 	existing.fromHistory(recorded)
 
-	program := tea.NewProgram(newModel(session, relay, settings, settingsPath, existing, worker))
+	program := tea.NewProgram(newModel(session, relay, settings, settingsPath, existing))
 	relay.attach(program)
 
 	_, err = program.Run()
 	return err
+}
+
+// arcEnqueuer is the devchat work queue: an arc a report opened is served by
+// the worker on its own goroutine, from the same queue a person's turn is
+// served from. A run that finds the arc's lease held comes back later, since
+// the holder's run covers the item by then.
+type arcEnqueuer struct {
+	worker *agent.ArcWorker
+	relay  *sender
+}
+
+func (e *arcEnqueuer) Enqueue(_ context.Context, ref agent.ArcRef, agentID string) error {
+	go func() {
+		for {
+			worked, err := e.worker.Work(context.Background(), ref, agentID)
+			if err != nil {
+				e.relay.send(arcDoneMsg{err: err})
+				return
+			}
+			if worked {
+				return
+			}
+			// The arc is held by another run, which is reading the same log.
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	return nil
 }
 
 // writeDefaultSettings leaves a settings file for the resolver to read, so a

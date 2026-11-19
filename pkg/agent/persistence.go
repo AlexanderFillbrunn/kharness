@@ -36,7 +36,23 @@ type EventPersistor interface {
 }
 
 type EventSource interface {
+	// GetEventsForArc returns the events one arc is run from: everything in
+	// its session up to and including the arc's opening event, plus everything
+	// correlated to the arc or to a task afterwards.
 	GetEventsForArc(ctx context.Context, ref ArcRef) ([]*events.Event, error)
+
+	// GetEventsForSession returns the session's whole log in the order it was
+	// written, which is what the task table and the report validation are
+	// built from.
+	GetEventsForSession(ctx context.Context, sessionID string) ([]*events.Event, error)
+}
+
+// WorkEnqueuer is the sliver of the work queue the report path needs: after an
+// opening event is persisted, the new arc becomes a work item in the same
+// queue user arcs are served from. Work items interleave in arrival order
+// across arcs and users; the per-arc lease serializes the runs of one arc.
+type WorkEnqueuer interface {
+	Enqueue(ctx context.Context, ref ArcRef, agentID string) error
 }
 
 // EventSink is told about events once they have been written. It is the

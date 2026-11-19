@@ -23,7 +23,7 @@ func TestTheViewSurvivesEveryWidth(t *testing.T) {
 		{20, 8}, {40, 14}, {96, 30}, {200, 60},
 	} {
 		settings := agent.AgentSettings{Model: agent.ModelRef{Source: "openai", Name: "gpt-5"}}
-		m := newModel(&session{}, &sender{}, settings, "", shown, nil).resize(size.width, size.height)
+		m := newModel(&session{}, &sender{}, settings, "", shown).resize(size.width, size.height)
 		if content := m.View().Content; content == "" {
 			t.Errorf("empty view at %dx%d", size.width, size.height)
 		}

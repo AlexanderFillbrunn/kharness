@@ -64,8 +64,10 @@ type ArcRunner interface {
 // that arc, and no trigger may be lost, so an enqueue must not fail
 // silently and a consume must not drop an item it could not work.
 type WorkQueue interface {
-	// Enqueue adds an item to the queue.
-	Enqueue(ctx context.Context, item WorkItem) error
+	// Enqueue adds an item for the arc named to the queue. It is the sliver of
+	// the queue the framework's report path needs, so pkg/agent can hand over
+	// an arc it opened without importing this package.
+	Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error
 	// Consume claims items and runs the worker over them, until the
 	// context is cancelled or the queue cannot go on. It returns only
 	// when there is nothing left to consume with.
@@ -194,24 +196,30 @@ func NewRedisWorkQueue(client *redis.Client, options ...QueueOption) (*RedisWork
 
 var _ WorkQueue = (*RedisWorkQueue)(nil)
 
-// Enqueue adds an item to the stream.
+// Enqueue adds an item for the arc named to the stream.
 //
-// An item naming no agent is refused before anything is written, since it
+// An arc that names no agent is refused before anything is written, since it
 // could never be worked: ArcWorker.Work refuses an empty agent id, and an
 // item enqueued anyway would fail on every consumer until it exhausted its
 // attempts and arrived in the dead stream saying nothing beyond that.
-func (q *RedisWorkQueue) Enqueue(ctx context.Context, item WorkItem) error {
-	if item.AgentID == "" {
-		return fmt.Errorf("a work item for arc %s names no agent", item.ref())
+func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error {
+	if agentID == "" {
+		return fmt.Errorf("a work item for arc %s names no agent", ref)
 	}
+	item := WorkItem{SessionID: ref.SessionID, ArcID: ref.ArcID, AgentID: agentID}
 	if err := q.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: q.stream,
 		Values: map[string]any{"payload": string(mustMarshal(item))},
 	}).Err(); err != nil {
-		return fmt.Errorf("could not enqueue a run of arc %s: %w", item.ref(), err)
+		return fmt.Errorf("could not enqueue a run of arc %s: %w", ref, err)
 	}
 	return nil
 }
+
+// redisinfra's queue satisfies the framework's sliver of it.
+var _ interface {
+	Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error
+} = (*RedisWorkQueue)(nil)
 
 // Consume claims items and works them until the context is cancelled.
 //

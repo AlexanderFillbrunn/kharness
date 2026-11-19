@@ -124,9 +124,91 @@ func (InterruptResponsePayload) EventType() EventType {
 }
 func (InterruptResponsePayload) eventPayload() {}
 
+// LLMVisibility decides which stream a task-emitted event belongs to for the
+// model: an event that opens an arc of its own (AsMessage), one folded into
+// the task's result message (InResult), or one the model never sees (None).
+// It is written once, on the write path, from the task kind's declaration, and
+// the event's correlation follows it.
+type LLMVisibility string
+
+const (
+	// LLMVisibilityNone is invisible to the model in every projection. It is
+	// in the log for the frontend and for replay.
+	LLMVisibilityNone LLMVisibility = "NONE"
+	// LLMVisibilityAsMessage correlates the event to an arc it opens, the way
+	// a user message opens one.
+	LLMVisibilityAsMessage LLMVisibility = "AS_MESSAGE"
+	// LLMVisibilityInResult correlates the event to the task and folds it into
+	// the final result message of the result-opened arc.
+	LLMVisibilityInResult LLMVisibility = "IN_RESULT"
+)
+
+// Effective returns the visibility an event carries, reading an empty one —
+// from a log line written before visibility existed — as AsMessage.
+func (v LLMVisibility) Effective() LLMVisibility {
+	if v == "" {
+		return LLMVisibilityAsMessage
+	}
+	return v
+}
+
+// Valid reports whether the visibility is one of the three, or empty.
+func (v LLMVisibility) Valid() bool {
+	switch v {
+	case "", LLMVisibilityNone, LLMVisibilityAsMessage, LLMVisibilityInResult:
+		return true
+	}
+	return false
+}
+
+// LLMVisibilityOf returns the visibility a task-emitted payload carries, or
+// "" for a payload that carries none.
+func LLMVisibilityOf(p EventPayload) LLMVisibility {
+	switch typed := p.(type) {
+	case AsyncTaskEventPayload:
+		return typed.LLMVisibility
+	case AsyncTaskInputRequestedPayload:
+		return typed.LLMVisibility
+	case AsyncTaskResultPayload:
+		return typed.LLMVisibility
+	}
+	return ""
+}
+
+// TaskCausation returns the task ID a task-emitted payload names, and whether
+// the payload names one at all.
+func TaskCausation(p EventPayload) (string, bool) {
+	switch typed := p.(type) {
+	case AsyncTaskEventPayload:
+		return typed.CausationID, true
+	case AsyncTaskInputRequestedPayload:
+		return typed.CausationID, true
+	case AsyncTaskInputProvidedPayload:
+		return typed.CausationID, true
+	case AsyncTaskResultPayload:
+		return typed.CausationID, true
+	}
+	return "", false
+}
+
+// OpensArc reports whether an event is an arc's opening record: a user message,
+// or a task-emitted event whose payload carries AsMessage visibility. An empty
+// visibility, from a log line written before visibility existed, reads as
+// AsMessage.
+func OpensArc(ev *Event) bool {
+	switch ev.Typ {
+	case UserMessageEventType:
+		return true
+	case AsyncTaskEventEventType, AsyncTaskInputRequestedEventType, AsyncTaskResultEventType:
+		return LLMVisibilityOf(ev.Payload).Effective() == LLMVisibilityAsMessage
+	}
+	return false
+}
+
 type AsyncTaskInvokePayload struct {
-	TaskName string `json:"task_name"`
-	Args     any    `json:"args"`
+	TaskName string      `json:"task_name"`
+	Args     any         `json:"args"`
+	Actor    users.Actor `json:"actor"`
 }
 
 func (AsyncTaskInvokePayload) EventType() EventType {
@@ -163,9 +245,10 @@ func (o AsyncTaskOutcome) Valid() bool {
 // AsyncTaskResultPayload settles a task. Outcome is a value rather than an
 // error flag, because work that was called off is not work that failed.
 type AsyncTaskResultPayload struct {
-	CausationID string           `json:"causation_id"`
-	Result      any              `json:"result"`
-	Outcome     AsyncTaskOutcome `json:"outcome"`
+	CausationID   string           `json:"causation_id"`
+	Result        any              `json:"result"`
+	Outcome       AsyncTaskOutcome `json:"outcome"`
+	LLMVisibility LLMVisibility    `json:"llm_visibility,omitempty"`
 }
 
 func (AsyncTaskResultPayload) EventType() EventType {
@@ -176,7 +259,11 @@ func (AsyncTaskResultPayload) eventPayload() {}
 // AsyncTaskEventPayload records a non-blocking notification emitted by a task.
 type AsyncTaskEventPayload struct {
 	CausationID string `json:"causation_id"`
-	Payload     any    `json:"payload"`
+	// Class is the notification's own name, as the task kind declared it, so
+	// the frontend and replay can tell notifications apart.
+	Class         string        `json:"class,omitempty"`
+	Payload       any           `json:"payload"`
+	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
 }
 
 func (AsyncTaskEventPayload) EventType() EventType {
@@ -185,8 +272,9 @@ func (AsyncTaskEventPayload) EventType() EventType {
 func (AsyncTaskEventPayload) eventPayload() {}
 
 type AsyncTaskInputRequestedPayload struct {
-	CausationID string `json:"causation_id"`
-	Message     string `json:"message"`
+	CausationID   string        `json:"causation_id"`
+	Message       string        `json:"message"`
+	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
 }
 
 func (AsyncTaskInputRequestedPayload) EventType() EventType {
@@ -239,6 +327,11 @@ func (ArcClosedPayload) eventPayload() {}
 
 type CancelPayload struct {
 	Reason *string `json:"reason,omitempty"`
+
+	// TaskID is set for a task-addressed cancel: the event's correlation ID is
+	// then the task ID and the fold settles the task, not an arc. Unset, the
+	// cancel is arc-addressed exactly as before.
+	TaskID *string `json:"task_id,omitempty"`
 }
 
 func (CancelPayload) EventType() EventType {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 
@@ -26,6 +25,11 @@ type (
 	eventMsg    struct{ event *events.Event }
 	turnDoneMsg struct{ err error }
 
+	// arcDoneMsg reports the end of a run the report path started on its own,
+	// for an arc a task opened. It is not the turn in the input, so it leaves
+	// the run-in-progress tracking alone.
+	arcDoneMsg struct{ err error }
+
 	// taskUnfiledMsg is a report a task could not get written at all. It comes
 	// from the task rather than the log for the one reason the log cannot
 	// carry it: there is nothing in the log to carry.
@@ -33,10 +37,6 @@ type (
 		ref agent.TaskRef
 		err error
 	}
-
-	// taskOwedMsg says a task's report did not get its arc a turn, because
-	// something else held the arc. The arc is owed a run once that is over.
-	taskOwedMsg struct{ arcID string }
 )
 
 // screenEvents is the event sink the persistor publishes to. Everything that
@@ -103,20 +103,12 @@ type model struct {
 	// to be to hand before the run has written anything to read it from.
 	arc string
 
-	// worker is how an arc is run. It is held so the interface can come back
-	// to an arc whose report arrived while something else held it.
-	worker *agent.ArcWorker
-
-	// owed are arcs a task reported on while they were busy. A report is in
-	// the log either way; what is missing is the turn it should have got.
-	owed []string
-
 	width  int
 	height int
 	ready  bool
 }
 
-func newModel(s *session, sender *sender, settings agent.AgentSettings, settingsPath string, existing *transcript, worker *agent.ArcWorker) model {
+func newModel(s *session, sender *sender, settings agent.AgentSettings, settingsPath string, existing *transcript) model {
 	input := textarea.New()
 	input.Placeholder = "Ask about the cluster…"
 	input.ShowLineNumbers = false
@@ -134,7 +126,6 @@ func newModel(s *session, sender *sender, settings agent.AgentSettings, settings
 		spinner:      spin,
 		settings:     settings,
 		settingsPath: settingsPath,
-		worker:       worker,
 	}
 }
 
@@ -161,12 +152,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.refresh(), nil
 
 	case taskUnfiledMsg:
-		m.transcript.taskSaid(msg.ref.ID, msg.ref.Name,
+		m.transcript.taskSaid(msg.ref.ID, "",
 			fmt.Sprintf("could not be filed: %v", msg.err), toolFailed)
 		return m.refresh(), nil
 
-	case taskOwedMsg:
-		return m.owe(msg.arcID)
+	case arcDoneMsg:
+		switch {
+		case msg.err == nil:
+		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, agent.ErrCancelled):
+			m.transcript.note("stopped")
+		default:
+			m.transcript.fail(msg.err)
+		}
+		return m.refresh(), nil
 
 	case turnDoneMsg:
 		m.cancel = nil
@@ -181,9 +179,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.transcript.fail(msg.err)
 		}
-		// An arc a task reported on while this run held it is owed the turn
-		// that report should have got, and now is when it can have it.
-		return m.refresh().settleOwed()
+		return m.refresh(), nil
 	}
 
 	var commands []tea.Cmd
@@ -260,42 +256,6 @@ func (m model) start(message string) (tea.Model, tea.Cmd) {
 	// Nothing is put on the screen here. The message is written to the log
 	// before anything else happens, and the persistor publishes it straight
 	// back, so showing it as well would show it twice.
-	return m.refresh(), m.spinner.Tick
-}
-
-// owe remembers an arc whose task reported while something else was working
-// it, and gives it its turn if nothing is running now.
-func (m model) owe(arcID string) (tea.Model, tea.Cmd) {
-	if !slices.Contains(m.owed, arcID) {
-		m.owed = append(m.owed, arcID)
-	}
-	return m.settleOwed()
-}
-
-// settleOwed works the first arc that is owed a turn, if the interface is free
-// to. One at a time: the next is picked up when this run reports it is done,
-// which is also what keeps two runs off one arc from this side.
-func (m model) settleOwed() (tea.Model, tea.Cmd) {
-	if m.running() || len(m.owed) == 0 || m.worker == nil {
-		return m, nil
-	}
-	arc := m.owed[0]
-	m.owed = m.owed[1:]
-
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel = cancel
-	m.arc = arc
-
-	worker, sender, session := m.worker, m.sender, m.session
-	go func() {
-		defer cancel()
-		worked, err := worker.Work(ctx, session.ref(arc), localAgentID)
-		if err == nil && !worked {
-			// Still held by somebody. The turn is still owed.
-			sender.send(taskOwedMsg{arcID: arc})
-		}
-		sender.send(turnDoneMsg{err: err})
-	}()
 	return m.refresh(), m.spinner.Tick
 }
 

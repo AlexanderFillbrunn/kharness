@@ -76,11 +76,11 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	reports, err := agent.NewTaskReports(worker)
+	reports, err := agent.NewTaskReports(persistor, store, tasks, workEnqueuer{worker})
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
-	runner.attach(reports, localAgentID, nil, nil)
+	runner.attach(reports, localAgentID, nil)
 
 	return &harness{
 		store:   store,
@@ -88,14 +88,24 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 		runner:  runner,
 		llm:     llm,
 		session: &session{
-			id:        path,
-			store:     store,
-			persistor: persistor,
-			worker:    worker,
-			cancels:   cancels,
-			actor:     users.Actor{UserID: "dev", TenantID: "dev"},
+			id:         path,
+			store:      store,
+			persistor:  persistor,
+			worker:     worker,
+			cancels:    cancels,
+			controller: runner,
+			actor:      users.Actor{UserID: "dev", TenantID: "dev"},
 		},
 	}
+}
+
+// workEnqueuer is the work queue in a test: an arc a report opened is worked
+// straight away, the way the queue serves it.
+type workEnqueuer struct{ worker *agent.ArcWorker }
+
+func (e workEnqueuer) Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error {
+	_, _ = e.worker.Work(ctx, ref, agentID)
+	return nil
 }
 
 // waitFor polls the log until it satisfies the condition, because a task runs
@@ -132,18 +142,18 @@ func logTypes(t *testing.T, h *harness) string {
 }
 
 func firstTask(h *history.History) *history.AsyncTask {
-	for _, arc := range h.Arcs {
-		if len(arc.AsyncTasks) > 0 {
-			return arc.AsyncTasks[0]
-		}
+	tasks := h.TasksInOrder()
+	if len(tasks) == 0 {
+		return nil
 	}
-	return nil
+	return tasks[0]
 }
 
-// The whole round trip: the model starts a task, the task asks for something,
-// the model puts the question to the user, the user answers in an arc of their
-// own, the answer reaches the task, and the task's result gets the arc that
-// started it a turn to report.
+// The whole round trip under the session-task model: the model starts a task
+// and its arc closes on the reply that started it; the task asks a question,
+// which opens an arc of its own that the model works; the user answers in
+// another arc, and the answer is recorded in the ask's arc; the task's result
+// opens a third arc, which the model works to report what came of the work.
 //
 // Every report goes through the ingress rather than into the log directly, so
 // what this exercises is the path a task running anywhere else would take.
@@ -170,30 +180,58 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 		t.Fatalf("first turn: %v", err)
 	}
 
-	// The arc stays open while its task runs, however final the reply reads.
+	// D1: the arc closed on its last reply even though the task it started is
+	// still running — the task is an object of the session, not of the arc.
 	folded, err := h.session.fullHistory(ctx)
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	if status := folded.Arcs[0].Status(); status != history.ArcStatusPending {
-		t.Fatalf("arc is %s, want it held open by its task", status)
+	if status := folded.Arcs[0].Status(); status != history.ArcStatusDone {
+		t.Fatalf("arc is %s, want it closed while its task runs on", status)
+	}
+	if task := firstTask(folded); task == nil || task.Status != history.AsyncTaskPending {
+		t.Fatalf("task = %+v, want the one started task still pending", firstTask(folded))
 	}
 
-	// The task reports its question through the ingress, which gives the arc a
-	// turn, and the model uses that turn to ask the user. The wait is for the
-	// reply rather than for the task's status: the record of the question is
-	// written first and the turn it earns comes after it.
-	folded = h.waitFor(t, "the question to be put to the user", func(folded *history.History) bool {
-		return len(folded.Arcs[0].Responses) >= 3
+	// The task asks a question. The ask is AsMessage, so it opens an arc of its
+	// own and that arc is served as a work item — the origin arc is not
+	// re-worked, and nothing is owed.
+	folded = h.waitFor(t, "the task to stop and ask", func(folded *history.History) bool {
+		task := firstTask(folded)
+		return task != nil && task.Status == history.AsyncTaskWaiting && task.WaitingArc != nil
 	})
 	task := firstTask(folded)
-	if task.Status != history.AsyncTaskWaiting {
-		t.Fatalf("task is %s, want it waiting on an answer", task.Status)
+	askArc := *task.WaitingArc
+	var ask *history.Arc
+	for _, arc := range folded.Arcs {
+		if arc.ID == askArc {
+			ask = arc
+		}
 	}
-
-	replies := folded.Arcs[0].Responses
-	if last := replies[len(replies)-1].Content; !strings.Contains(last, "which namespace") {
-		t.Errorf("the last reply is %q, want the task's question put to the user", last)
+	if ask == nil {
+		t.Fatalf("no arc %s for the ask; arcs are %d", askArc, len(folded.Arcs))
+	}
+	if !strings.Contains(ask.Content, "asks a question") || !strings.Contains(ask.Content, "which of kube-system") {
+		t.Errorf("ask arc content = %q, want the task note and the question", ask.Content)
+	}
+	if ask.OpenedByTask != task.ID {
+		t.Errorf("ask arc opened by %q, want the task %s", ask.OpenedByTask, task.ID)
+	}
+	// The arc was worked: the model put the question to the user in it.
+	folded = h.waitFor(t, "the question to be put to the user", func(folded *history.History) bool {
+		for _, arc := range folded.Arcs {
+			if arc.ID == askArc && len(arc.Responses) > 0 {
+				return true
+			}
+		}
+		return false
+	})
+	for _, arc := range folded.Arcs {
+		if arc.ID == askArc && len(arc.Responses) > 0 {
+			if last := arc.Responses[len(arc.Responses)-1].Content; !strings.Contains(last, "which namespace") {
+				t.Errorf("the ask arc's last reply is %q, want the task's question put to the user", last)
+			}
+		}
 	}
 
 	// The user answers. It opens an arc of its own, which is why the task's ID
@@ -204,6 +242,30 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 		t.Fatalf("second turn: %v", err)
 	}
 
+	// AC4: the answer is recorded in the ask's own arc, so the cutoff puts it
+	// in that arc's read at any point.
+	h.waitFor(t, "the answer to be recorded", func(folded *history.History) bool {
+		return strings.Contains(logTypes(t, h), string(events.AsyncTaskInputProvidedEventType))
+	})
+	askEvents, err := h.store.GetEventsForArc(ctx, h.session.ref(askArc))
+	if err != nil {
+		t.Fatalf("read the ask arc: %v", err)
+	}
+	var sawAnswer bool
+	for _, ev := range askEvents {
+		if ev.Typ == events.AsyncTaskInputProvidedEventType {
+			sawAnswer = true
+			if ev.CorrelationID == nil || *ev.CorrelationID != askArc {
+				t.Errorf("the answer is correlated to %v, want the ask's arc %s", ev.CorrelationID, askArc)
+			}
+		}
+	}
+	if !sawAnswer {
+		t.Errorf("the ask arc's read holds no ASYNC_TASK_INPUT_PROVIDED; got %s", logTypes(t, h))
+	}
+
+	// The task finishes with the answer in it, and its result opens another
+	// arc, which is worked to report the findings.
 	folded = h.waitFor(t, "the audit to finish", func(folded *history.History) bool {
 		task := firstTask(folded)
 		return task != nil && task.FinishedSeq != nil
@@ -215,15 +277,30 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 	if result, _ := task.Result.(string); !strings.Contains(result, "kube-system") {
 		t.Errorf("result = %q, want the audit to have used the answer it was given", result)
 	}
-
-	// The arc that started the work is the arc that reports it, and only then
-	// is it closed.
-	folded = h.waitFor(t, "the arc to close", func(folded *history.History) bool {
-		return folded.Arcs[0].Status() == history.ArcStatusDone
+	if task.ResultArc == "" {
+		t.Fatal("the result opened no arc")
+	}
+	folded = h.waitFor(t, "the result arc to be worked", func(folded *history.History) bool {
+		for _, arc := range folded.Arcs {
+			if arc.ID == task.ResultArc && len(arc.Responses) > 0 {
+				return true
+			}
+		}
+		return false
 	})
-	replies = folded.Arcs[0].Responses
-	if last := replies[len(replies)-1].Content; !strings.Contains(last, "two problems") {
-		t.Errorf("the last reply is %q, want it to report what the task found", last)
+	for _, arc := range folded.Arcs {
+		if arc.ID != task.ResultArc {
+			continue
+		}
+		if !strings.Contains(arc.Content, "returned results") {
+			t.Errorf("result arc content = %q, want the task note and the result", arc.Content)
+		}
+		if result, _ := task.Result.(string); !strings.Contains(arc.Content, result) {
+			t.Errorf("result arc content = %q, want the task's result %q carried whole", arc.Content, result)
+		}
+		if last := arc.Responses[len(arc.Responses)-1].Content; !strings.Contains(last, "two problems") {
+			t.Errorf("the result arc's last reply is %q, want it to report what the task found", last)
+		}
 	}
 }
 
@@ -241,9 +318,10 @@ func (h *harness) scriptAnswer(taskID string) {
 	}
 }
 
-// Stopping the arc stops what it started, and the task says so itself: a
-// cancel does not know whether work already under way stopped or what it did
-// first.
+// Cancelling an arc stops every task it started: the harness loops over the
+// fold's task table and writes a task-addressed CANCEL for each, which is what
+// settles the task in the log and reaches the runner. The runner's later
+// report about a settled task is refused, so the cancel's outcome sticks.
 func TestCancellingAnArcStopsItsTask(t *testing.T) {
 	h := newHarness(t,
 		&agent.LLMResponse{ModelID: "test", ToolCalls: []agent.LLMToolCall{
@@ -260,20 +338,46 @@ func TestCancellingAnArcStopsItsTask(t *testing.T) {
 	if err := h.session.cancel(ctx, arc, "changed my mind"); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
-
-	// The cancel is recorded and announced, and neither reaches a task running
-	// somewhere else. That is the worker's, so the arc is owed the run that
-	// does it, which is what the interface queues after a cancel.
-	if _, err := h.session.worker.Work(ctx, h.session.ref(arc), localAgentID); err != nil {
-		t.Fatalf("Work: %v", err)
+	if err := h.session.cancelArcTasks(ctx, arc, "changed my mind"); err != nil {
+		t.Fatalf("cancel the arc's tasks: %v", err)
 	}
 
-	folded := h.waitFor(t, "the task to report that it stopped", func(folded *history.History) bool {
+	folded := h.waitFor(t, "the task to be settled cancelled", func(folded *history.History) bool {
 		task := firstTask(folded)
-		return task != nil && task.FinishedSeq != nil
+		return task != nil && task.Status == history.AsyncTaskCancelled
 	})
-	if status := firstTask(folded).Status; status != history.AsyncTaskCancelled {
-		t.Errorf("task is %s, want %s", status, history.AsyncTaskCancelled)
+	task := firstTask(folded)
+	if task.CancelledBy == nil || task.CancelledBy.UserID != "dev" {
+		t.Errorf("cancelled by %v, want the session's actor", task.CancelledBy)
+	}
+	if task.FinishedSeq == nil {
+		t.Error("the cancel set no finish seq")
+	}
+
+	// The CANCEL is correlated to the task ID and names it in the payload.
+	stored, err := h.store.Events(ctx)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var sawCancel, sawResult bool
+	for _, ev := range stored {
+		if ev.Typ == events.CancelEventType && ev.CorrelationID != nil && *ev.CorrelationID == task.ID {
+			sawCancel = true
+			if payload, ok := ev.Payload.(events.CancelPayload); !ok || payload.TaskID == nil || *payload.TaskID != task.ID {
+				t.Errorf("cancel payload = %#v, want TaskID %s", ev.Payload, task.ID)
+			}
+		}
+		if ev.Typ == events.AsyncTaskResultEventType {
+			sawResult = true
+		}
+	}
+	if !sawCancel {
+		t.Errorf("no CANCEL correlated to the task in %s", logTypes(t, h))
+	}
+	// The runner's report that it stopped is refused: the task is already
+	// settled, and the cancel's outcome is what the log keeps.
+	if sawResult {
+		t.Errorf("a result was written for the cancelled task; log = %s", logTypes(t, h))
 	}
 }
 
@@ -289,8 +393,8 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: h.session.actor}},
 		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.AssistantMessageEventType, ID: "msg-1", CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "test", Content: "running"}},
-		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc,
-			Payload: events.AsyncTaskInvokePayload{TaskName: "audit_namespaces"}},
+		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc, Actor: h.session.actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "audit_namespaces", Actor: h.session.actor}},
 	} {
 		if _, err := h.session.persistor.Persist(ctx, ev); err != nil {
 			t.Fatalf("persist: %v", err)
@@ -319,6 +423,22 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	}
 	if result, _ := task.Result.(string); !strings.Contains(result, "not known") {
 		t.Errorf("result = %q, want it to say whether the work happened is not known", result)
+	}
+	// The reaper's settle is None visibility, correlated to the task: it opens
+	// no arc and reaches no model.
+	if len(folded.Arcs) != 1 {
+		t.Errorf("the settle opened %d arcs, want none (arcs: %d)", len(folded.Arcs)-1, len(folded.Arcs))
+	}
+	stored, err := h.store.Events(ctx)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	last := stored[len(stored)-1]
+	if last.Typ != events.AsyncTaskResultEventType || last.CorrelationID == nil || *last.CorrelationID != "task-1" {
+		t.Fatalf("the settle is %s correlated to %v, want a result correlated to the task", last.Typ, last.CorrelationID)
+	}
+	if payload, ok := last.Payload.(events.AsyncTaskResultPayload); !ok || payload.LLMVisibility != events.LLMVisibilityNone {
+		t.Errorf("the settle's visibility = %#v, want NONE", last.Payload)
 	}
 }
 

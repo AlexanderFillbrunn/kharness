@@ -45,7 +45,7 @@ func runningModel(t *testing.T, arc string) (model, context.Context, *filestore.
 	}
 
 	settings := agent.AgentSettings{Model: agent.ModelRef{Source: "openai", Name: "gpt-5"}}
-	m := newModel(s, &sender{}, settings, "", newTranscript(), nil).resize(80, 24)
+	m := newModel(s, &sender{}, settings, "", newTranscript()).resize(80, 24)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	m.cancel = cancel

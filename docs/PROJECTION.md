@@ -63,8 +63,10 @@ no provider understands.
 Input
 --------------------
 A projection is made for one arc. The history it receives holds every event up
-to that arc's own user message, plus every later event correlated to it. The
-read-model applies that cutoff when it builds the history.
+to that arc's own opening event — its user message, or a task event whose
+payload carries `AS_MESSAGE` visibility, which opened the arc — plus every
+later event correlated to it or to one of the session's tasks. The read-model
+applies that cutoff when it builds the history.
 
 Four consequences:
 
@@ -114,6 +116,12 @@ path from the arc down to the record. `U2` is the second user message.
 AE, AQ and AP share one counter per task, because they share one transcript.
 `A1.1, AE1.1.1, AQ1.1.2, AP1.1.3, AR1.1` reads in the order it happened.
 
+An AE, AQ or AR whose payload carries `AS_MESSAGE` visibility is an arc's
+opening record, exactly as a user message is: it opens an arc of its own, and
+that arc's opening bubble is the event's composed content (see Async tasks).
+`NONE` and `IN_RESULT` events stay correlated to the task and appear in no
+arc's transcript as their own records.
+
 TR and G are mutually exclusive for a given call. Both settle it and the first
 to arrive wins.
 
@@ -129,10 +137,10 @@ Only `KX`, `FEX.Y` and `CX.Y` can close an arc, and each names its arc in its
 own ID. An arc is open at a cutoff when no `x` event for it appears.
 
 `KX` is the agent's own record that it is finished with the arc. It is emitted
-when a response requested no tool calls and no async task under the arc is
-still running. A response is therefore not a closing event, however final it
-reads: work it started can outlive it, and an arc whose task is still running
-stays open until that task returns and the agent closes it.
+when the last response requested no tool calls, whatever tasks are unfinished:
+a running task does not hold its arc open, because the task's later events open
+arcs of their own. A response is therefore not a closing event by itself, but an
+arc whose last response asked for tools stays open until those calls settle.
 
 `FEX.Y` always closes its arc. `CX.Y` closes only when the arc was not already
 closed, which `Cancel.TerminatedWork` records. Where two closing records exist,
@@ -234,12 +242,6 @@ records into one message.
     tool_events    progress notifications emitted by a running call
                    note | elide*
 
-    async_events   notifications a running task emitted
-                   note* | elide
-
-    async_input    a task stopping to ask a human for input
-                   note* | elide
-
     error          a non-fatal error the arc survived
                    note | elide*
 
@@ -278,7 +280,10 @@ Four cases are not modes.
    The call has to be answered and the refusal is the answer. No mode reaches
    it, because no mode reaches a tool result.
 
-4. An async task is always two notes, one at invocation and one at completion.
+4. An async task invoked in the projected arc always gets its invocation note
+   there. Its completion is an arc of its own when the result was written
+   `AS_MESSAGE`; a task settled without opening an arc — a task-addressed
+   cancel, or the startup reaper — gets its completion note in the origin arc.
 
 Reasoning
 --------------------
@@ -325,19 +330,63 @@ deliberate exception rather than an established second category.
 
 Async tasks
 --------------------
-A task is always two notes.
+A task is an object of the session, not of the arc that started it. The fold
+keeps a session-level task table keyed by task ID, and the invocation note is
+emitted in the origin arc, where the model began the work:
 
-    n{task:A2.1 started}    work the model began is now running
-    n{task:A2.1 → ok}       what came of it
+    n{task:A2.1 started: …}    work the model began is now running
 
-Neither note is optional. Without the first the model cannot account for work
-it started. Without the second it waits for an answer that already arrived.
+The invocation note is the task's only record in its origin arc. Every later
+task event names the task by ID in its payload and carries an explicit
+`LLMVisibility`, decided once on the write path from the task kind's
+declaration, and the correlation follows it:
 
-Tasks do not project through the tool-call protocol. A task with no result is
-the normal state, and tool shape would require `pending` to invent an answer
-every turn until the task finished. The cost of notes is the structural link
-between what the model started and what came back, which has to live in the
-wording instead.
+    AS_MESSAGE   the event opens an arc of its own, the way a user message does.
+                 The arc's opening bubble is composed content: a note naming the
+                 task — `Task <name> with id <id> (emitted an event | asks a
+                 question | returned results)` — followed by the event's own
+                 content, the notification's payload for a notification, the
+                 ask's message for an ask, and for a result the task's result
+                 as returned, not summarized. That arc is a work item of its
+                 own, and the model works it like any other arc.
+    IN_RESULT    the event stays correlated to the task and is folded into the
+                 final result message of the result-opened arc, gathered from
+                 the task table at render time. The message carries the last N
+                 of them, or all at N = -1, with N declared per task kind and a
+                 global override in the agent config. They are not projected
+                 as messages of their own.
+    NONE         invisible to the model in every projection. It is in the log
+                 for the frontend and for replay.
+
+An ask and a result are always `AS_MESSAGE`: an ask that opened no arc could
+never be answered, and a result that opened none would never be worked on. The
+one exception is the startup reaper, which settles abandoned tasks with `NONE`
+so it opens no arc. A notification's visibility is declared per class on the
+task kind, and a report naming a class the kind has not declared is refused at
+the write path. An `AS_MESSAGE` notification costs a run, since it opens an
+arc; the controller coalesces the notifications of each `AS_MESSAGE` class
+into at most one report per group window, and past the kind's event limit it
+demotes the event (`NONE` or `IN_RESULT`, per the kind's overflow policy)
+instead of opening an arc.
+
+Placement is decided from correlation and sequence number, as for every record.
+A task-correlated event appears in no arc's transcript as its own record, and
+the payload's `LLMVisibility` records the same decision explicitly: `AS_MESSAGE`
+correlates to an arc, `NONE` and `IN_RESULT` to the task, and the fold rejects
+an event whose payload disagrees with its correlation.
+
+In the arc an ask opened, the model decides: it either puts the question to
+the user or answers the ask itself through the input tool under the invoke's
+actor. The answer is recorded as an `AP` correlated to that same arc, so it is
+in the ask arc's own transcript at any cutoff. Put to the user, the ask's arc
+closes and the human's reply opens a new arc; in that arc the model calls the
+input tool, and the `AP` still correlates to the question's arc.
+
+A task does not project through the tool-call protocol. A task with no result
+is the normal state, and tool shape would require `pending` to invent an answer
+every turn until the task finished. The invocation note is what links what the
+model started to what came back, and when the completion opened an arc of its
+own, that arc carries the link instead: fixed rule 4.
 
 Every note names its task by name and ID. The ID is there because the model
 answers a waiting task by naming it, and a note is the only place it is told
@@ -345,34 +394,13 @@ which task is meant. It is written whole: a shortened ID would have to be
 matched by prefix, which resolves the wrong task rather than failing to find
 one.
 
-The second note reports what the runner said, and a runner has three things it
-can say. A task that was called off is not one that went wrong, so `cancelled`
-is an outcome of its own rather than an error, and the model is told the work
-was stopped rather than that it failed.
-
-A running task holds its arc open. The agent records `KX` only once nothing
-under the arc is still running, so an arc that answered and left a task behind
-is still governed by `foreign_arc`, and a cancel that stops that task is a
-cancel that stopped work. Without this a task nobody can account for keeps
-running under an arc that reads as finished.
-
-`async_events` decides whether task notifications are told at all. A task that
-reported three times and then finished yields three event notes and two task
-notes.
-
-`async_input` covers a task that stops to ask a human. The ask and the answer
-are one note each, placed where each happened.
-
-    n{ask:AQ2.1.1} n{answer:AP2.1.2}
-        answered right away, so the notes sit together
-
-    n{ask:AQ2.1.1} … a(R2.1) … n{answer:AP2.1.2}
-        the model spoke in between, so the notes stay apart
-
-The second case is why the ask keeps its own position. An ask left unanswered
-across a turn was disclosed as a state, and the model may have told the user
-that the task is waiting on them. An unanswered ask is also the only thing that
-conveys a task moving to WAITING.
+A task that was called off is not one that went wrong, so `cancelled` is an
+outcome of its own rather than an error: a task-addressed cancel (a `CANCEL`
+whose correlation ID is the task ID) settles the task in the log, with who
+cancelled it and when, and the runner is reached through the controller. The
+completion note for it is emitted in the origin arc, since no arc opened for
+it. The startup reaper's settle is the same: a completion note in the origin
+arc, written `NONE`.
 
 Interrupts
 --------------------
@@ -433,9 +461,10 @@ A cancel is three cases and only one is a mode.
 
     stopped     Cancelled while the agent was working. Always disclosed.
 
-A cancel that stops nothing but a running async task is a `stopped` cancel. The
-arc was open, because a running task is what keeps it open, and the work the
-cancel ended belonged to it.
+A cancel can also be addressed to a task instead of an arc: a `CANCEL` whose
+correlation ID is the task ID. It settles the task, not an arc, and touches no
+arc's records — it is not governed by `foreign_arc`, because it closed nothing
+the arc's projection shows.
 
 For the stopped case the work and the cancel are disclosed together.
 
@@ -481,20 +510,20 @@ again.
 The same three readings apply to an arc that died of a fatal error, which is
 over for the same reason: nothing further is coming.
 
-An async task is governed by the same rule, with no first case: a task that has
-been invoked has started, so a cancel settles none of them. It runs where the
-cancel cannot reach it and outlives the run that began it, so cancelling ends
-the waiting rather than the task. What became of it is the runner's to report,
-and a result arriving after the cancel settles the task the ordinary way.
+An async task is not settled by an arc's cancel at all: a running task does not
+hold its arc open, and the task runs where the cancel cannot reach it. What
+ends it is a task-addressed cancel — a loop over the task table in the harness,
+not a batch record — which writes a `CANCEL` correlated to the task ID, settles
+the task in the log with the actor and sequence of the event, and reaches the
+runner through the controller. A later report from that runner is refused at
+the write path and dropped by the fold, since the task is already settled.
 
-A runner that stops when asked reports `cancelled`, which is how a task reaches
-that status: no cancel writes it, because a cancel does not know whether the
-task stopped or what it did first. The first report settles the task, so a
-runner that acknowledged a stop and then finished anyway does not overwrite
-what it already said.
+Fixed rule 4 still holds, so a task settled without opening an arc gets its
+completion note in the origin arc, placed where the settle happened:
 
-Fixed rule 4 still holds, so a task the arc stopped on gets its second note
-from the stop rather than from a completion that will never arrive.
+    [task auditor (id 4f1c…) was cancelled before it finished]
+
+A task still running when its origin arc was stopped and projected gets:
 
     [task auditor (id 4f1c…) was still running when this request was stopped.
      Whether it finished is not known.]
@@ -536,6 +565,11 @@ arc, so a model that answers both files the answer under the wrong arc and
 leaves the foreign one open with no response of its own. An arc whose material
 was all elided by a finer mode reaches the transcript bare and gets the note
 for the same reason.
+
+A task-opened arc has no user words: its request is its composed `Arc.Content`,
+the note naming the task followed by the event's own content. A `foreign_arc`
+note about it quotes that content, so the quote names the task and carries the
+question or the result whole.
 
 One mode covers all three statuses, so an arc is governed the same way at every
 cutoff as its status changes. The three share one setting: a session that
@@ -605,9 +639,10 @@ rather than the wire format. Everything else it does is a shape translation.
 
 Known gaps
 --------------------
-*Per-task event settings.* `async_events` is session-wide. A long-running
-deployment and a quick lookup want different answers and the task definition
-knows which it is.
+*Per-task event settings.* Task notifications are governed per class by the
+task kind's declaration (`AS_MESSAGE` / `IN_RESULT` / `NONE`), with coalescing
+windows, an event limit and an overflow policy declared alongside. There is no
+session-wide mode left to disagree with them.
 
 Scenario format
 --------------------

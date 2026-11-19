@@ -128,7 +128,7 @@ func pendingCount(t *testing.T, client *redis.Client, queue *RedisWorkQueue) int
 func TestEnqueueRefusesAnItemNamingNoAgent(t *testing.T) {
 	queue, _ := newQueue(t)
 
-	err := queue.Enqueue(context.Background(), WorkItem{SessionID: "s", ArcID: "a"})
+	err := queue.Enqueue(context.Background(), agent.ArcRef{SessionID: "s", ArcID: "a"}, "")
 	if err == nil {
 		t.Fatal("an item naming no agent was enqueued")
 	}
@@ -136,9 +136,9 @@ func TestEnqueueRefusesAnItemNamingNoAgent(t *testing.T) {
 
 func TestEnqueueThenConsumeRunsTheItem(t *testing.T) {
 	queue, client := newQueue(t)
-	item := WorkItem{SessionID: "s", ArcID: "a", AgentID: "agent-1"}
+	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
 
-	if err := queue.Enqueue(context.Background(), item); err != nil {
+	if err := queue.Enqueue(context.Background(), ref, "agent-1"); err != nil {
 		t.Fatalf("could not enqueue the item: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestEnqueueThenConsumeRunsTheItem(t *testing.T) {
 	}
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
-	if len(runner.calls) != 1 || runner.calls[0] != item.ref() || runner.ids[0] != "agent-1" {
+	if len(runner.calls) != 1 || runner.calls[0] != ref || runner.ids[0] != "agent-1" {
 		t.Fatalf("the item was worked as %v under %v", runner.calls, runner.ids)
 	}
 	if !waitUntil(2*time.Second, func() bool { return pendingCount(t, client, queue) == 0 }) {
@@ -160,9 +160,9 @@ func TestEnqueueThenConsumeRunsTheItem(t *testing.T) {
 
 func TestContentionPutsTheItemBackAndWorksItAgain(t *testing.T) {
 	queue, client := newQueue(t)
-	item := WorkItem{SessionID: "s", ArcID: "a", AgentID: "agent-1"}
+	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
 
-	if err := queue.Enqueue(context.Background(), item); err != nil {
+	if err := queue.Enqueue(context.Background(), ref, "agent-1"); err != nil {
 		t.Fatalf("could not enqueue the item: %v", err)
 	}
 
@@ -180,9 +180,9 @@ func TestContentionPutsTheItemBackAndWorksItAgain(t *testing.T) {
 
 func TestAFailingItemIsRetriedThenMovedToTheDeadStream(t *testing.T) {
 	queue, client := newQueue(t)
-	item := WorkItem{SessionID: "s", ArcID: "a", AgentID: "agent-1"}
+	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
 
-	if err := queue.Enqueue(context.Background(), item); err != nil {
+	if err := queue.Enqueue(context.Background(), ref, "agent-1"); err != nil {
 		t.Fatalf("could not enqueue the item: %v", err)
 	}
 
@@ -216,8 +216,8 @@ func TestAFailingItemIsRetriedThenMovedToTheDeadStream(t *testing.T) {
 
 func TestADeadConsumersPendingEntryIsRecovered(t *testing.T) {
 	queue, client := newQueue(t)
-	item := WorkItem{SessionID: "s", ArcID: "a", AgentID: "agent-1"}
-	if err := queue.Enqueue(context.Background(), item); err != nil {
+	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	if err := queue.Enqueue(context.Background(), ref, "agent-1"); err != nil {
 		t.Fatalf("could not enqueue the item: %v", err)
 	}
 

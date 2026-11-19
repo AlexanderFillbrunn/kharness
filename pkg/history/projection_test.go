@@ -19,9 +19,10 @@ var testActor = users.Actor{UserID: "user-1", TenantID: "tenant-1"}
 // logger builds an event log in sequence order, so a test reads like the
 // Events line of a scenario file.
 type logger struct {
-	seq    int
-	start  time.Time
-	events []events.Event
+	seq        int
+	start      time.Time
+	events     []events.Event
+	lastAskArc string
 }
 
 func newLogger() *logger {
@@ -100,23 +101,62 @@ func (l *logger) interruptResponse(arc, interrupt string, rejected bool) {
 }
 
 func (l *logger) task(arc, id, name string, args any) {
-	l.add(id, arc, events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{TaskName: name, Args: args})
+	l.add(id, arc, events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{TaskName: name, Args: args, Actor: testActor})
 }
 
+// taskEvent logs a notification declared None: it correlates to the task and
+// opens no arc.
 func (l *logger) taskEvent(arc, task, id string, payload any) {
-	l.add(id, arc, events.AsyncTaskEventEventType, events.AsyncTaskEventPayload{CausationID: task, Payload: payload})
+	l.add(id, task, events.AsyncTaskEventEventType, events.AsyncTaskEventPayload{
+		CausationID: task, Class: "progress", Payload: payload, LLMVisibility: events.LLMVisibilityNone})
 }
 
+// taskEventAsMessage logs a notification declared AsMessage: it opens an arc
+// of its own, which the fold mints under the correlation ID.
+func (l *logger) taskEventAsMessage(arc, task, id, class string, payload any) {
+	l.add(id, "arc-"+id, events.AsyncTaskEventEventType, events.AsyncTaskEventPayload{
+		CausationID: task, Class: class, Payload: payload, LLMVisibility: events.LLMVisibilityAsMessage})
+}
+
+// taskEventInResult logs a notification declared InResult: it correlates to
+// the task and is folded into the result message.
+func (l *logger) taskEventInResult(arc, task, id string, payload any) {
+	l.add(id, task, events.AsyncTaskEventEventType, events.AsyncTaskEventPayload{
+		CausationID: task, Class: "detail", Payload: payload, LLMVisibility: events.LLMVisibilityInResult})
+}
+
+// taskAsk logs an input request: an ask is always AsMessage, so it opens an
+// arc of its own.
 func (l *logger) taskAsk(arc, task, id, message string) {
-	l.add(id, arc, events.AsyncTaskInputRequestedEventType, events.AsyncTaskInputRequestedPayload{CausationID: task, Message: message})
+	arcID := "arc-" + id
+	l.add(id, arcID, events.AsyncTaskInputRequestedEventType, events.AsyncTaskInputRequestedPayload{
+		CausationID: task, Message: message, LLMVisibility: events.LLMVisibilityAsMessage})
+	l.lastAskArc = arcID
 }
 
+// taskAnswer logs the answer to the last ask, correlated to the arc that ask
+// opened.
 func (l *logger) taskAnswer(arc, task, id, message string) {
-	l.add(id, arc, events.AsyncTaskInputProvidedEventType, events.AsyncTaskInputProvidedPayload{CausationID: task, Message: message})
+	corr := l.lastAskArc
+	if corr == "" {
+		corr = arc
+	}
+	l.add(id, corr, events.AsyncTaskInputProvidedEventType, events.AsyncTaskInputProvidedPayload{
+		CausationID: task, Message: message})
 }
 
+// taskResult logs a completion: a result is always AsMessage, so it opens an
+// arc of its own carrying the result.
 func (l *logger) taskResult(arc, task string, result any, outcome events.AsyncTaskOutcome) {
-	l.add("result-"+task, arc, events.AsyncTaskResultEventType, events.AsyncTaskResultPayload{CausationID: task, Result: result, Outcome: outcome})
+	l.add("result-"+task, "arc-result-"+task, events.AsyncTaskResultEventType, events.AsyncTaskResultPayload{
+		CausationID: task, Result: result, Outcome: outcome, LLMVisibility: events.LLMVisibilityAsMessage})
+}
+
+// taskResultNone logs a completion the reaper writes: None visibility,
+// correlated to the task, opening no arc.
+func (l *logger) taskResultNone(arc, task string, result any, outcome events.AsyncTaskOutcome) {
+	l.add("result-"+task, task, events.AsyncTaskResultEventType, events.AsyncTaskResultPayload{
+		CausationID: task, Result: result, Outcome: outcome, LLMVisibility: events.LLMVisibilityNone})
 }
 
 func (l *logger) history(t *testing.T) *History {
@@ -125,20 +165,28 @@ func (l *logger) history(t *testing.T) *History {
 }
 
 // eventsFor returns the events a read model hands the projection for one arc:
-// everything up to that arc's user message, plus everything correlated to it
-// however late it arrived. This query is the projection's cutoff, so a test
+// everything up to the arc's opening event, plus everything correlated to it
+// however late it arrived, plus the session's task-correlated events, so the
+// fold builds the task table. This query is the projection's cutoff, so a test
 // projects from the slice rather than from the whole log.
 func (l *logger) eventsFor(arc string) []events.Event {
+	taskIDs := map[string]bool{}
+	for i := range l.events {
+		if l.events[i].Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[l.events[i].ID] = true
+		}
+	}
 	opened := -1
-	for _, event := range l.events {
-		if event.ID == arc {
-			opened = event.Seq
+	for i := range l.events {
+		ev := &l.events[i]
+		if ev.CorrelationID != nil && *ev.CorrelationID == arc && events.OpensArc(ev) {
+			opened = ev.Seq
 			break
 		}
 	}
 	var out []events.Event
 	for _, event := range l.events {
-		if event.Seq <= opened || (event.CorrelationID != nil && *event.CorrelationID == arc) {
+		if event.Seq <= opened || (event.CorrelationID != nil && (*event.CorrelationID == arc || taskIDs[*event.CorrelationID])) {
 			out = append(out, event)
 		}
 	}
@@ -213,6 +261,35 @@ func noteTexts(transcript *ModelTranscript) []string {
 		}
 	}
 	return out
+}
+
+// allTexts returns every message's text, whatever its shape, for assertions
+// about what the transcript does or does not carry.
+func allTexts(transcript *ModelTranscript) []string {
+	var out []string
+	for _, message := range transcript.Messages {
+		switch typed := message.(type) {
+		case ModelTextMessage:
+			out = append(out, typed.Content)
+		case ModelAssistantMessage:
+			out = append(out, typed.Content)
+		case ModelToolMessage:
+			out = append(out, typed.Content)
+		case ModelNoteMessage:
+			out = append(out, typed.Content)
+		}
+	}
+	return out
+}
+
+// containsText reports whether any message in the transcript carries the text.
+func containsText(transcript *ModelTranscript, text string) bool {
+	for _, got := range allTexts(transcript) {
+		if strings.Contains(got, text) {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatchedCall returns one call as the projection for arc saw it, so a test
@@ -544,68 +621,62 @@ func TestToolEventsModeGovernsProgressNotifications(t *testing.T) {
 	wantNoteContaining(t, noted, "2 of 5 replicas updated")
 }
 
-func TestAsyncEventsModeGovernsTaskNotifications(t *testing.T) {
+// A notification's class decides whether it reaches the model at all: one
+// declared None appears in no arc's transcript, and one declared AsMessage
+// opens an arc of its own whose opening message carries the notification.
+func TestTaskNotificationsAreGovernedByTheirDeclaredClass(t *testing.T) {
 	log := newLogger()
 	log.user("u1", "audit the cluster")
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "a1.1", "auditor", nil)
 	log.taskEvent("u1", "a1.1", "ae1", "scanned 40 namespaces")
+	log.taskEventAsMessage("u1", "a1.1", "ae2", "progress", "found 3 busy namespaces")
 	log.taskResult("u1", "a1.1", "no findings", events.AsyncTaskOutcomeSuccess)
 	log.assistant("u1", "r1.2", "audit clean")
 	log.closeArc("u1", "r1.2")
 	log.user("u2", "thanks")
 
-	modes := DefaultModes()
-	modes.AsyncEvents = TreatmentElide
-	elided := project(t, log, "u2", modes)
-	// A task is always two notes, whatever async_events says.
-	wantShape(t, elided,
-		"u(audit the cluster)", "a(started the audit)", "n{}", "n{}", "a(audit clean)", "u(thanks)")
-
-	modes.AsyncEvents = TreatmentNote
-	noted := project(t, log, "u2", modes)
-	wantShape(t, noted,
-		"u(audit the cluster)", "a(started the audit)", "n{}", "n{}", "n{}", "a(audit clean)", "u(thanks)")
-	wantNoteContaining(t, noted, "scanned 40 namespaces")
-	wantNoteContaining(t, noted, "started")
-	wantNoteContaining(t, noted, "no findings")
+	transcript := project(t, log, "u2", DefaultModes())
+	// The invocation note stays in the origin arc; the None notification
+	// appears nowhere; the AsMessage notification is the opening message of
+	// the arc it opened; the result is the opening message of its own arc.
+	wantShape(t, transcript,
+		"u(audit the cluster)", "a(started the audit)", "n{}",
+		"u(Task auditor with id a1.1 (emitted an event)\nfound 3 busy namespaces)", "n{}",
+		"u(Task auditor with id a1.1 (returned results)\nno findings)", "n{}",
+		"a(audit clean)", "u(thanks)")
+	for _, text := range allTexts(transcript) {
+		if strings.Contains(text, "scanned 40 namespaces") {
+			t.Errorf("a None notification reached the model: %q", text)
+		}
+	}
 }
 
-func TestAsyncInputModeGovernsATaskAskingAHuman(t *testing.T) {
+// An ask always opens an arc, and the answer is written correlated to that
+// same arc, so it is in the ask arc's own transcript at any cutoff.
+func TestAnAskOpensAnArcTheAnswerBelongsTo(t *testing.T) {
 	log := newLogger()
 	log.user("u1", "upgrade the cluster")
 	log.assistant("u1", "r1.1", "starting")
 	log.task("u1", "a1.1", "upgrader", nil)
 	log.taskAsk("u1", "a1.1", "aq1", "which maintenance window?")
-	log.assistant("u1", "r1.2", "the upgrader needs a window from you")
 	log.taskAnswer("u1", "a1.1", "ap1", "tonight")
 	log.user("u2", "status?")
 
-	modes := DefaultModes()
-	modes.AsyncInput = TreatmentNote
-	noted := project(t, log, "u2", modes)
-	// The ask and the answer keep their own positions, so the response the
-	// model wrote in between stays between them.
-	wantShape(t, noted,
+	transcript := project(t, log, "u2", DefaultModes())
+	wantShape(t, transcript,
 		"u(upgrade the cluster)",
 		"a(starting)",
-		"n{}",
-		"n{}",
-		"a(the upgrader needs a window from you)",
-		"n{}",
-		"n{}",
+		"n{}", "n{}",
+		"u(Task upgrader with id a1.1 (asks a question)\nwhich maintenance window?)", "n{}",
 		"u(status?)")
-	wantNoteContaining(t, noted, "which maintenance window?")
-	wantNoteContaining(t, noted, "tonight")
 
-	modes.AsyncInput = TreatmentElide
-	wantShape(t, project(t, log, "u2", modes),
-		"u(upgrade the cluster)",
-		"a(starting)",
-		"n{}",
-		"a(the upgrader needs a window from you)",
-		"n{}",
-		"u(status?)")
+	// Projecting the ask's own arc reads the answer too, at any cutoff,
+	// because the answer is correlated to that arc.
+	ask := project(t, log, "arc-aq1", DefaultModes())
+	if !containsText(ask, "which maintenance window?") {
+		t.Errorf("the ask arc's own transcript does not carry its question: %q", allTexts(ask))
+	}
 }
 
 func TestForeignArcModeGovernsADeadArc(t *testing.T) {
@@ -1152,13 +1223,38 @@ func TestFailedTaskIsReportedAsFailed(t *testing.T) {
 	log.user("u1", "audit the cluster")
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "a1.1", "auditor", nil)
-	log.taskResult("u1", "a1.1", "the audit host was unreachable", events.AsyncTaskOutcomeFailed)
+	log.taskResultNone("u1", "a1.1", "the audit host was unreachable", events.AsyncTaskOutcomeFailed)
 	log.assistant("u1", "r1.2", "the audit did not run")
 	log.closeArc("u1", "r1.2")
 	log.user("u2", "thanks")
 
 	transcript := project(t, log, "u2", DefaultModes())
 	wantNoteContaining(t, transcript, "task auditor (id a1.1) failed: the audit host was unreachable")
+}
+
+// A result written AsMessage is an arc of its own: the completion reaches the
+// model as that arc's opening message, carrying the result as returned, not
+// summarized, and not as a note in the origin arc.
+func TestAResultOpensAnArcOfItsOwn(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "a1.1", "auditor", nil)
+	log.taskResult("u1", "a1.1", "3 findings: 2 pods without limits, 1 single replica", events.AsyncTaskOutcomeSuccess)
+	log.user("u2", "thanks")
+
+	transcript := project(t, log, "u2", DefaultModes())
+	wantShape(t, transcript,
+		"u(audit the cluster)",
+		"a(started the audit)",
+		"n{}", "n{}",
+		"u(Task auditor with id a1.1 (returned results)\n3 findings: 2 pods without limits, 1 single replica)", "n{}",
+		"u(thanks)")
+	for _, text := range noteTexts(transcript) {
+		if strings.Contains(text, "finished") {
+			t.Errorf("the origin arc still carries a completion note: %q", text)
+		}
+	}
 }
 
 func TestCancelledCallWithoutAReasonStillAnswersTheCall(t *testing.T) {
@@ -1628,7 +1724,7 @@ func TestCancelLeavesARunningTaskUnsettled(t *testing.T) {
 	log.task("u1", "k1.1", "auditor", nil)
 	log.cancel("u1", "c1.1", nil)
 
-	task := log.history(t).Arcs[0].AsyncTasks[0]
+	task := log.history(t).Tasks["k1.1"]
 	if task.Status != AsyncTaskPending {
 		t.Errorf("task is %s, want it left running", task.Status)
 	}
@@ -1645,10 +1741,10 @@ func TestATaskResultAfterACancelStillSettlesIt(t *testing.T) {
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "k1.1", "auditor", nil)
 	log.cancel("u1", "c1.1", nil)
-	log.taskResult("u1", "k1.1", "14 findings", events.AsyncTaskOutcomeSuccess)
+	log.taskResultNone("u1", "k1.1", "14 findings", events.AsyncTaskOutcomeSuccess)
 	log.user("u2", "anything?")
 
-	task := log.history(t).Arcs[0].AsyncTasks[0]
+	task := log.history(t).Tasks["k1.1"]
 	if task.Status != AsyncTaskSuccess || task.Result != "14 findings" {
 		t.Fatalf("task = %#v, want it settled by its own result", task)
 	}
@@ -1693,10 +1789,10 @@ func TestARunnerReportingACancelSettlesTheTaskAsCancelled(t *testing.T) {
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "k1.1", "auditor", nil)
 	log.cancel("u1", "c1.1", nil)
-	log.taskResult("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
+	log.taskResultNone("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
 	log.user("u2", "anything?")
 
-	task := log.history(t).Arcs[0].AsyncTasks[0]
+	task := log.history(t).Tasks["k1.1"]
 	if task.Status != AsyncTaskCancelled {
 		t.Fatalf("task is %s, want %s", task.Status, AsyncTaskCancelled)
 	}
@@ -1717,18 +1813,20 @@ func TestALateResultDoesNotUndoACancelledTask(t *testing.T) {
 	log.user("u1", "audit the cluster")
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "k1.1", "auditor", nil)
-	log.taskResult("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
-	log.add("result-late", "u1", events.AsyncTaskResultEventType,
-		events.AsyncTaskResultPayload{CausationID: "k1.1", Result: "14 findings", Outcome: events.AsyncTaskOutcomeSuccess})
+	log.taskResultNone("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
+	log.add("result-late", "k1.1", events.AsyncTaskResultEventType,
+		events.AsyncTaskResultPayload{CausationID: "k1.1", Result: "14 findings", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityNone})
 
-	task := log.history(t).Arcs[0].AsyncTasks[0]
+	task := log.history(t).Tasks["k1.1"]
 	if task.Status != AsyncTaskCancelled || task.Result != "stopped on request" {
 		t.Errorf("task = %#v, want the outcome it was already settled with", task)
 	}
 }
 
-// The model answers a waiting task by naming it, and the note is the only
-// place it is ever told which task that is.
+// The model answers a waiting task by naming it, and the invocation note is
+// the place it is told which task that is. The ask's arc is foreign to a later
+// turn, and its status note quotes the arc's Content, which for a task-opened
+// arc is the composed note naming the task and the question.
 func TestTaskNotesCarryTheIDTheModelAnswersWith(t *testing.T) {
 	log := newLogger()
 	log.user("u1", "audit the cluster")
@@ -1738,5 +1836,81 @@ func TestTaskNotesCarryTheIDTheModelAnswersWith(t *testing.T) {
 	log.user("u2", "kube-system")
 
 	noted := project(t, log, "u2", DefaultModes())
-	wantNoteContaining(t, noted, "task auditor (id k1.1) is waiting for input: which namespace?")
+	wantNoteContaining(t, noted, "task auditor (id k1.1) started")
+	wantNoteContaining(t, noted, "Task auditor with id k1.1 (asks")
+}
+
+// AC6/R18: an InResult notification appears only folded into the final result
+// message of the result-opened arc, carrying the last N of them (all at -1),
+// gathered from the task table at render time — never as its own message.
+func TestInResultEventsAreFoldedIntoTheResultMessage(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "a1.1", "auditor", nil)
+	log.taskEventInResult("u1", "a1.1", "ir1", "checked kube-system")
+	log.taskEventInResult("u1", "a1.1", "ir2", "checked ingress")
+	log.taskEventInResult("u1", "a1.1", "ir3", "checked data")
+	log.taskResult("u1", "a1.1", "3 findings", events.AsyncTaskOutcomeSuccess)
+	log.user("u2", "thanks")
+
+	// The whole trail at -1.
+	transcript := project(t, log, "u2", DefaultModes())
+	for _, text := range allTexts(transcript) {
+		if strings.Contains(text, "checked kube-system") && !strings.Contains(text, "returned results") {
+			t.Errorf("an InResult event projected as its own message: %q", text)
+		}
+	}
+	wantShape(t, transcript,
+		"u(audit the cluster)",
+		"a(started the audit)",
+		"n{}", "n{}",
+		"u(Task auditor with id a1.1 (returned results)\n3 findings\nchecked kube-system\nchecked ingress\nchecked data)", "n{}",
+		"u(thanks)")
+
+	// The last N at N=2.
+	h := foldEvents(t, "session-1", log.eventsFor("u2"))
+	h.TaskResultTrail = 2
+	limited, err := h.Project("u2", DefaultModes())
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	found := false
+	for _, text := range allTexts(limited) {
+		if strings.Contains(text, "returned results") {
+			found = true
+			if strings.Contains(text, "checked kube-system") {
+				t.Errorf("the trail carried more than the last 2 events: %q", text)
+			}
+			if !strings.Contains(text, "checked data") || !strings.Contains(text, "checked ingress") {
+				t.Errorf("the trail does not carry the last 2 events: %q", text)
+			}
+		}
+	}
+	if !found {
+		t.Error("no result message in the transcript")
+	}
+}
+
+// R19: RenderChat draws a session as a sequence of arcs, and a task-triggered
+// arc renders its composed Content as its opening bubble.
+func TestRenderChatShowsATaskOpenedArc(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "a1.1", "auditor", nil)
+	log.taskResult("u1", "a1.1", "3 findings", events.AsyncTaskOutcomeSuccess)
+	log.user("u2", "thanks")
+
+	h := foldEvents(t, "session-1", log.eventsFor("u2"))
+	out := h.RenderChat()
+	for _, want := range []string{
+		"audit the cluster",
+		"Task auditor with id a1.1 (returned results)\n3 findings",
+		"thanks",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderChat() does not contain %q:\n%s", want, out)
+		}
+	}
 }

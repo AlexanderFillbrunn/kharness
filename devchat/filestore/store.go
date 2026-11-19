@@ -167,12 +167,37 @@ func (s *Store) Events(_ context.Context) ([]*events.Event, error) {
 	return pointers(readFile(s.path))
 }
 
-// GetEventsForArc returns the events one arc is projected from: everything in
-// its session up to and including the user message that opened it, plus
-// everything correlated to it afterwards.
+// GetEventsForSession returns the session's whole log in the order it was
+// written. A file holds one session, so the session ID only ever rules events
+// out here; a store that held more than one would partition on it.
+func (s *Store) GetEventsForSession(_ context.Context, sessionID string) ([]*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	all, err := readFile(s.path)
+	if err != nil {
+		return nil, err
+	}
+	var selected []*events.Event
+	for i := range all {
+		if all[i].SessionID == sessionID {
+			selected = append(selected, &all[i])
+		}
+	}
+	return selected, nil
+}
+
+// GetEventsForArc returns the events one arc is run from: everything in its
+// session up to and including the event that opened the arc, plus everything
+// correlated to the arc afterwards, plus the session's task-correlated events,
+// so the fold builds the session's task table.
 //
-// That query is the projection's cutoff. A store that returned more, or less,
-// would change what the model is told. See PROJECTION.md.
+// An arc is found by its opening event — the earliest event correlated to the
+// arc ID whose kind is opening: a USER_MESSAGE, or a task event whose payload
+// carries AsMessage visibility. The cutoff rule is otherwise unchanged:
+// everything up to and including the opening event, plus everything
+// correlated to the arc. That query is the projection's cutoff, so a store
+// that returned more or less of the arc's own events would change what the
+// model is told. See PROJECTION.md.
 //
 // A file holds one session, so the session in the ref only ever rules events
 // out here. A store that held more than one would partition on it.
@@ -185,11 +210,17 @@ func (s *Store) GetEventsForArc(_ context.Context, ref agent.ArcRef) ([]*events.
 		return nil, err
 	}
 
+	taskIDs := map[string]bool{}
 	opening := -1
 	for i := range all {
-		if all[i].Typ == events.UserMessageEventType && belongsTo(&all[i], ref) {
+		if all[i].SessionID != ref.SessionID {
+			continue
+		}
+		if all[i].Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[all[i].ID] = true
+		}
+		if opening < 0 && correlatesTo(&all[i], ref.ArcID) && events.OpensArc(&all[i]) {
 			opening = all[i].Seq
-			break
 		}
 	}
 	if opening < 0 {
@@ -201,7 +232,8 @@ func (s *Store) GetEventsForArc(_ context.Context, ref agent.ArcRef) ([]*events.
 		if all[i].SessionID != ref.SessionID {
 			continue
 		}
-		if all[i].Seq <= opening || correlatesTo(&all[i], ref.ArcID) {
+		if all[i].Seq <= opening || correlatesTo(&all[i], ref.ArcID) ||
+			(all[i].CorrelationID != nil && taskIDs[*all[i].CorrelationID]) {
 			selected = append(selected, &all[i])
 		}
 	}
@@ -220,6 +252,25 @@ func (s *Store) Cancelled(_ context.Context, ref agent.ArcRef) (*events.Event, e
 	}
 	for i := range all {
 		if all[i].Typ == events.CancelEventType && belongsTo(&all[i], ref) {
+			return &all[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// CancelledTask returns the task-addressed cancel recorded against the task
+// named — a CANCEL whose correlation ID is the task ID — or nil where there is
+// none.
+func (s *Store) CancelledTask(_ context.Context, sessionID, taskID string) (*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	all, err := readFile(s.path)
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Typ == events.CancelEventType && all[i].SessionID == sessionID && correlatesTo(&all[i], taskID) {
 			return &all[i], nil
 		}
 	}

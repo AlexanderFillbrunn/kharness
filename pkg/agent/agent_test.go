@@ -695,13 +695,14 @@ func TestAFreshCallIsNotTreatedAsAbandoned(t *testing.T) {
 	}
 }
 
-// awaitedTaskArc is an arc that started a task, was answered with a reply of
-// its own, and then heard back from the task: the shape a run picking the arc
-// up again finds after a task has settled. The result lands at the sequence
-// number given, so a caller can put it on either side of that reply.
+// awaitedTaskArc is an arc that started a task and was answered with a reply of
+// its own. The task's result lands at the sequence number given, always
+// AsMessage and correlated to the arc it opens — never back in the origin arc,
+// which closed on its last reply.
 func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 	t.Helper()
 	arc := testArcID
+	resultArc := "arc-result"
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
@@ -710,56 +711,39 @@ func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
-		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
-		{ID: "ar-1", Seq: resultSeq, Timestamp: at, Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess}},
+		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
+		{ID: "ar-1", Seq: resultSeq, Timestamp: at, Typ: events.AsyncTaskResultEventType, CorrelationID: &resultArc, Actor: actor,
+			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
 	}
 	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
 
-	h, err := history.Replay("session", log)
+	h, err := history.Replay(testSessionID, log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	return h
 }
 
-// A task that finished after the arc's last reply is work the model has never
-// reported on. The arc gets one more turn rather than closing on a reply
-// written while the task was still running.
-func TestALateTaskResultGetsTheModelATurn(t *testing.T) {
-	h := awaitedTaskArc(t, 5)
-	persistor := &fakePersistor{next: 10}
-	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
-		{ModelID: "gpt-5", Content: "the audit found 3 things"},
-	}})
-	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+// arcByID returns the named arc, or fails the test.
+func arcByID(t *testing.T, h *history.History, id string) *history.Arc {
+	t.Helper()
+	for _, arc := range h.Arcs {
+		if arc.ID == id {
+			return arc
+		}
 	}
-
-	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	want := "ASSISTANT_MESSAGE, ARC_CLOSED"
-	if got := typesOf(persistor.persisted); got != want {
-		t.Fatalf("wrote %s, want %s", got, want)
-	}
-
-	// The close names the reply that reported the result, not the one written
-	// while the task was still running.
-	closing := persistor.persisted[1].Payload.(events.ArcClosedPayload)
-	if closing.CausationID != persistor.persisted[0].ID {
-		t.Errorf("the close names %s, want the reply that reported the result", closing.CausationID)
-	}
+	t.Fatalf("no arc %s in the history", id)
+	return nil
 }
 
-// A result the last reply already accounts for is not reported twice. Without
-// this the arc answers itself for as long as the loop keeps reading it.
-func TestATaskResultTheModelHasSeenClosesTheArc(t *testing.T) {
-	h := awaitedTaskArc(t, 3)
+// D1/AC3: a result the task reports after the origin arc's last reply does not
+// reopen that arc or give it a turn. The reply asked for no tool calls, so the
+// run closes the arc; the result opened an arc of its own.
+func TestATaskResultAfterTheLastReplyClosesTheOriginArc(t *testing.T) {
+	h := awaitedTaskArc(t, 5)
 	persistor := &fakePersistor{next: 10}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{})
 	if err != nil {
@@ -771,16 +755,49 @@ func TestATaskResultTheModelHasSeenClosesTheArc(t *testing.T) {
 	}
 
 	if got := typesOf(persistor.persisted); got != "ARC_CLOSED" {
-		t.Fatalf("wrote %s, want ARC_CLOSED", got)
+		t.Fatalf("wrote %s, want ARC_CLOSED alone", got)
+	}
+	// The close names the arc's own last reply, not the task's result.
+	closing := persistor.persisted[0].Payload.(events.ArcClosedPayload)
+	if closing.CausationID != "msg-2" {
+		t.Errorf("the close names %s, want msg-2", closing.CausationID)
 	}
 }
 
-// waitingTaskArc is an arc whose task stopped to ask for input. The ask lands
-// at the sequence number given, so a caller can put it on either side of the
-// arc's last reply, and answered says whether the input arrived after it.
+// AC2: the arc a result opens is a work item of its own. Worked, the model gets
+// a turn over it — its opening bubble is the task's result, composed per D9.
+func TestAResultOpenedArcGetsTheModelATurn(t *testing.T) {
+	h := awaitedTaskArc(t, 3)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", Content: "the audit found 3 things"},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: "arc-result"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := "ASSISTANT_MESSAGE, ARC_CLOSED"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
+	}
+	content := arcByID(t, h, "arc-result").Content
+	if !strings.Contains(content, "returned results") || !strings.Contains(content, "3 findings") {
+		t.Errorf("arc content = %q, want the task note and the result", content)
+	}
+}
+
+// waitingTaskArc is an arc whose task stopped to ask for input. The ask is
+// always AsMessage and opens an arc of its own at the sequence number given;
+// answered says whether the input arrived after the arc's last reply, recorded
+// in the ask's arc.
 func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
 	t.Helper()
 	arc := testArcID
+	askArc := "arc-ask"
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
@@ -789,30 +806,30 @@ func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
-		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
-		{ID: "aq-1", Seq: askSeq, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "a-1", Message: "which namespace?"}},
+		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
+		{ID: "aq-1", Seq: askSeq, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
+			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "a-1", Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
 	}
 	if answered {
-		log = append(log, events.Event{ID: "ap-1", Seq: 6, Timestamp: at, Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &arc,
+		log = append(log, events.Event{ID: "ap-1", Seq: 6, Timestamp: at, Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &askArc, Actor: actor,
 			Payload: events.AsyncTaskInputProvidedPayload{CausationID: "a-1", Message: "kube-system"}})
 	}
 	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
 
-	h, err := history.Replay("session", log)
+	h, err := history.Replay(testSessionID, log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	return h
 }
 
-// A task waiting on input nobody has been asked for yet gets the model a turn,
-// which is the only way the question reaches the person who can answer it. The
-// arc stays open, because the task is still there waiting.
-func TestATaskWaitingOnInputGetsTheModelATurn(t *testing.T) {
+// AC4: an ask opens an arc of its own, and working that arc is what puts the
+// question to the user — or answers it with provide_task_input. The arc's
+// opening bubble carries the question, composed per D9.
+func TestAnAskOpenedArcGetsTheModelATurn(t *testing.T) {
 	h := waitingTaskArc(t, 5, false)
 	persistor := &fakePersistor{next: 10}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
@@ -822,40 +839,23 @@ func TestATaskWaitingOnInputGetsTheModelATurn(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: "arc-ask"}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if got := typesOf(persistor.persisted); got != "ASSISTANT_MESSAGE" {
-		t.Fatalf("wrote %s, want ASSISTANT_MESSAGE alone", got)
+	want := "ASSISTANT_MESSAGE, ARC_CLOSED"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
 	}
-	if status := h.Arcs[0].Status(); status != history.ArcStatusPending {
-		t.Errorf("the arc is %s, want it left open for the task still waiting", status)
-	}
-}
-
-// The question the agent has already put to the user is not put again. Without
-// this the arc asks for as long as the task waits to be answered.
-func TestAnAskAlreadyPutToTheUserIsNotRepeated(t *testing.T) {
-	h := waitingTaskArc(t, 3, false)
-	persistor := &fakePersistor{next: 10}
-	agent, err := NewAgent(nil, nil, &scriptedLLM{})
-	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
-	}
-
-	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	if got := typesOf(persistor.persisted); got != "" {
-		t.Fatalf("wrote %s, want nothing", got)
+	content := arcByID(t, h, "arc-ask").Content
+	if !strings.Contains(content, "asks a question") || !strings.Contains(content, "which namespace?") {
+		t.Errorf("arc content = %q, want the task note and the question", content)
 	}
 }
 
-// An ask the task already has its answer to is the task's business. The agent
-// has nothing to say about it and waits for what the task makes of it.
-func TestAnAnsweredAskGetsNoTurn(t *testing.T) {
+// D1: the ask does not hold the origin arc open either — its last reply asked
+// for no tool calls, so that arc closes, answered or not.
+func TestAnAskDoesNotHoldTheOriginArcOpen(t *testing.T) {
 	h := waitingTaskArc(t, 5, true)
 	persistor := &fakePersistor{next: 10}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{})
@@ -867,7 +867,7 @@ func TestAnAnsweredAskGetsNoTurn(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if got := typesOf(persistor.persisted); got != "" {
-		t.Fatalf("wrote %s, want nothing", got)
+	if got := typesOf(persistor.persisted); got != "ARC_CLOSED" {
+		t.Fatalf("wrote %s, want ARC_CLOSED alone", got)
 	}
 }

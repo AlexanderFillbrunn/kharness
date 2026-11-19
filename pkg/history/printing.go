@@ -26,10 +26,13 @@ func PrintHistory(w io.Writer, history *History) error {
 			return err
 		}
 	}
+	if err := printAsyncTasks(w, history.TasksInOrder()); err != nil {
+		return err
+	}
 	return nil
 }
 
-// printArc prints the user message that opened the arc followed by everything
+// printArc prints the record that opened the arc followed by everything
 // recorded under it. Nesting is what carries the correlation, so the records
 // themselves no longer repeat the arc ID.
 func printArc(w io.Writer, arc *Arc) error {
@@ -50,9 +53,6 @@ func printArc(w io.Writer, arc *Arc) error {
 		}
 	}
 	if err := printErrors(w, arc.Errors); err != nil {
-		return err
-	}
-	if err := printAsyncTasks(w, arc.AsyncTasks); err != nil {
 		return err
 	}
 	return printCancel(w, arc.Cancel)
@@ -125,19 +125,20 @@ func printInterrupt(w io.Writer, interrupt *Interrupt) error {
 	return err
 }
 
-// printAsyncTasks prints an arc's tasks, each followed by its transcript. Arcs
-// that launched none print nothing.
+// printAsyncTasks prints the session's task table, each task followed by its
+// transcript. Tasks that ran none print nothing.
 func printAsyncTasks(w io.Writer, tasks []*AsyncTask) error {
 	if len(tasks) == 0 {
 		return nil
 	}
-	if _, err := fmt.Fprintln(w, "\n  Async tasks"); err != nil {
+	if _, err := fmt.Fprintln(w, "\nAsync tasks"); err != nil {
 		return err
 	}
 	for _, task := range tasks {
-		if _, err := fmt.Fprintf(w, "\n    async task %s\n      id: %s\n      status: %s\n      args: %s\n      result: %s\n      finished_at: %s\n",
+		if _, err := fmt.Fprintf(w, "\n  async task %s\n    id: %s\n    origin arc: %s\n    status: %s\n    args: %s\n    result: %s\n    finished_at: %s\n",
 			task.TaskName,
 			task.ID,
+			task.CorrelationID,
 			task.Status,
 			formatValue(task.Args),
 			formatValue(task.Result),
@@ -146,7 +147,7 @@ func printAsyncTasks(w io.Writer, tasks []*AsyncTask) error {
 			return err
 		}
 		for _, event := range task.Events {
-			if _, err := fmt.Fprintf(w, "      [%s] %s %s\n%s\n", formatTime(event.Timestamp), event.Type, event.ID, indent(formatValue(event.Payload), "        ")); err != nil {
+			if _, err := fmt.Fprintf(w, "    [%s] %s %s\n%s\n", formatTime(event.Timestamp), event.Type, event.ID, indent(formatValue(event.Payload), "      ")); err != nil {
 				return err
 			}
 		}
