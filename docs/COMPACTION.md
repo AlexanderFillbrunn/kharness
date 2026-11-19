@@ -482,7 +482,8 @@ lower is checked first on any round, so by the time a run threatens the
 higher budget, a compaction is already in flight or already landed. A run
 reaching the higher budget is expected for long arcs. A third value,
 `KeepRecentTokens`, is the tail of the log the cut must leave above it, as
-under Where the cut goes.
+under Where the cut goes; a fourth, `MaxToolResultTokens`, caps what one
+tool result may contribute to a transcript, as under Thinning tool results.
 
 Whether compaction is due is a pure function of the log. `AssistantMessage`
 `Payload.Usage` carries the input tokens of the last reply, and distinguishes
@@ -498,7 +499,8 @@ The second clause prevents a loop: just after a compaction lands, the last
 reply's usage still describes the replaced transcript, and a rule reading
 only the usage would find the session due again. A reply counts only if its
 cost was measured against the compacted transcript. A reply whose usage is
-nil counts as not due.
+nil falls back to the transcript estimate rather than counting as not due:
+a provider that reports nothing would otherwise never be found due.
 
 *In the loop, after every round, the lower budget.* The loop consults the
 predicate after each reply. Where due, it writes a `COMPACTION_REQUESTED`
@@ -596,9 +598,25 @@ picks the arc up.
 suspends onto the compaction its own earlier rounds triggered; no second
 compaction is produced.
 
+*Thinning tool results.* A tool result is the one part of the transcript
+that can shrink without misrepresenting who said it: the log keeps the whole
+result and the projection thins what the model is told. A result over
+`MaxToolResultTokens` — measured with the same per-event estimate as the
+tail cap — is truncated to the cap with a marker naming what was cut, or
+replaced outright by a synthesized tool result documenting the error
+("result too large"). The replacement is the agent's, not the tool's: not
+an `IsError` FAILED outcome, which reads as the tool failing, but a
+synthesized stand-in — a note naming the call and the omitted size — so the
+model reads that the harness thinned the result. Thinned before every call,
+tool results never reach the provider oversized, and a rejection can only be
+of material that cannot be thinned.
+
 *Overflow recovery.* The budgets and the estimate are the proactive
 mechanism; the provider's rejection is the backstop, for the case where the
-estimate was wrong. A run whose call the provider rejects as over budget —
+estimate was wrong. A user message is never thinned — it is the user's own
+words, and truncating it would misrepresent them — so the rejections the
+backstop sees are rejections of user-message material, and only those
+recover. A run whose call the provider rejects as over budget —
 or whose reply ends early on a length stop — recovers the way case 4
 suspends: it writes a non-fatal `Error` correlated to the arc, carrying the
 provider's reason, so the rejection is in the log and the resumed turn
@@ -872,18 +890,20 @@ itself changes nothing else: it reads the whole log, as it does today.
 The missing-arc and nil-correlation checks are already in.
 
 `pkg/history/projection.go` emits the summary at the head of the transcript,
-the note and the threshold test and the skeleton for a suspended arc — the
+thins an over-`MaxToolResultTokens` tool result into a truncated result or a
+synthesized note naming the call and the omitted size, and emits the note
+and the threshold test and the skeleton for a suspended arc — the
 `ARC_SUSPENDED` event being the trigger — and the invocation note
 synthesised from the task table for an unsettled task whose invoke is below
 the watermark. `Modes` gains nothing, because compaction has no mode.
 
 `pkg/agent` gains the `Compactor` interface with its three implementations,
-the method, the two budgets and `KeepRecentTokens` on `AgentConfig` and with
-them the arc threshold the bound rule tests, the bound rule itself that
-computes the watermark from the open arcs and the tail cap — an arc's
-opening or its live boundary, whichever the threshold allows — the loop's
-check after
-every round that writes a `COMPACTION_REQUESTED` and enqueues the compaction
+the method, the two budgets, `KeepRecentTokens` and `MaxToolResultTokens`
+on `AgentConfig`, and with them the arc threshold the bound rule tests, the
+bound rule itself that computes the watermark from the open arcs and the
+tail cap — an arc's opening or its live boundary, whichever the threshold
+allows — the loop's check after every round that writes a
+`COMPACTION_REQUESTED` and enqueues the compaction
 work item when the fold says one is due, the compaction lease scoped to
 the session and the leaving-unacknowledged of an item that finds it held,
 the discard of an item whose request a landed `COMPACTED` already covers,
@@ -907,8 +927,8 @@ snapshot mechanism — persisting the folded state so a worker loads a
 snapshot plus the events after it — is separate work, and not specified
 here.
 
-PROJECTION.md gains a section, and loses the sentence saying a note is one
-line. Rendering follows: `RenderChat` and devchat's transcript draw a
+PROJECTION.md gains a section for the compacted transcript and one for
+thinned tool results, and loses the sentence saying a note is one line. Rendering follows: `RenderChat` and devchat's transcript draw a
 session as a sequence of arcs, and a compacted session is a summary block
 followed by arcs.
 
@@ -918,8 +938,13 @@ Open questions
 measure and are the provider's, arriving one turn late and absent when a
 provider reports nothing. An estimate from the transcript is available
 immediately and is wrong by an unknown amount. The first is probably right
-and the nil case needs an answer. The tail cap under Where the cut goes is
-measured with the estimate, so its accuracy is this question's too.
+and the nil case needs an answer: the Pi harness anchors on the provider's
+usage of the last reply, adds a characters-per-token estimate for the
+trailing messages, and uses the pure estimate for everything where no usage
+exists — its nil case is the estimate, never "not due", because a streaming
+provider that omits the usage chunk would otherwise never compact. The tail
+cap under Where the cut goes is measured with the estimate, so its
+accuracy is this question's too.
 
 *Whether a summary is one block or several.* One block per compaction is
 simplest and means the second compaction summarises a summary, losing a
