@@ -3,11 +3,276 @@ Compaction
 
 Status
 --------------------
-A proposal, not a specification, and the starting point for the
-implementation work. [PROJECTION.md](PROJECTION.md) and
-[ENCODING.md](ENCODING.md) describe what the code does today; nothing here is
-binding until it is folded into those two. The code follows neither this
-document nor [ASYNC-TASKS.md](ASYNC-TASKS.md) yet.
+A technical specification for the implementation work: Summary, Goal,
+Requirements and Acceptance Criteria up front, design detail below.
+[PROJECTION.md](PROJECTION.md) and [ENCODING.md](ENCODING.md) describe what
+the code does today; nothing here is binding until it is folded into those
+two. The code follows neither this document nor [ASYNC-TASKS.md](ASYNC-TASKS.md)
+yet.
+
+Summary
+--------------------
+Compaction lets a session continue past the size of its own history: a
+prefix of the event log is replaced, in what the model is told, by a
+summary, while the log itself is never rewritten. Three records drive it —
+`COMPACTION_REQUESTED` (the want), `ARC_SUSPENDED` (a paused arc) and
+`COMPACTED` (the result, carrying a `ThroughSeq` watermark) — plus a
+non-fatal `Error` when a provider rejects an over-budget transcript. A turn
+reads the `COMPACTED` with the greatest `ThroughSeq` written at or before
+its start, and renders that summary plus the projection of the events above
+the watermark. The cut never separates a tool call from its result, never
+strands an open arc's live material, and keeps a `KeepRecentTokens` tail.
+Two budgets act proactively (the lower writes a request after any round, the
+higher suspends a run), a classified provider rejection recovers reactively
+once per arc, and character-based limits thin tool results and reject
+oversized user messages. Parallel runs each keep the transcript they
+started with; only runs started after a compaction lands read its summary.
+
+Goal
+--------------------
+A session of unbounded length stays servable by a provider of bounded
+context, without lying to the model and without stranding work. The
+invariants:
+
+1. The log is append-only: compaction changes what the model is told, never
+   what the store holds.
+2. A tool call and its result are never separated by the cut.
+3. Every reference across the cut resolves, because the fold reads the whole
+   log.
+4. An open arc's live material — its last response, an unanswered ask, the
+   request that opened it — stays above the cut.
+5. A run in flight is never affected by a compaction that lands mid-run.
+6. The model is never shown the harness's thinning as a tool's own failure.
+
+Requirements
+--------------------
+Records and watermark.
+
+*REQ-1* The store gains `COMPACTION_REQUESTED`, `ARC_SUSPENDED` and
+`COMPACTED`; the `COMPACTED` payload carries `ThroughSeq` (the watermark, in
+the payload and not the record's position), `Summary`, `Method`, `Modes`,
+`ModelID` and `Usage`. See The record.
+
+*REQ-2* The compaction in force for a turn starting at seq S is the
+`COMPACTED` with the greatest `ThroughSeq` among those written at or before
+S — coverage by watermark, not arrival, so out-of-order or duplicated
+compactions are harmless. `History.LastCompaction` is set by the same rule.
+See What an arc reads.
+
+*REQ-3* Compaction is recursive: each summary is made from the previous
+compaction's kept boundary plus what has landed since. See The record.
+
+The cut.
+
+*REQ-4* `ThroughSeq = min( min(bound(arc) for open arcs) - 1, tailCap )`,
+where `bound(arc)` is `opening(arc)` when the arc's log fits the arc
+threshold at watermark-computation time and `liveBoundary(arc)` otherwise,
+and `tailCap` is the last turn boundary at or below the backward
+accumulation of per-event estimates that reaches `KeepRecentTokens`. See
+Where the cut goes.
+
+*REQ-5* The cut never separates a tool call from its result, never straddles
+a fitting open arc, and keeps every open arc's live material above the line.
+See Where the cut goes.
+
+What a turn reads.
+
+*REQ-6* A turn's transcript is the summary of the events at or below
+`ThroughSeq` plus the projection of the arc's cutoff-selected events above
+it; a run in flight keeps the transcript it started with. See What an arc
+reads and Two views of one prefix.
+
+*REQ-7* A suspended arc over the threshold renders as a skeleton: the
+opening request verbatim, tool calls without their results above the cut,
+the live part whole, and a note at the cut stating that the arc's own log
+wins over the summary. See The arc the line passes through.
+
+Estimation.
+
+*REQ-8* `estimate(event) = ceil(chars/4)` over the event's projected text —
+one heuristic for every model, no per-model tokenizer. It is what the tail
+cap, the arc-threshold fit and the admission estimate use, and the fallback
+when a reply's usage is nil; reported usage is preferred where present and
+nil never counts as "not due". See When compaction runs.
+
+Triggers and suspension.
+
+*REQ-9* `CompactionDue(lower)`: the last reply's input tokens (usage, else
+the estimate) exceed the lower budget, that reply sits above the watermark
+in force, and no `COMPACTION_REQUESTED` is unsatisfied. The loop checks
+after every round, writes the request and enqueues the work item, and the
+run continues (mid-run async). See When compaction runs.
+
+*REQ-10* The higher budget is checked before a run (the admission check
+estimates the would-be transcript; over budget it writes the request and an
+`ARC_SUSPENDED` and refuses to start) and between rounds (a run that would
+cross it suspends). `ARC_SUSPENDED` carries no payload and names the request
+as its cause; outstanding/released/resolved are derived from the log. See
+When compaction runs.
+
+*REQ-11* After writing `COMPACTED`, the handler's completion scan enqueues
+every arc with a released, unresolved suspension the compaction covers;
+autoclaim re-offers expired items; an item whose request is already covered
+is discarded; a session-scoped lease prevents two workers computing at
+once. See The window and admission control.
+
+*REQ-12* One compaction per episode: a run crossing the higher budget
+suspends onto the request its own earlier rounds triggered. See When
+compaction runs.
+
+Thinning and limits.
+
+*REQ-13* A tool result over `MaxToolResultChars` is thinned in the
+projection — truncated with a marker, or replaced by a synthesized
+"result too large" note naming the call and the omitted size, marked as the
+harness's, never an `IsError` FAILED outcome — before every call; the log
+keeps the whole result. See Thinning tool results.
+
+*REQ-14* A user message over `MaxUserMessageChars` is rejected without a
+call: the admission check writes a fatal `Error` and refuses the arc. User
+messages are never thinned. See Overflow recovery.
+
+Overflow recovery.
+
+*REQ-15* The `LLM` interface gains a typed error (status, type, code,
+message), a stop reason on the reply, and a per-vendor classifier
+`IsContextOverflow`: status plus a context code, a 413, a message pattern
+where no code exists, an error object inside a 200 stream, a final length
+stop — never the status alone, never an output-limit stop. See Overflow
+recovery.
+
+*REQ-16* A classified rejection mid-run writes a non-fatal `Error`
+correlated to the arc, then a `COMPACTION_REQUESTED` if none stands, then an
+`ARC_SUSPENDED`, and ends the in-flight period; the completion scan resumes
+the arc on the compacted transcript. Bounded to one recovery per arc — a
+rejection on an arc whose suspension is already resolved is fatal. See
+Overflow recovery and How a compaction and a run meet.
+
+Async tasks.
+
+*REQ-17* A running task never pins the watermark and a task report is never
+held; a task whose invoke falls below the watermark gets its invocation
+note synthesized from the task table, ID verbatim. See Async tasks.
+
+Mode.
+
+*REQ-18* The parallelism mode is mid-run async: the request is written
+after any due round and the run continues on its fixed transcript;
+suspension appears only at the higher budget. See Parallelism modes.
+
+Out of scope: snapshots (a separate mechanism, see Snapshots).
+
+Acceptance Criteria
+--------------------
+*AC-1* (REQ-2, REQ-6) Given `COMPACTED(ThroughSeq=100)` written at seq 141
+and `COMPACTED(ThroughSeq=120)` at 150: a turn starting at 160 reads the
+summary through 120; a run that started at 145 and is still in flight at
+150 keeps the transcript it started with, and the landing is not in force
+under it.
+
+*AC-2* (REQ-4, REQ-5) Given open arcs with bounds 40 and 80 and a tail cap
+of 200, `ThroughSeq = 39`. For every log: no tool call/result pair
+straddles `ThroughSeq`, and every open arc's opening request and last
+response are above it.
+
+*AC-3* (REQ-4) Given per-event estimates and `KeepRecentTokens` K, `tailCap`
+is the last turn boundary T with the estimated tokens above T at least K,
+and `ThroughSeq ≤ T`; when the whole log estimates below K the cap
+constrains nothing.
+
+*AC-4* (REQ-9) Given a reply whose reported input exceeds the lower budget
+above the watermark in force and no unsatisfied request, the round after it
+leaves exactly one `COMPACTION_REQUESTED` standing; a duplicate work item
+taken by another worker is discarded on read.
+
+*AC-5* (REQ-8) Given a reply with nil usage, `CompactionDue` uses the
+estimate; given usage zero, it counts zero.
+
+*AC-6* (REQ-10, REQ-11) Given an admission estimate over the higher
+budget, the arc is not started, `ARC_SUSPENDED` with causation naming the
+request is written, and after the covering `COMPACTED` lands the completion
+scan has enqueued the arc; the resumed turn reads the compaction in force at
+its start.
+
+*AC-7* (REQ-12) A run that crosses the higher budget after its own earlier
+rounds wrote a request suspends onto that request and writes no second one.
+
+*AC-8* (REQ-16) Given a classified rejection mid-run, the log gains a
+non-fatal `Error` correlated to the arc, then the request if needed and the
+`ARC_SUSPENDED`; after the covering `COMPACTED` the arc resumes and reads
+the summary. Given a second classified rejection after a resolved
+suspension, the `Error` is fatal and no suspension is written.
+
+*AC-9* (REQ-13) Given a tool result over `MaxToolResultChars`, the
+transcript shows the truncated prefix with its marker or the synthesized
+note naming the call and omitted size; the log retains the full result; no
+`IsError` tool result is written for the thinning.
+
+*AC-10* (REQ-14) Given a user message over `MaxUserMessageChars`, the
+admission check writes a fatal `Error`, the arc never runs, and the message
+event stays in the log whole.
+
+*AC-11* (REQ-7) Given a suspended arc over the threshold with the cut
+inside its spent prefix, its transcript shows the opening request verbatim,
+the calls without results above the cut, the precedence note at the cut,
+and the live part whole.
+
+*AC-12* (REQ-17) Given a task whose invoke is below the watermark, the
+transcript carries the synthesized invocation note with the task ID
+verbatim, and no compaction waits on a running task.
+
+*AC-13* (REQ-8) `estimate(event)` equals `ceil(len(projected text)/4)` for a
+table of known strings, identically for every model.
+
+*AC-14* (REQ-1) A `COMPACTED` computed through seq 100 but written at 141 is
+honored by its `ThroughSeq`, and the events at 101..141 are still read.
+
+*AC-15* (REQ-18) Given a run in flight while a request stands, the run
+finishes on its fixed transcript and the next run of any arc reads the
+summary — two views of one prefix, bounded by the watermark rule.
+
+Implementation notes
+--------------------
+Checked against the code (pkg/agent, redisinfra, devchat).
+
+*An in-flight run is structurally unaffected by a landing.* The log is
+fetched once per run — `GetEventsForArc` returns the session up to the
+arc's opening plus what correlates to it, which is the projection's
+cutoff — and the run folds only its own writes (`persistAndFold`), so a
+`COMPACTED` that lands mid-run is invisible to the run in flight; the next
+run fetches fresh and reads it. Invariant 5, AC-1 and AC-15 need no pinning
+mechanism.
+
+*The worked arc is the last arc of the fetched history.* `RunOptions.ArcID`
+names the arc that is fetched and worked, and because the fetch cuts the
+log at that arc, it is the last arc in the history the run holds — which is
+what the LLM client's target selection assumes. Keep that explicit (pass
+the arc ID through `LLMOptions`) when compaction lands; the `Compactor`
+takes a `ModelTranscript`, so it is unaffected.
+
+*The context window is a lookup, not a field.* `ContextWindow(modelRef) int`
+over a catalog keyed by model ref in `pkg/agent`, with `DefaultContextWindow`
+= 32000 and per-model overrides in the settings file; `FileResolver.build`
+resolves it into `AgentConfig` when the agent is built. The settings schema
+(`AgentSettings`) is also the home for default timeouts and other
+cross-cutting defaults.
+
+*Still to build, in dependency order:* the three event types and their
+codec cases; `LastCompaction`, `CompactionDue` and the suspension states in
+the fold; the summary/skeleton/thinning/invocation-note rendering in the
+projection (and the PROJECTION.md sections, including dropping "a note is
+one line"); the typed LLM error, the stop reason on the reply and the
+per-vendor classifier (`openAIError` flattens to a string today and
+`finishReason` is parsed but dropped); the `ceil(chars/4)` estimator in
+`pkg/history`; a non-arc work-item kind and a session-scoped lease in the
+queue and worker (queue items are arc-shaped today); the budget and limit
+fields on `AgentConfig` and in the settings schema. Note the module
+boundaries: `devchat/` and `redisinfra/` are separate Go modules with no
+`go.work` at the root.
+
+The sections below are the design detail behind these requirements; where
+prose and a requirement disagree, the requirement and its acceptance
+criteria win.
 
 Overview
 --------------------
@@ -59,6 +324,11 @@ payload is along these lines.
         Usage   *TokenUsage
     }
 
+Where a provider rejects a transcript as over budget, a non-fatal `Error`
+is appended before the arc suspends, so the rejection is in the log and the
+resumed turn reads it as a note; see Overflow recovery under When compaction
+runs.
+
 `ThroughSeq` is the watermark. Which compaction is in force, what a reader
 loads and whether two workers conflict are all answered by comparing
 watermarks.
@@ -74,7 +344,7 @@ everything written in between must be read.
 
 Where the cut goes
 --------------------
-Three constraints on `ThroughSeq`.
+Four constraints on `ThroughSeq`.
 
 *A tool call and its result are not separated.* Providers require the pair
 to be contiguous, and the projection makes it the one exception to log order.
@@ -93,11 +363,30 @@ already accounted for in a response — is spent prefix: summarised where the
 line passes through, and kept whole below the line where the opening bound
 applies.
 
-The rule that satisfies all three:
+*A tail stays above the cut.* The last `KeepRecentTokens` of the log are
+never summarised. Walking backwards from the end of the log as it stands when
+the compaction computes its watermark and accumulating the per-event
+estimate (`ceil(chars/4)`, defined under When compaction runs) until
+`KeepRecentTokens` is reached gives a token point; the last turn boundary at
+or below it is `tailCap`. The tail is measured on the projection, the same
+material the summary is made from.
+
+The rule that satisfies all four:
 
     bound(arc) = opening(arc)        where the arc's own log fits the arc threshold
               = liveBoundary(arc)   otherwise
-    ThroughSeq = min(bound(arc) for arcs where arc.Status() != closed) - 1
+    ThroughSeq = min( min(bound(arc) for arcs where arc.Status() != closed) - 1,
+                     tailCap )
+
+The tail cap only ever lowers the cut below what the bound rule chose, so it
+cannot span a fitting open arc — the opening bound already holds the cut
+before it — and a turn boundary never separates a tool call from its result.
+Where the whole log is smaller than `KeepRecentTokens` the cap constrains
+nothing. Where a single arc outruns the tail, the bound rule's live boundary
+decides, the live part kept above the line may be smaller than
+`KeepRecentTokens`, and the spanning arc renders as the skeleton it already
+does. Like the skeleton, the cap is derived from the log and the config, so
+the payload gains nothing for it.
 
 The live boundary of an arc is its last turn boundary, or its opening where
 it has taken no turn. An arc that has not been worked pins the watermark at
@@ -115,9 +404,10 @@ shared by all open arcs, so it advances only as far as the least advanced of
 them permits; an arc that stays open without taking a turn holds the line
 for the others.
 
-The fit is measured when the compaction computes its watermark, against the
-arc's log as it stands then. An arc kept whole that outgrows the threshold
-afterwards is not re-cut by a compaction already in force: the arc renders
+The fit is measured with the estimate, when the compaction computes its
+watermark, against the arc's log as it stands then. An arc kept whole that
+outgrows the threshold afterwards is not re-cut by a compaction already in
+force: the arc renders
 whole against that line, and the next compaction, finding the arc over the
 threshold, draws its line at the arc's live boundary instead.
 
@@ -132,7 +422,8 @@ and [5, parallel open arcs with the oldest too large](diagrams/compaction-5-para
 Each draws the log as event blocks with the arcs bracketed and the cut as a
 double line, and beside the log a strip showing the context estimate as a
 step function — one step per event, at the event's position — against the
-soft and the hard budget as lines the curve crosses. The parallel cases 4
+soft and the hard budget and the tail cap as lines the curve crosses. The
+parallel cases 4
 and 5 draw one column per run: an event both runs read spans both
 columns, and an event of one run's own stays in that run's column.
 Session records are dashed wherever they were written: in the writing
@@ -452,10 +743,22 @@ When compaction runs
 Two budgets are configured on the agent: `AgentConfig` gains a lower budget
 and a higher budget, as token counts, alongside the compaction method. The
 lower budget triggers compaction and sits well below what the provider
-accepts; the higher budget suspends runs and sits close to the limit. The
+accepts; the higher budget suspends runs and sits close to the context
+window of the run's model — the `ContextWindow` lookup with a default of
+32000, see Implementation notes. The
 lower is checked first on any round, so by the time a run threatens the
 higher budget, a compaction is already in flight or already landed. A run
-reaching the higher budget is expected for long arcs.
+reaching the higher budget is expected for long arcs. A third value,
+`KeepRecentTokens`, is the tail of the log the cut must leave above it, as
+under Where the cut goes. Two character-based limits sit beside them:
+`MaxToolResultChars` caps what one tool result may contribute to a
+transcript, as under Thinning tool results, and `MaxUserMessageChars` is
+the most a user message may carry before the harness rejects it outright,
+as under Overflow recovery. Where a number is wanted in tokens and no
+reported usage is available, the estimate is `ceil(chars/4)` per event,
+counted over its projected text — one heuristic for every model, no
+per-model tokenizer — and it is what the tail cap, the arc-threshold fit
+and the admission estimate all use.
 
 Whether compaction is due is a pure function of the log. `AssistantMessage`
 `Payload.Usage` carries the input tokens of the last reply, and distinguishes
@@ -471,7 +774,8 @@ The second clause prevents a loop: just after a compaction lands, the last
 reply's usage still describes the replaced transcript, and a rule reading
 only the usage would find the session due again. A reply counts only if its
 cost was measured against the compacted transcript. A reply whose usage is
-nil counts as not due.
+nil falls back to the transcript estimate rather than counting as not due:
+a provider that reports nothing would otherwise never be found due.
 
 *In the loop, after every round, the lower budget.* The loop consults the
 predicate after each reply. Where due, it writes a `COMPACTION_REQUESTED`
@@ -569,9 +873,58 @@ picks the arc up.
 suspends onto the compaction its own earlier rounds triggered; no second
 compaction is produced.
 
-One residual case: if even the compacted transcript is over the higher
-budget, the resumed round is rejected by the provider. The budgets were
-set wrong; it is a condition to alert on, not a mechanism to build.
+*Thinning tool results.* A tool result is the one part of the transcript
+that can shrink without misrepresenting who said it: the log keeps the whole
+result and the projection thins what the model is told. A result over
+`MaxToolResultChars` — counted in characters, converted by the estimate
+where a budget wants tokens — is truncated to the cap with a marker naming
+what was cut, or
+replaced outright by a synthesized tool result documenting the error
+("result too large"). The replacement is the agent's, not the tool's: not
+an `IsError` FAILED outcome, which reads as the tool failing, but a
+synthesized stand-in — a note naming the call and the omitted size — so the
+model reads that the harness thinned the result. Thinned before every call,
+tool results never reach the provider oversized, and a rejection can only be
+of material that cannot be thinned.
+
+*Overflow recovery.* The budgets and the estimate are the proactive
+mechanism; the provider's rejection is the backstop, for the case where the
+estimate was wrong. A user message is never thinned — it is the user's own
+words, and truncating it would misrepresent them — so the rejections the
+backstop sees are rejections of user-message material, and only those
+recover. A user message over `MaxUserMessageChars` is rejected without a
+call: the admission check writes the `Error` fatal and refuses the arc,
+because no compaction can shrink a user message and the provider would
+reject the transcript anyway. A run whose call the provider rejects as
+over budget —
+or whose reply ends early on a length stop — recovers the way case 4
+suspends: it writes a non-fatal `Error` correlated to the arc, carrying the
+provider's reason, so the rejection is in the log and the resumed turn
+reads it as a note; then, where no request stands unsatisfied, a
+`COMPACTION_REQUESTED`; then an `ARC_SUSPENDED` causally naming the
+request; and the run ends its in-flight period. The completion scan
+resumes the arc on the compacted transcript.
+
+Recognising the rejection is the vendor's job at the `LLM` boundary, not
+the loop's: the interface gains a typed error carrying the status, type,
+code and message of the provider's complaint, a stop reason on the reply,
+and a classifier saying whether an error or a stop is a budget rejection.
+Each vendor maps its own wire format — a status with a context code
+(OpenAI's `context_length_exceeded`), a 413 where a gateway uses one, a
+message pattern where no code exists (Anthropic's "prompt is too long"),
+an error object inside an otherwise-200 stream, and a final length stop,
+never an output-limit stop such as `max_tokens`. Never the status alone. A
+vendor with no reliable signal classifies nothing, its rejections stay
+fatal, and the proactive budgets carry it: the backstop simply never fires
+for that vendor.
+
+The recovery is bounded to one per arc, and the bound is derived, not
+recorded: the fold already derives the suspension states, so a classified
+rejection on an arc whose suspension is already resolved writes the `Error`
+fatal and suspends nothing. One residual case remains: if even the
+compacted transcript is over the provider's limit, that second rejection
+is the alert — the budgets were set wrong, and no mechanism is built for
+it.
 
 Parallelism modes
 --------------------
@@ -678,14 +1031,15 @@ case: the landing is not in force under the run. Blocking: none.
       the run writes its reply
       the next run of any arc reads the summary
 
-*Case 6: the compacted transcript is still over the higher budget.* The
-residual case of When compaction runs: the budgets were set wrong.
-Blocking: none built in.
+*Case 6: the compacted transcript is still over the provider's limit.*
+The residual case of When compaction runs. Blocking: the tail of the
+window, once.
 
       the compaction lands; the suspended arc is requeued
       the run resumes, reading the summary
       the provider rejects the round: even the compacted transcript
-      is over the higher budget
+      is over the limit
+      overflow recovery fires once; a second rejection is fatal
       an alert, not a mechanism
 
 The window and admission control
@@ -803,36 +1157,58 @@ What would have to change
 --------------------
 `proto/pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
 — `COMPACTED` carrying the method that ran — and `ARC_SUSPENDED`, which
-carries no payload of its own; the codec gains their cases.
+carries no payload of its own; the codec gains their cases. `ErrorPayload`
+needs nothing for overflow recovery: `IsFatal` and `CausationID` already
+exist, and a non-fatal error already folds without ending the arc and
+projects as a note.
 
-`agent/pkg/history` gains `LastCompaction` on `History`, the apply function that
-sets it by coverage rather than arrival, `CompactionDue`, and the derived
-suspension states: outstanding until a covering `COMPACTED` lands, released
+`pkg/history` gains the per-event estimate `ceil(chars/4)` shared by the
+tail cap, the fit test and the admission check, plus `LastCompaction` on
+`History`, the apply function that sets it by coverage rather than arrival,
+`CompactionDue`, and the derived suspension states: outstanding until a
+covering `COMPACTED` lands, released
 until a response follows the `ARC_SUSPENDED`, then resolved. The fold
 itself changes nothing else: it reads the whole log, as it does today.
 The missing-arc and nil-correlation checks are already in.
 
-`agent/pkg/history/projection.go` emits the summary at the head of the transcript,
-the note and the threshold test and the skeleton for a suspended arc — the
+`pkg/history/projection.go` emits the summary at the head of the transcript,
+thins an over-`MaxToolResultChars` tool result into a truncated result or a
+synthesized note naming the call and the omitted size, and emits the note
+and the threshold test and the skeleton for a suspended arc — the
 `ARC_SUSPENDED` event being the trigger — and the invocation note
 synthesised from the task table for an unsettled task whose invoke is below
 the watermark. `Modes` gains nothing, because compaction has no mode.
 
-`agent/pkg/agent` gains the `Compactor` interface with its three implementations,
-the method and the two budgets on `AgentConfig` and with them the arc
-threshold the bound rule tests, the bound rule itself that computes the
-watermark from the open arcs — an arc's opening or its live boundary,
-whichever the threshold allows — the loop's check after
-every round that writes a `COMPACTION_REQUESTED` and enqueues the compaction
+`pkg/agent` gains the `Compactor` interface with its three implementations,
+the method, the two budgets, `KeepRecentTokens`, `MaxToolResultChars` and
+`MaxUserMessageChars` on `AgentConfig`, the context-window lookup
+(`ContextWindow(modelRef)` over a catalog with `DefaultContextWindow` =
+32000, overridable in the settings file) resolved into `AgentConfig` at
+build, and with them the arc threshold the
+bound rule tests, the
+bound rule itself that computes the watermark from the open arcs and the
+tail cap — an arc's opening or its live boundary, whichever the threshold
+allows — the loop's check after every round that writes a
+`COMPACTION_REQUESTED` and enqueues the compaction
 work item when the fold says one is due, the compaction lease scoped to
 the session and the leaving-unacknowledged of an item that finds it held,
 the discard of an item whose request a landed `COMPACTED` already covers,
 the write of an `ARC_SUSPENDED` by a suspending run and by the admission
-check, the completion scan that requeues every arc with an outstanding
-suspension, the higher-budget check before a run and between rounds, and
+check, the admission check's refusal of an over-`MaxUserMessageChars` user
+message as a fatal `Error`, the completion scan that requeues every arc with
+an outstanding suspension, the higher-budget check before a run and between
+rounds, and
 the autoclaim that reaps an expired item so that a dead worker's compaction
-is taken up by another. `TaskReports` is unchanged, since a report is never
-held.
+is taken up by another; and the LLM-boundary classification for overflow
+recovery — a typed error with the status, type, code and message, a stop
+reason on the reply, and an `IsContextOverflow`-style classifier each vendor
+fills in — with the loop's handling of a classified rejection: the
+non-fatal `Error`, the request where none stands, the `ARC_SUSPENDED`, and
+the one-recovery-per-arc bound read off the derived suspension states.
+`TaskReports` is unchanged, since a report is never held. The settings
+schema (`AgentSettings`) gains the compaction block and a defaults section —
+context window, timeouts — which `FileResolver.build` resolves into
+`AgentConfig`.
 `GuardCancellation` needs no change: `startsWork` covers dispatches and
 task invocations, and a compaction is neither.
 
@@ -842,7 +1218,8 @@ snapshot mechanism — persisting the folded state so a worker loads a
 snapshot plus the events after it — is separate work, and not specified
 here.
 
-PROJECTION.md gains a section, and loses the sentence saying a note is one
+PROJECTION.md gains a section for the compacted transcript and one for
+thinned tool results, and loses the sentence saying a note is one
 line. Rendering follows: `RenderChat` and devchat's transcript draw a
 session as a sequence of arcs, and a compacted session is a summary block
 followed by arcs.
@@ -850,10 +1227,14 @@ followed by arcs.
 Open questions
 --------------------
 *What the budget is measured in.* Reported input tokens are the reliable
-measure and are the provider's, arriving one turn late and absent when a
-provider reports nothing. An estimate from the transcript is available
-immediately and is wrong by an unknown amount. The first is probably right
-and the nil case needs an answer.
+measure and are the provider's, arriving one turn late; where they are
+absent the estimate stands in, so the nil case is the estimate, never
+"not due" — a streaming provider that omits the usage chunk would
+otherwise never be found due. The estimate is fixed: `ceil(chars/4)` per
+event, one heuristic for every model, no per-model tokenizer. What stays
+open is only its accuracy: it errs by an unknown, model-dependent amount in
+both directions, and the two budgets plus the overflow backstop absorb the
+error.
 
 *Whether a summary is one block or several.* One block per compaction is
 simplest and means the second compaction summarises a summary, losing a
@@ -882,4 +1263,123 @@ rather than as a round number under the context limit.
 set well, a run rarely suspends, and the higher-budget check and the
 completion scan are machinery for a case that rarely arises. They should
 be built and then measured, and the measurement decides whether they
-stay.
+stay. Overflow recovery is that machinery reacting to a classified
+rejection rather than an estimate; measure the two together.
+
+Glossary
+--------------------
+Terms as this document uses them, in the order they appear above.
+
+*Log, event, `Seq`* — the append-only record of everything that happened.
+Each event has a sequence number; the log is never rewritten, and
+compaction changes what the model is told, not what the store holds.
+
+*Session, `History`* — one log and its folded state. Arcs live in a session.
+
+*Arc* — one unit of work: a request that opened it (a user message or a task
+report) and everything done in answer, closed by a reply.
+
+*Run, turn* — a run is a worker executing an arc and is in flight while it
+executes; a turn is one step of a run, which reads the compaction in force
+at its start. A resume after a suspension is a new turn.
+
+*Fold* — reading the whole log into `History`: the task table, the arc
+statuses, `LastCompaction`. Compaction never removes a fold input.
+
+*Projection, transcript, cutoff* — the `ModelTranscript` the model is told,
+derived from `History` under the arc's cutoff and `Modes`. Compaction sits
+after projection and before encoding.
+
+*Note* — synthesized text the model must be told that no participant said
+(`ModelNoteMessage`). The summary is the one note that is not short.
+
+*Watermark (`ThroughSeq`)* — the last event a compaction's summary accounts
+for: everything at or below it is replaced in the transcript, everything
+above it survives. It is carried in the `COMPACTED` payload, not taken from
+the record's own position.
+
+*Compaction in force, coverage rule* — for a turn starting at seq S, the
+`COMPACTED` with the greatest `ThroughSeq` among those written at or before
+S. Coverage by watermark, not arrival, so duplicated or out-of-order
+compactions are harmless.
+
+*The cut (the line)* — where the watermark falls in the log.
+
+*Bound* — where the cut may pass an open arc: the arc's `opening` where its
+log fits the arc threshold, its `liveBoundary` otherwise.
+
+*Live material, live boundary* — an open arc's last response, an unanswered
+ask, and the request that opened it; always above the cut. The live boundary
+is the arc's last turn boundary, or its opening where it has taken no turn.
+
+*Spent prefix* — an open arc's tool rounds already accounted for in a
+response; the only part of an open arc the cut may pass through.
+
+*Tail cap (`KeepRecentTokens`, `tailCap`)* — the last tokens of the log that
+are never summarised; `tailCap` is the last turn boundary at or below the
+backward accumulation of per-event estimates that reaches `KeepRecentTokens`.
+
+*Skeleton* — how a spanning arc renders against the cut: the opening request
+verbatim, tool calls without their results above the line, the live part
+whole, and a note at the cut.
+
+*The records* — `COMPACTION_REQUESTED` (the want; satisfied by a covering
+`COMPACTED`, discarded on read once covered), `ARC_SUSPENDED` (a paused arc,
+no payload, causation naming the request; outstanding, then released, then
+resolved), `COMPACTED` (the result). A non-fatal `Error` records a classified
+provider rejection before the suspension.
+
+*Window* — the time between a `COMPACTION_REQUESTED` and the `COMPACTED`
+that satisfies it.
+
+*Work item, lease, autoclaim* — a compaction is a queued work item in the
+same queue as arcs; a session-scoped lease lets exactly one worker compute
+it; autoclaim re-offers an item whose lease expired.
+
+*Completion scan* — the compaction handler's step, after writing
+`COMPACTED`, of enqueuing every arc with a released, unresolved suspension
+the compaction covers.
+
+*Admission check* — the estimate made before a run starts: over the higher
+budget it writes the request and the suspension; over `MaxUserMessageChars`
+it writes a fatal refusal.
+
+*Budgets* — the lower budget triggers a compaction request and is checked
+after every round; the higher suspends runs and is checked at admission and
+between rounds. Both are token counts on `AgentConfig`.
+
+*Arc threshold* — the size an arc's log may reach before the bound rule
+draws the line at its live boundary rather than its opening.
+
+*Estimate* — `ceil(chars/4)` per event over its projected text; one heuristic
+for every model, used wherever a token count is needed and no reported usage
+is available.
+
+*Thinning* — shrinking an over-`MaxToolResultChars` tool result in the
+projection; the log keeps the whole result, and the synthesized replacement
+is a note, never an `IsError` tool failure.
+
+*Overflow recovery* — the backstop for a classified provider rejection of an
+over-budget transcript: non-fatal `Error`, request if none stands,
+`ARC_SUSPENDED`, resume after the compaction lands; once per arc.
+
+*Classified rejection* — a provider error or length stop that the vendor's
+`IsContextOverflow` classifier maps to the context budget.
+
+*Stop reason* — why the provider ended a reply; a final `length` stop may
+signal the budget, while an output-limit stop such as `max_tokens` never
+does.
+
+*Two views of one prefix* — an in-flight run keeps the transcript it started
+with while a compaction lands; the next run reads the summary.
+
+*Compactor* — the interface that turns a transcript prefix into a shorter
+transcript: an LLM summary, pruning with a note, or a provider's compaction
+endpoint.
+
+*Async task, task table* — background work whose events correlate to the
+task; the fold's task table is what lets a reference below the watermark
+resolve.
+
+*`Modes`* — the projection settings a summary was made under; recorded in
+the `COMPACTED` payload.
