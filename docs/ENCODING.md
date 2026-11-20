@@ -24,9 +24,9 @@ The encoder's work is four repairs and a shape translation.
 Input
 --------------------
 A `ModelTranscript` is a flat ordered list of `ModelMessage`. Four shapes, from
-`pkg/history/projection.go`.
+`agent/pkg/history/projection.go`.
 
-    ModelTextMessage        text with a role, USER or INSTRUCTION
+    ModelTextMessage        text with a role, USER, INSTRUCTION or TASK
     ModelAssistantMessage   the model's text, plus the calls it requested
     ModelToolMessage        one call's outcome, keyed by tool call ID
     ModelToolCall           one call, carried by the assistant message
@@ -98,6 +98,18 @@ The choice changes what merging has to do. A note carried as user text is a
 user message, so it can collide with a neighbouring user message and needs the
 merge. A note carried as an operator message is its own role and usually does
 not.
+
+Task-opened arcs are the same question one level up. A `TASK` message is the
+opening of an arc a background task opened, and the task is not the user, so
+carrying it as `user` invites the model to read a task's question as the user's
+own words. The content carries a `[background task, not the user …]` header
+that names the provenance either way, so the role is a convenience rather than
+the only signal: by default the encoder carries a `TASK` message as `user`,
+which every provider accepts, and a definition may name an operator role
+instead (`task_role` in the agent settings, e.g. `developer` on OpenAI; an
+unknown role, or a client that cannot carry one, is refused when the agent is
+built). Where the role is an operator role, a task arc and a note share the
+carrier, and the header is what tells them apart.
 
 Do not render the same note through both carriers in one transcript. The model
 reads position and role as provenance, and a note that is sometimes an operator

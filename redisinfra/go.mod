@@ -3,7 +3,8 @@ module fillbrunn.ai/kube-agent/redisinfra
 go 1.27.1
 
 require (
-	fillbrunn.ai/kube-agent v0.0.0
+	fillbrunn.ai/kube-agent/agent v0.0.0
+	fillbrunn.ai/kube-agent/proto v0.0.0
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/redis/go-redis/v9 v9.23.0
 )
@@ -23,4 +24,7 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 )
 
-replace fillbrunn.ai/kube-agent => ../
+replace (
+	fillbrunn.ai/kube-agent/agent => ../agent
+	fillbrunn.ai/kube-agent/proto => ../proto
+)

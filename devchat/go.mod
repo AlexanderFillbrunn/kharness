@@ -6,7 +6,9 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
-	fillbrunn.ai/kube-agent v0.0.0
+	fillbrunn.ai/kube-agent/agent v0.0.0
+	fillbrunn.ai/kube-agent/ingress v0.0.0
+	fillbrunn.ai/kube-agent/proto v0.0.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
 
@@ -35,4 +37,8 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 )
 
-replace fillbrunn.ai/kube-agent => ../
+replace (
+	fillbrunn.ai/kube-agent/agent => ../agent
+	fillbrunn.ai/kube-agent/ingress => ../ingress
+	fillbrunn.ai/kube-agent/proto => ../proto
+)

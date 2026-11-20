@@ -1,20 +1,49 @@
 kube-agent
 ==========
 
-This repository holds three modules, so the framework and its concrete
-implementations cannot grow into each other:
+This repository holds five modules, so the wire protocol, the agent worker,
+the producer-side ingress, and the concrete implementations cannot grow into
+each other:
 
-    fillbrunn.ai/kube-agent             the framework (this module)
-    fillbrunn.ai/kube-agent/devchat     the terminal harness
-    fillbrunn.ai/kube-agent/redisinfra  Redis-backed lease, cancellation hub and work queue
+    fillbrunn.ai/kube-agent/proto       the wire contract, in proto/
+    fillbrunn.ai/kube-agent/agent       the agent worker, in agent/
+    fillbrunn.ai/kube-agent/ingress     the task-report ingress, in ingress/
+    fillbrunn.ai/kube-agent/devchat     the terminal harness, in devchat/
+    fillbrunn.ai/kube-agent/redisinfra  Redis-backed lease, cancellation hub and work queue, in redisinfra/
+
+Each module lives in its own folder under the repository root and is laid out
+the same way: `go.mod` at the root, importable packages under `pkg/`, and
+`cmd/` or `internal/` where they apply. go.work ties the five into one
+workspace, so a change to the protocol is built and tested against every other
+module at once:
+
+    go.work               the workspace tying the five modules together
+    proto/
+      pkg/events/         the event types and their payloads
+      pkg/users/          the actor
+      pkg/common/         the contracts both sides share: refs, work items,
+                          the persistor chain, the cancel guard, task declarations
+    agent/
+      pkg/agent/          the agent loop, the worker, the tool registry, the OpenAI client
+      pkg/history/        the fold, and the projection into a model transcript
+    ingress/
+      pkg/ingress/        what running tasks report, coalescing, and the
+                          persist-then-enqueue path producers use
+    devchat/
+      cmd/devchat/        the harness binary
+      internal/harness/   the harness itself, unreachable from other modules
+      internal/filestore/ the file-backed event log
+    redisinfra/
+      pkg/redisinfra/     the Redis-backed lease, cancellation hub, work queue and log
+
+The dependency direction is enforced by the module graph: agent requires proto
+and nothing else, ingress requires proto (plus agent for tests only), and
+nothing may import the ingress from the agent — outside the workspace that is
+a build error, not a convention.
 
 An event-sourced agent. The log is the source of truth: a conversation is a
 sequence of events, a `History` is the fold of them, and what the model sees is
 derived from that fold rather than kept alongside it.
-
-    pkg/events     the event types and their payloads
-    pkg/history    the fold, and the projection into a model transcript
-    pkg/agent      the agent loop, the tool registry, and the OpenAI client
 
 Two documents specify the transitions between the log and a provider's request,
 and the code follows them rather than the other way round:
@@ -39,12 +68,12 @@ guarded and reaches a run in this process, but nothing further.
 Development harness
 --------------------
 `devchat` is a separate module in this repository, so the agent framework and
-its UI cannot grow into each other. `devchat` and `devchat/filestore` exist to
-exercise the agent by hand. Neither is part of the product.
+its UI cannot grow into each other. `devchat` and `devchat/internal/filestore`
+exist to exercise the agent by hand. Neither is part of the product.
 
     export OPENAI_API_KEY=...
     cd devchat
-    go run .
+    go run ./cmd/devchat
 
 A full-screen terminal interface, built on Bubble Tea. Type a message; the
 agent runs until it is your turn again, with the reply appearing as it is
@@ -79,7 +108,7 @@ something you can read with `cat` and a failure something you can replay:
 `-store` takes any path if you want a session somewhere else; the directory is
 created if it is not there.
 
-`devchat/filestore` lives in the harness's module, out of the framework's
+`devchat/internal/filestore` lives in the harness's module, out of the framework's
 reach, on purpose. It reads the whole log for every query, never compacts, and
 assumes a single writer. It is a way to
 run the agent without standing anything up, not the first draft of a real

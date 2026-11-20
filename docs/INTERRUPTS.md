@@ -9,7 +9,7 @@ A proposal, not a specification. [PROJECTION.md](PROJECTION.md) and
 Interrupts are a special case among the proposals. Half of one is already
 built and specified: the two event types, the fold, the phase, the arc status,
 and the projection notes all exist and are tested. What is missing is the
-other half. Nothing in `pkg/agent` ever raises an interrupt, and nothing in
+other half. Nothing in `agent/pkg/agent` ever raises an interrupt, and nothing in
 `devchat` can answer one.
 
 This document covers that half: how the agent asks, and how a human answers.
@@ -22,10 +22,10 @@ What is already there
 A refusal settles the call `REFUSED` and carries the human's words as the
 call's result. An approval leaves the call pending, so it runs.
 
-    pkg/events/payloads.go      InterruptPayload, InterruptResponsePayload
-    pkg/history/history.go      applyInterrupt, applyInterruptResponse
-    pkg/history/history.go      ToolCallPhaseAwaitingApproval, ArcStatusInterrupted
-    pkg/history/projection.go   projectInterrupt, the ask and approval notes
+    proto/pkg/events/payloads.go      InterruptPayload, InterruptResponsePayload
+    agent/pkg/history/history.go      applyInterrupt, applyInterruptResponse
+    agent/pkg/history/history.go      ToolCallPhaseAwaitingApproval, ArcStatusInterrupted
+    agent/pkg/history/projection.go   projectInterrupt, the ask and approval notes
 
 Two properties of the fold carry most of the design below.
 

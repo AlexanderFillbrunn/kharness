@@ -4,7 +4,7 @@ Event sink
 Status
 --------------------
 Built. `EventSink`, `PublishEvents`, `TokenSink`, `ArcRef` and `RunOptions` are
-in `pkg/agent`, and `devchat` is wired through them.
+in `agent/pkg/agent`, and `devchat` is wired through them.
 
 The agent used to notify an interface directly: `AgentConfig.Observer` took
 every event it folded and `AgentConfig.Tokens` took the model's text as it
@@ -255,17 +255,17 @@ plausible.
 
 What this touched
 --------------------
-    pkg/agent/agent.go          Observer and Tokens off AgentConfig; Run takes
+    agent/pkg/agent/agent.go          Observer and Tokens off AgentConfig; Run takes
                                 RunOptions; message ID minted in llmStep; the
                                 agent stamps the session on what it writes
-    pkg/agent/persistence.go    EventSink, PublishEvents, MintIdentity,
+    agent/pkg/agent/persistence.go    EventSink, PublishEvents, MintIdentity,
                                 EventSource takes ArcRef
-    pkg/agent/arcwork.go        ArcRef, TokenSink, StreamToken; Work takes a
+    agent/pkg/agent/arcwork.go        ArcRef, TokenSink, StreamToken; Work takes a
                                 ref; Acquire takes a context and can fail
-    pkg/agent/cancellation.go   CancelSource takes ArcRef; the cache is gone
-    pkg/agent/tasks.go          TaskRef embeds ArcRef
-    pkg/agent/reports.go        Report routes by ArcRef
-    devchat/filestore          both queries take ArcRef and scope by session
+    agent/pkg/agent/cancellation.go   CancelSource takes ArcRef; the cache is gone
+    agent/pkg/agent/tasks.go          TaskRef embeds ArcRef
+    ingress/pkg/ingress/reports.go        Report routes by ArcRef
+    devchat/internal/filestore          both queries take ArcRef and scope by session
     devchat                 one sink per stream, wired into the persistor
                                 and the worker rather than into the agent
 

@@ -1155,7 +1155,7 @@ can carry it; otherwise it is user text.
 
 What would have to change
 --------------------
-`pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
+`proto/pkg/events` gains `COMPACTED` and `COMPACTION_REQUESTED` with their payloads
 — `COMPACTED` carrying the method that ran — and `ARC_SUSPENDED`, which
 carries no payload of its own; the codec gains their cases. `ErrorPayload`
 needs nothing for overflow recovery: `IsFatal` and `CausationID` already

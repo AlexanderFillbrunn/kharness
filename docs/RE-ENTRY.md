@@ -3,7 +3,7 @@ Re-entry
 
 Status
 --------------------
-Half built. The lease and the worker are in `pkg/agent/arcwork.go`. The queue
+Half built. The lease and the worker are in `agent/pkg/agent/arcwork.go`. The queue
 that drives them is a proposal, and nothing implements it.
 
 An arc is named by an `ArcRef`: a session and an arc ID together. A worker
