@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"bufio"
 	"bytes"
 	"context"
@@ -35,10 +36,6 @@ type OpenAI struct {
 	apiKey string
 	client *http.Client
 
-	// modes is how much of the log each request discloses. It is fixed for the
-	// session, so a projection is a pure function of the log and the arc.
-	modes history.Modes
-
 	// noteRole carries synthesized notes. OpenAI offers `developer` and
 	// `system`; compatible endpoints frequently reject `developer`.
 	noteRole string
@@ -61,12 +58,6 @@ func WithBaseURL(url string) OpenAIOption {
 // timeouts, retries and transport-level instrumentation belong.
 func WithHTTPClient(client *http.Client) OpenAIOption {
 	return func(o *OpenAI) { o.client = client }
-}
-
-// WithProjectionModes sets how much of the log the model is told. See
-// PROJECTION.md.
-func WithProjectionModes(modes history.Modes) OpenAIOption {
-	return func(o *OpenAI) { o.modes = modes }
 }
 
 // WithSystemNoteRole carries notes as `system` rather than `developer`, for
@@ -117,7 +108,6 @@ func NewOpenAI(apiKey, model string, opts ...OpenAIOption) *OpenAI {
 		BaseURL:  openAIDefaultBaseURL,
 		apiKey:   apiKey,
 		client:   http.DefaultClient,
-		modes:    history.DefaultModes(),
 		noteRole: openAIRoleDeveloper,
 		taskRole: openAIRoleUser,
 	}
@@ -167,35 +157,54 @@ func (u *openAIUsage) tokenUsage() *TokenUsage {
 }
 
 // StreamResponse asks the model for one response and streams its text to
-// tokSink as it arrives. The reply itself is returned whole.
-func (o *OpenAI) StreamResponse(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[RawToken]) (*LLMResponse, error) {
-	return o.respond(ctx, h, opts, tokSink)
+// tokSink as it arrives. The reply itself is returned whole. The transcript is
+// already projected; this client only encodes it.
+func (o *OpenAI) StreamResponse(ctx context.Context, t *history.ModelTranscript, opts *LLMOptions, tokSink common.Sink[RawToken]) (*LLMResponse, error) {
+	return o.respond(ctx, t, opts, tokSink)
 }
 
 // Response asks the model for one response without streaming it.
-func (o *OpenAI) Response(ctx context.Context, h *history.History, opts *LLMOptions) (*LLMResponse, error) {
-	return o.respond(ctx, h, opts, nil)
+func (o *OpenAI) Response(ctx context.Context, t *history.ModelTranscript, opts *LLMOptions) (*LLMResponse, error) {
+	return o.respond(ctx, t, opts, nil)
 }
 
-// respond runs one exchange. A nil tokSink means the response is not
-// streamed.
-func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[RawToken]) (*LLMResponse, error) {
+// RespondToTranscript calls the model over an already-projected transcript,
+// which is what the LLM-summary compactor needs. No tools are offered: the
+// reply is a summary, not a turn.
+func (o *OpenAI) RespondToTranscript(ctx context.Context, t history.ModelTranscript, systemPrompt string) (*LLMResponse, error) {
+	enc := encoder{vendorIDs: vendorToolCallIDs(&t), noteRole: o.noteRole, taskRole: o.taskRole}
+	messages, err := enc.encodeTranscript(&t, systemPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("encode transcript: %w", err)
+	}
+	body := &openAIRequest{Model: o.Model, Messages: messages}
+	response, err := o.post(ctx, body)
+	if err != nil {
+		return nil, overflowOr(err)
+	}
+	defer response.Close()
+	completion, err := readCompletion(response)
+	if err != nil {
+		return nil, overflowOr(err)
+	}
+	return lengthStop(o.asResponse(completion), completion.finishReason)
+}
+
+// respond runs one exchange over an already-projected transcript. A nil
+// tokSink means the response is not streamed.
+func (o *OpenAI) respond(ctx context.Context, t *history.ModelTranscript, opts *LLMOptions, tokSink common.Sink[RawToken]) (*LLMResponse, error) {
 	if opts == nil {
 		opts = &LLMOptions{}
 	}
-	arc, err := targetArc(h)
-	if err != nil {
-		return nil, err
-	}
 
-	body, err := o.buildRequest(h, arc.ID, opts, tokSink != nil)
+	body, err := o.buildRequest(t, opts, tokSink != nil)
 	if err != nil {
 		return nil, err
 	}
 
 	response, err := o.post(ctx, body)
 	if err != nil {
-		return nil, err
+		return nil, overflowOr(err)
 	}
 	defer response.Close()
 
@@ -206,31 +215,17 @@ func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptio
 		completion, err = readCompletion(response)
 	}
 	if err != nil {
-		return nil, err
+		return nil, overflowOr(err)
 	}
 
-	return o.asResponse(completion), nil
+	return lengthStop(o.asResponse(completion), completion.finishReason)
 }
 
-// targetArc returns the arc the response belongs to, which is the last arc in
-// the history.
-func targetArc(h *history.History) (*history.Arc, error) {
-	if h == nil || len(h.Arcs) == 0 {
-		return nil, errors.New("cannot respond to a history with no arcs")
-	}
-	return h.Arcs[len(h.Arcs)-1], nil
-}
-
-func (o *OpenAI) buildRequest(h *history.History, arcID string, opts *LLMOptions, stream bool) (*openAIRequest, error) {
-	transcript, err := h.Project(arcID, o.modes)
+func (o *OpenAI) buildRequest(t *history.ModelTranscript, opts *LLMOptions, stream bool) (*openAIRequest, error) {
+	enc := encoder{vendorIDs: vendorToolCallIDs(t), noteRole: o.noteRole, taskRole: o.taskRole}
+	messages, err := enc.encodeTranscript(t, opts.SystemPrompt)
 	if err != nil {
-		return nil, fmt.Errorf("project arc %s: %w", arcID, err)
-	}
-
-	enc := encoder{vendorIDs: vendorToolCallIDs(h), noteRole: o.noteRole, taskRole: o.taskRole}
-	messages, err := enc.encodeTranscript(transcript, opts.SystemPrompt)
-	if err != nil {
-		return nil, fmt.Errorf("encode transcript of arc %s: %w", arcID, err)
+		return nil, fmt.Errorf("encode transcript: %w", err)
 	}
 
 	request := &openAIRequest{
@@ -275,8 +270,9 @@ func (o *OpenAI) post(ctx context.Context, body *openAIRequest) (io.ReadCloser, 
 	return resp.Body, nil
 }
 
-// openAIError turns an error response into an error carrying whatever the API
-// said about it.
+// openAIError turns an error response into a typed error carrying whatever
+// the API said about it: the status, and the type, code and message of the
+// error object where the body holds one.
 func openAIError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 
@@ -288,9 +284,69 @@ func openAIError(resp *http.Response) error {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Message != "" {
-		return fmt.Errorf("openai: %s (%s %s): %s", resp.Status, payload.Error.Type, payload.Error.Code, payload.Error.Message)
+		return &LLMError{
+			Status:  resp.StatusCode,
+			Type:    payload.Error.Type,
+			Code:    payload.Error.Code,
+			Message: payload.Error.Message,
+		}
 	}
-	return fmt.Errorf("openai: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	return &LLMError{Status: resp.StatusCode, Message: strings.TrimSpace(string(body))}
+}
+
+// contextOverflowMessages are the message patterns a provider uses where it
+// sends no code: the complaint is in the text alone.
+var contextOverflowMessages = []string{
+	"context_length_exceeded",
+	"context length",
+	"prompt is too long",
+	"too many tokens",
+	"maximum context",
+	"exceeds the model's maximum",
+	"input is too long",
+}
+
+// asOverflow classifies a typed provider error as a context-budget rejection
+// and returns it as a *ContextOverflowError. For OpenAI-shaped APIs that is an
+// error carrying the `context_length_exceeded` code, a 413 where a gateway
+// uses one, a message pattern where no code exists, or an error object inside
+// an otherwise-200 stream — never the status alone.
+func asOverflow(err error) *ContextOverflowError {
+	var lerr *LLMError
+	if !errors.As(err, &lerr) {
+		return nil
+	}
+	if lerr.Code == "context_length_exceeded" || lerr.Status == http.StatusRequestEntityTooLarge {
+		return &ContextOverflowError{LLMError: *lerr}
+	}
+	message := strings.ToLower(lerr.Message)
+	for _, pattern := range contextOverflowMessages {
+		if strings.Contains(message, pattern) {
+			return &ContextOverflowError{LLMError: *lerr}
+		}
+	}
+	return nil
+}
+
+// overflowOr returns err as a *ContextOverflowError where it classifies as
+// one, and unchanged otherwise, so a rejection over budget always crosses the
+// boundary typed and every other error keeps its own type.
+func overflowOr(err error) error {
+	if overflow := asOverflow(err); overflow != nil {
+		return overflow
+	}
+	return err
+}
+
+// lengthStop classifies a finished completion: a final `length` stop may
+// signal the context budget, an output-limit stop such as `max_tokens` never
+// does. The partial reply travels with the error, so the caller records what
+// the model did say.
+func lengthStop(reply *LLMResponse, finishReason string) (*LLMResponse, error) {
+	if finishReason == "length" {
+		return reply, &ContextOverflowError{StopReason: finishReason}
+	}
+	return reply, nil
 }
 
 // openAICompletion is one response, however it arrived: the streamed and
@@ -355,6 +411,8 @@ type openAIChunk struct {
 	Usage *openAIUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
 	} `json:"error"`
 }
 
@@ -372,7 +430,7 @@ type openAIToolCallDelta struct {
 
 // readStream consumes the SSE stream, handing each text fragment to tokSink as
 // it arrives and assembling the completion behind it.
-func readStream(body io.Reader, tokSink Sink[RawToken]) (*openAICompletion, error) {
+func readStream(body io.Reader, tokSink common.Sink[RawToken]) (*openAICompletion, error) {
 	completion := &openAICompletion{}
 	// Calls are keyed by their index rather than appended, because fragments
 	// of two parallel calls interleave.
@@ -380,7 +438,7 @@ func readStream(body io.Reader, tokSink Sink[RawToken]) (*openAICompletion, erro
 	var order []int
 
 	tokCounter := 0
-	sink := SinkFromFunc(func (s string) error {
+	sink := common.SinkFromFunc(func (s string) error {
 		tokSink.Consume(RawToken{
 			Content: s,
 			Seq: tokCounter,
@@ -401,7 +459,9 @@ func readStream(body io.Reader, tokSink Sink[RawToken]) (*openAICompletion, erro
 				return nil, fmt.Errorf("decode stream chunk: %w", err)
 			}
 			if chunk.Error != nil {
-				return nil, fmt.Errorf("openai: %s", chunk.Error.Message)
+				// An error object inside an otherwise-200 stream: the status
+				// says nothing, so the typed fields carry the complaint.
+				return nil, &LLMError{Status: http.StatusOK, Type: chunk.Error.Type, Code: chunk.Error.Code, Message: chunk.Error.Message}
 			}
 			if err := applyChunk(completion, calls, &order, chunk, sink); err != nil {
 				return nil, err
@@ -434,7 +494,7 @@ func sseData(line string) (string, bool) {
 }
 
 // applyChunk folds one chunk into the completion being assembled.
-func applyChunk(completion *openAICompletion, calls map[int]*openAIToolCall, order *[]int, chunk openAIChunk, tokSink Sink[string]) error {
+func applyChunk(completion *openAICompletion, calls map[int]*openAIToolCall, order *[]int, chunk openAIChunk, tokSink common.Sink[string]) error {
 	if chunk.ID != "" {
 		completion.vendorID = chunk.ID
 	}
@@ -486,9 +546,10 @@ func applyChunk(completion *openAICompletion, calls map[int]*openAIToolCall, ord
 // log names the model that ran rather than an alias.
 func (o *OpenAI) asResponse(completion *openAICompletion) *LLMResponse {
 	response := &LLMResponse{
-		ModelID: completion.model,
-		Content: completion.content,
-		Usage:   completion.usage.tokenUsage(),
+		ModelID:    completion.model,
+		Content:    completion.content,
+		Usage:      completion.usage.tokenUsage(),
+		StopReason: completion.finishReason,
 	}
 	if response.ModelID == "" {
 		response.ModelID = o.Model

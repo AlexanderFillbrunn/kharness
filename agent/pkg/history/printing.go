@@ -26,8 +26,44 @@ func PrintHistory(w io.Writer, history *History) error {
 			return err
 		}
 	}
+	if err := printCompaction(w, history); err != nil {
+		return err
+	}
 	if err := printAsyncTasks(w, history.TasksInOrder()); err != nil {
 		return err
+	}
+	return nil
+}
+
+// printCompaction prints the session's compaction records: the compaction in
+// force, every request, and each arc's suspensions.
+func printCompaction(w io.Writer, history *History) error {
+	if history.LastCompaction == nil && len(history.CompactionRequests) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "\nCompaction"); err != nil {
+		return err
+	}
+	if c := history.LastCompaction; c != nil {
+		if _, err := fmt.Fprintf(w, "\n  compacted\n    id: %s\n    seq: %d\n    through_seq: %d\n    method: %s\n    model_id: %s\n    summary:\n%s\n",
+			c.ID, c.Seq, c.ThroughSeq, c.Method, c.ModelID, indent(c.Summary, "      ")); err != nil {
+			return err
+		}
+	}
+	for _, req := range history.CompactionRequests {
+		satisfied := history.CompactionRequestSatisfied(req)
+		if _, err := fmt.Fprintf(w, "\n  compaction requested\n    id: %s\n    seq: %d\n    watermark: %d\n    satisfied: %v\n",
+			req.ID, req.Seq, req.Watermark, satisfied); err != nil {
+			return err
+		}
+	}
+	for _, arc := range history.Arcs {
+		for _, s := range arc.Suspensions {
+			if _, err := fmt.Fprintf(w, "\n  arc %s suspended\n    id: %s\n    seq: %d\n    request: %s\n    state: %s\n",
+				arc.ID, s.ID, s.Seq, s.RequestID, history.SuspensionStateOf(arc, s)); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

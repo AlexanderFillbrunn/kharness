@@ -163,13 +163,13 @@ func textMessage(role, content string) openAIMessage {
 	return openAIMessage{Role: role, Content: &content}
 }
 
-// vendorToolCallIDs indexes the provider identifiers a history holds, so the
-// encoder can look one up by the log ID the transcript carries.
-func vendorToolCallIDs(h *history.History) map[string]string {
+// vendorToolCallIDs indexes the provider identifiers a transcript carries, so
+// the encoder can look one up by the log ID a tool result answers.
+func vendorToolCallIDs(t *history.ModelTranscript) map[string]string {
 	ids := map[string]string{}
-	for _, arc := range h.Arcs {
-		for _, response := range arc.Responses {
-			for _, call := range response.ToolCalls {
+	for _, message := range t.Messages {
+		if assistant, ok := message.(history.ModelAssistantMessage); ok {
+			for _, call := range assistant.ToolCalls {
 				if call.VendorID != "" {
 					ids[call.ID] = call.VendorID
 				}

@@ -1,8 +1,10 @@
 package harness
 
 import (
+	"strings"
 	"testing"
 
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
@@ -86,5 +88,67 @@ func TestAFailedResultShowsAsFailed(t *testing.T) {
 
 	if shown.blocks[0].state != toolFailed {
 		t.Errorf("call is %s, want failed", shown.blocks[0].state)
+	}
+}
+
+// The three compaction records reach the screen: the request and the
+// suspension as notes, the result as the summary block.
+func TestCompactionEventsReachTheTranscript(t *testing.T) {
+	shown := newTranscript()
+	shown.event(arcEvent("req-1", events.CompactionRequestedEventType,
+		events.CompactionRequestedPayload{Watermark: 40}))
+	shown.event(arcEvent("sus-1", events.ArcSuspendedEventType,
+		events.ArcSuspendedPayload{CausationID: "req-1"}))
+	shown.event(&events.Event{ID: "c1", Typ: events.CompactedEventType,
+		Payload: events.CompactedPayload{ThroughSeq: 40, Method: "prune", Summary: "earlier conversation pruned"}})
+
+	if len(shown.blocks) != 3 {
+		t.Fatalf("transcript holds %d blocks, want request, suspension and summary", len(shown.blocks))
+	}
+	if shown.blocks[0].kind != blockNote || shown.blocks[1].kind != blockNote {
+		t.Errorf("request/suspension blocks are %v/%v, want notes", shown.blocks[0].kind, shown.blocks[1].kind)
+	}
+	summary := shown.blocks[2]
+	if summary.kind != blockSummary ||
+		!strings.Contains(summary.text, "seq 40") ||
+		!strings.Contains(summary.text, "earlier conversation pruned") {
+		t.Errorf("summary block = %+v", summary)
+	}
+}
+
+// A recorded session with a compaction in force opens with the summary block
+// ahead of its arcs.
+func TestFromHistoryOpensWithTheSummaryBlock(t *testing.T) {
+	arc1, arc2 := "arc-1", "arc-2"
+	log := []events.Event{
+		{SessionID: "session", ID: "u1", Seq: 1, Typ: events.UserMessageEventType,
+			CorrelationID: &arc1, Payload: events.UserMessagePayload{Content: "first question"}},
+		{SessionID: "session", ID: "c1", Seq: 2, Typ: events.CompactedEventType,
+			Payload: events.CompactedPayload{ThroughSeq: 1, Method: "prune", Summary: "earlier conversation pruned"}},
+		{SessionID: "session", ID: "u2", Seq: 3, Typ: events.UserMessageEventType,
+			CorrelationID: &arc2, Payload: events.UserMessagePayload{Content: "second question"}},
+	}
+	h, err := history.Replay("session", log)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+
+	shown := newTranscript()
+	shown.fromHistory(h)
+
+	if len(shown.blocks) < 2 {
+		t.Fatalf("transcript holds %d blocks, want the summary plus the arcs", len(shown.blocks))
+	}
+	head := shown.blocks[0]
+	if head.kind != blockSummary || !strings.Contains(head.text, "earlier conversation pruned") {
+		t.Errorf("head block = %+v, want the summary block", head)
+	}
+	// The log is never rewritten, so the screen still shows every arc below
+	// the watermark; the summary sits ahead of them, not instead of them.
+	if shown.blocks[1].kind != blockUser || shown.blocks[1].text != "first question" {
+		t.Errorf("block after the summary = %+v, want the first arc's opening", shown.blocks[1])
+	}
+	if shown.blocks[2].kind != blockUser || shown.blocks[2].text != "second question" {
+		t.Errorf("third block = %+v, want the second arc's opening", shown.blocks[2])
 	}
 }

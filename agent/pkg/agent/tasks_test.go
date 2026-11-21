@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"slices"
@@ -18,14 +19,14 @@ import (
 // was told to. It holds no idea of what is running, which is the point: a
 // controller is asked to do things and never asked how a task is doing.
 type fakeController struct {
-	cancelled []TaskRef
+	cancelled []common.TaskRef
 	inputs    []string
 	requests  []string
-	refs      []TaskRef
+	refs      []common.TaskRef
 	failure   error
 }
 
-func (c *fakeController) Cancel(_ context.Context, ref TaskRef, _ string) error {
+func (c *fakeController) Cancel(_ context.Context, ref common.TaskRef, _ string) error {
 	if c.failure != nil {
 		return c.failure
 	}
@@ -33,7 +34,7 @@ func (c *fakeController) Cancel(_ context.Context, ref TaskRef, _ string) error 
 	return nil
 }
 
-func (c *fakeController) ProvideInput(_ context.Context, ref TaskRef, requestID, input string) error {
+func (c *fakeController) ProvideInput(_ context.Context, ref common.TaskRef, requestID, input string) error {
 	if c.failure != nil {
 		return c.failure
 	}
@@ -44,10 +45,10 @@ func (c *fakeController) ProvideInput(_ context.Context, ref TaskRef, requestID,
 }
 
 // taskRegistryWith returns a registry holding one kind of task.
-func taskRegistryWith(t *testing.T, name string, start Starter) *TaskRegistry {
+func taskRegistryWith(t *testing.T, name string, start common.Starter) *TaskRegistry {
 	t.Helper()
 	registry := NewTaskRegistry()
-	if err := registry.RegisterTask(TaskMetadata{Name: name}, start); err != nil {
+	if err := registry.RegisterTask(common.TaskMetadata{Name: name}, start); err != nil {
 		t.Fatalf("register task: %v", err)
 	}
 	return registry
@@ -67,12 +68,12 @@ func toolNames(tools []*mcp.Tool) []string {
 func TestARegistryOffersOneToolPerTaskPlusTwo(t *testing.T) {
 	registry := NewTaskRegistry()
 	for _, name := range []string{"auditor", "migrator"} {
-		if err := registry.RegisterTask(TaskMetadata{Name: name}, func(context.Context, TaskRef, any) error { return nil }); err != nil {
+		if err := registry.RegisterTask(common.TaskMetadata{Name: name}, func(context.Context, common.TaskRef, any) error { return nil }); err != nil {
 			t.Fatalf("register task: %v", err)
 		}
 	}
 
-	want := []string{"auditor", "migrator", CancelTaskTool, ProvideTaskInputTool}
+	want := []string{"auditor", "migrator", events.CancelTaskToolName, events.ProvideTaskInputToolName}
 	if got := toolNames(taskToolSet{registry}.All()); !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)
 	}
@@ -91,14 +92,14 @@ func TestAnEmptyRegistryOffersNothing(t *testing.T) {
 
 func TestATaskCannotTakeTheNameOfTheToolsThatAddressTasks(t *testing.T) {
 	registry := NewTaskRegistry()
-	err := registry.RegisterTask(TaskMetadata{Name: CancelTaskTool}, func(context.Context, TaskRef, any) error { return nil })
+	err := registry.RegisterTask(common.TaskMetadata{Name: events.CancelTaskToolName}, func(context.Context, common.TaskRef, any) error { return nil })
 	if err == nil {
 		t.Fatal("a task was registered under the name of the tool that cancels tasks")
 	}
 }
 
 func TestATaskNeedsAWayToStart(t *testing.T) {
-	if err := NewTaskRegistry().RegisterTask(TaskMetadata{Name: "auditor"}, nil); err == nil {
+	if err := NewTaskRegistry().RegisterTask(common.TaskMetadata{Name: "auditor"}, nil); err == nil {
 		t.Fatal("a task with no starter was registered")
 	}
 }
@@ -107,7 +108,7 @@ func TestATaskNeedsAWayToStart(t *testing.T) {
 // name meaning two things is a call that reaches whichever is checked first.
 func TestANameCannotBeBothAToolAndATask(t *testing.T) {
 	tools := registryWith(t, "auditor", nil)
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 
 	_, err := NewAgent(nil, tools, &scriptedLLM{}, WithTasks(tasks, &fakeController{}))
 	if err == nil {
@@ -117,7 +118,7 @@ func TestANameCannotBeBothAToolAndATask(t *testing.T) {
 
 // A registry with nobody to reach the tasks it starts is half an agent.
 func TestTasksNeedAController(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	if _, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks, nil)); err == nil {
 		t.Fatal("an agent was built with tasks it could never stop or answer")
 	}
@@ -127,14 +128,14 @@ func TestTasksNeedAController(t *testing.T) {
 // can start.
 func TestTheModelIsOfferedToolsAndTasksTogether(t *testing.T) {
 	tools := registryWith(t, "list_pods", nil)
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 
 	agent, err := NewAgent(nil, tools, &scriptedLLM{}, WithTasks(tasks, &fakeController{}))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	want := []string{"list_pods", "auditor", CancelTaskTool, ProvideTaskInputTool}
+	want := []string{"list_pods", "auditor", events.CancelTaskToolName, events.ProvideTaskInputToolName}
 	if got := toolNames(CombineTools(agent.tools, taskToolSet{agent.tasks}).All()); !slices.Equal(got, want) {
 		t.Errorf("tools = %v, want %v", got, want)
 	}
@@ -152,18 +153,18 @@ func TestAnAgentWithoutTasksIsUnchanged(t *testing.T) {
 	if got := toolNames(CombineTools(agent.tools, taskToolSet{agent.tasks}).All()); !slices.Equal(got, []string{"list_pods"}) {
 		t.Errorf("tools = %v, want the one registered tool", got)
 	}
-	if classify(agent.tasks, CancelTaskTool) != opTool {
+	if classify(agent.tasks, events.CancelTaskToolName) != opTool {
 		t.Error("a name that addresses tasks routed somewhere with no tasks to address")
 	}
 }
 
 func TestClassifyNamesTheOperation(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 
 	for name, want := range map[string]taskOperation{
 		"auditor":            opStart,
-		CancelTaskTool:       opCancel,
-		ProvideTaskInputTool: opProvideInput,
+		events.CancelTaskToolName:       opCancel,
+		events.ProvideTaskInputToolName: opProvideInput,
 		"list_pods":          opTool,
 	} {
 		if got := classify(tasks, name); got != want {
@@ -212,7 +213,7 @@ func taskConversation(t *testing.T, waiting bool) *history.History {
 
 // runCallInArc drives one turn of the named arc in which the model makes the
 // given call, then says it is done.
-func runCallInArc(t *testing.T, h *history.History, arcID string, tasks *TaskRegistry, controller TaskController, call LLMToolCall) *fakePersistor {
+func runCallInArc(t *testing.T, h *history.History, arcID string, tasks *TaskRegistry, controller common.TaskController, call LLMToolCall) *fakePersistor {
 	t.Helper()
 	persistor := &fakePersistor{next: 10}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
@@ -257,8 +258,8 @@ func resultText(t *testing.T, call *history.ToolCall) string {
 // The invocation is written before the task is started, because the record is
 // what names the task and that name is what the task reports back under.
 func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
-	var started TaskRef
-	tasks := taskRegistryWith(t, "auditor", func(_ context.Context, ref TaskRef, _ any) error {
+	var started common.TaskRef
+	tasks := taskRegistryWith(t, "auditor", func(_ context.Context, ref common.TaskRef, _ any) error {
 		started = ref
 		return nil
 	})
@@ -301,12 +302,12 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 // directly through the input tool, or by putting the question to the user
 // first and then passing the answer on.
 func TestTheStartResultOffersBothWaysToAnswerAnAsk(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	h := userArcHistory(t)
 	runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
 	text := resultText(t, lastCallIn(t, h, testArcID))
-	for _, want := range []string{"put the question to the user first", ProvideTaskInputTool, CancelTaskTool} {
+	for _, want := range []string{"put the question to the user first", events.ProvideTaskInputToolName, events.CancelTaskToolName} {
 		if !strings.Contains(text, want) {
 			t.Errorf("start result = %q, want it to mention %q", text, want)
 		}
@@ -317,7 +318,7 @@ func TestTheStartResultOffersBothWaysToAnswerAnAsk(t *testing.T) {
 // response that requested no tool calls, while the task runs on as an object
 // of the session.
 func TestAStartedTaskDoesNotHoldTheArcOpen(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	h := userArcHistory(t)
 	persistor := runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
@@ -336,7 +337,7 @@ func TestAStartedTaskDoesNotHoldTheArcOpen(t *testing.T) {
 // A launch that fails may still have taken hold, so the task is settled and the
 // text says the effect is unknown rather than claiming nothing happened.
 func TestATaskThatCouldNotBeStartedIsSettledAsUnknown(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return errUnreachable })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return errUnreachable })
 	h := userArcHistory(t)
 	persistor := runCallInArc(t, h, testArcID, tasks, &fakeController{}, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
@@ -357,12 +358,12 @@ func TestATaskThatCouldNotBeStartedIsSettledAsUnknown(t *testing.T) {
 // then reaches the runner through the controller. What became of work already
 // under way is the runner's to report.
 func TestCancellingATaskWritesACancelAgainstTheTask(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, false)
 
 	persistor := runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: CancelTaskTool,
+		VendorID: "call_2", ToolName: events.CancelTaskToolName,
 		Args: map[string]any{"task_id": "task-1", "reason": "no longer needed"}})
 
 	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, CANCEL, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
@@ -405,12 +406,12 @@ func TestCancellingATaskWritesACancelAgainstTheTask(t *testing.T) {
 // that arc is the one waiting on the answer, and the cutoff includes the record
 // there at any point.
 func TestInputIsGivenToTheTaskBeforeItIsRecorded(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, true)
 
 	persistor := runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: ProvideTaskInputTool,
+		VendorID: "call_2", ToolName: events.ProvideTaskInputToolName,
 		Args: map[string]any{"task_id": "task-1", "input": "kube-system"}})
 
 	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, ASYNC_TASK_INPUT_PROVIDED, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
@@ -442,12 +443,12 @@ func TestInputIsGivenToTheTaskBeforeItIsRecorded(t *testing.T) {
 // input arrived: the task would be waiting on an answer everyone believes it
 // has.
 func TestInputThatNeverReachedTheTaskIsNotRecorded(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{failure: errUnreachable}
 	h := taskConversation(t, true)
 
 	persistor := runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: ProvideTaskInputTool,
+		VendorID: "call_2", ToolName: events.ProvideTaskInputToolName,
 		Args: map[string]any{"task_id": "task-1", "input": "kube-system"}})
 
 	if got := typesOf(persistor.persisted); strings.Contains(got, "ASYNC_TASK_INPUT_PROVIDED") {
@@ -464,12 +465,12 @@ func TestInputThatNeverReachedTheTaskIsNotRecorded(t *testing.T) {
 // A call naming a task this conversation cannot see is answered rather than
 // failing the run. The model made a mistake it can correct.
 func TestAnsweringAnUnknownTaskIsAnErrorTheModelCanRead(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, true)
 
 	runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: ProvideTaskInputTool,
+		VendorID: "call_2", ToolName: events.ProvideTaskInputToolName,
 		Args: map[string]any{"task_id": "made-up", "input": "kube-system"}})
 
 	call := lastCallIn(t, h, "arc-2")
@@ -487,12 +488,12 @@ func TestAnsweringAnUnknownTaskIsAnErrorTheModelCanRead(t *testing.T) {
 // A question the run has not been given is one it cannot answer, whether the
 // task has yet to ask it or asked it after this run read the log.
 func TestAnsweringATaskThatIsNotWaitingIsRefused(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, false)
 
 	runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: ProvideTaskInputTool,
+		VendorID: "call_2", ToolName: events.ProvideTaskInputToolName,
 		Args: map[string]any{"task_id": "task-1", "input": "kube-system"}})
 
 	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "asked nothing you have been given") {
@@ -506,13 +507,13 @@ func TestAnsweringATaskThatIsNotWaitingIsRefused(t *testing.T) {
 // Stopping something that already stopped is not a stop, and saying so as an
 // error is what stops the model reporting that it cancelled the work.
 func TestCancellingAFinishedTaskSaysSo(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
+	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
 	controller := &fakeController{}
 	h := taskConversation(t, false)
 	settleTask(t, h, "task-1")
 
 	runCallInArc(t, h, "arc-2", tasks, controller, LLMToolCall{
-		VendorID: "call_2", ToolName: CancelTaskTool, Args: map[string]any{"task_id": "task-1"}})
+		VendorID: "call_2", ToolName: events.CancelTaskToolName, Args: map[string]any{"task_id": "task-1"}})
 
 	call := lastCallIn(t, h, "arc-2")
 	if call.Status != history.ToolCallStatusFailed {

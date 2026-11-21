@@ -144,7 +144,13 @@ func (ModelNoteMessage) modelMessage() {}
 
 // ModelToolCall is one call requested by a ModelAssistantMessage.
 type ModelToolCall struct {
-	ID   string
+	ID string
+
+	// VendorID is the provider's own identifier for the call, carried
+	// alongside the log's so an encoder can answer the call in a tool result
+	// without reading the log.
+	VendorID string
+
 	Name string
 	Args any
 }
@@ -260,10 +266,31 @@ func (m Modes) Validate() error {
 	return nil
 }
 
+// ProjectionOptions are the limits a projection applies on top of the modes.
+// They are configuration, not modes: compaction has no mode, so Modes itself
+// gains nothing for them.
+type ProjectionOptions struct {
+	// MaxToolResultChars caps what one tool result may contribute to the
+	// transcript, in characters. A result over the cap is truncated with a
+	// marker naming the call and the omitted size; the log keeps the whole
+	// result, and the thinning is never an IsError outcome. 0 leaves results
+	// whole.
+	MaxToolResultChars int
+
+	// ArcThresholdTokens is the size an arc's log may reach before an arc the
+	// cut passes through renders as a skeleton rather than whole. 0 disables
+	// the skeleton: a spanning arc renders whole.
+	ArcThresholdTokens int
+}
+
 // Project builds the transcript for one arc. The history must be the one the
 // read model produced for this arc: every event up to the arc's own user
 // message, plus every later event correlated to it. That query is the cutoff.
-func (h *History) Project(arcID string, modes Modes) (*ModelTranscript, error) {
+//
+// Where the session has compacted, the transcript is the summary of the
+// compaction in force — the COMPACTED with the greatest ThroughSeq in this
+// history — plus the projection of the events above its watermark.
+func (h *History) Project(arcID string, modes Modes, opts ...ProjectionOptions) (*ModelTranscript, error) {
 	if h == nil {
 		return nil, errors.New("history must not be nil")
 	}
@@ -282,7 +309,31 @@ func (h *History) Project(arcID string, modes Modes) (*ModelTranscript, error) {
 		return nil, fmt.Errorf("no arc with ID=%s in history", arcID)
 	}
 
-	projector := newProjector(h, h.Arcs[target], modes)
+	options := ProjectionOptions{}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	projector := newProjector(h, h.Arcs[target], modes, options)
+	projector.run()
+	return &ModelTranscript{Messages: projector.messages()}, nil
+}
+
+// ProjectThrough projects the whole session capped at a sequence number: every
+// arc kept, every record above through dropped, and the summary of the
+// compaction already in force at the head where its watermark falls below
+// through. It is the region a compaction summarises — the previous summary
+// plus what has landed since — so the compactor's input and output are the
+// same type.
+func (h *History) ProjectThrough(through int, modes Modes, opts ProjectionOptions) (*ModelTranscript, error) {
+	if h == nil {
+		return nil, errors.New("history must not be nil")
+	}
+	if err := modes.Validate(); err != nil {
+		return nil, err
+	}
+	projector := newProjector(h, nil, modes, opts)
+	projector.ceiling = through
+	projector.allTargets = true
 	projector.run()
 	return &ModelTranscript{Messages: projector.messages()}, nil
 }
@@ -301,21 +352,88 @@ type projector struct {
 	history *History
 	target  *Arc
 	modes   Modes
+	opts    ProjectionOptions
+
+	// floor is the watermark of the compaction in force, or -1 where the
+	// session has never compacted: everything at or below it is replaced by
+	// the summary. ceiling caps the projection at a sequence number, or -1
+	// for none; it is set only when projecting the region a compaction
+	// summarises.
+	floor   int
+	ceiling int
+
+	// allTargets marks a session-wide projection, where every arc is projected
+	// as the target would be. It is what the compactor reads.
+	allTargets bool
 
 	units []unit
 }
 
-func newProjector(history *History, target *Arc, modes Modes) *projector {
-	return &projector{history: history, target: target, modes: modes}
+func newProjector(history *History, target *Arc, modes Modes, opts ProjectionOptions) *projector {
+	return &projector{history: history, target: target, modes: modes, opts: opts, floor: history.Watermark(), ceiling: -1}
 }
 
 // run walks the arcs the history holds, once, and emits what survives. A
 // foreign arc's records all precede the target's user message, and the target
 // owns everything correlated to it.
 func (p *projector) run() {
+	// The summary goes at the head of the transcript, before the first
+	// surviving arc; nothing precedes it but the system prompt. It is
+	// synthesized, so it is a note — the one note that is not short.
+	if p.floor >= 0 && p.history.LastCompaction != nil && (p.ceiling < 0 || p.floor < p.ceiling) {
+		p.emit(-1, 0, ModelNoteMessage{Content: p.history.LastCompaction.Summary})
+	}
+	if p.ceiling >= 0 && p.floor >= p.ceiling {
+		// The whole region is already inside the summary in force.
+		return
+	}
+
 	for _, arc := range p.history.Arcs {
 		p.projectArc(arc)
 	}
+
+	// A task whose invocation fell below the cut cannot be introduced by the
+	// event that started it — that event is summarised — so the note is
+	// synthesized from the task table, with the ID verbatim, since a
+	// shortened ID resolves the wrong task.
+	if p.ceiling < 0 {
+		for _, task := range p.history.TasksInOrder() {
+			if task.Seq <= p.floor {
+				p.emit(p.floor, -1, ModelNoteMessage{Content: taskInvokeNote(task)})
+			}
+		}
+	}
+}
+
+// taskInvokeNote is the invocation note synthesized from the task table for a
+// task whose invoke event was summarised away: the name, the ID verbatim, and
+// the status, including a waiting task's outstanding question.
+func taskInvokeNote(task *AsyncTask) string {
+	note := fmt.Sprintf("[task %s started: %s", taskLabel(task), formatValue(task.Args))
+	switch task.Status {
+	case AsyncTaskWaiting:
+		if request := lastInputRequestOf(task); request != nil {
+			note += fmt.Sprintf("; it is waiting for an answer to: %s", resultText(request.Payload))
+		} else {
+			note += "; it is waiting for input"
+		}
+	case AsyncTaskPending:
+		note += "; it is running"
+	default:
+		note += fmt.Sprintf("; it finished: %s", task.Status)
+	}
+	return note + "]"
+}
+
+// lastInputRequestOf is the question a waiting task last asked, or nil.
+func lastInputRequestOf(task *AsyncTask) *AsyncTaskEvent {
+	var last *AsyncTaskEvent
+	for i := range task.Events {
+		if task.Events[i].Type == AsyncTaskEventInputRequested {
+			last = &task.Events[i]
+		}
+	}
+	return last
 }
 
 // messages returns the emitted messages in log order. Units that share a
@@ -371,15 +489,37 @@ const (
 	arcNoteStopped
 )
 
-// projectArc emits one arc under the mode that governs it.
+// projectArc emits one arc under the mode that governs it, against the cut:
+// an arc wholly below the watermark is covered by the summary and skipped, an
+// arc the line passes through renders as the skeleton where it does not fit
+// the arc threshold, and everything else projects whole.
 func (p *projector) projectArc(arc *Arc) {
-	plan := planArc(arc, p.modes, arc.ID == p.target.ID)
+	if p.ceiling >= 0 && arc.Seq > p.ceiling {
+		return
+	}
+	if end := arcEndSeq(arc); end <= p.floor {
+		return
+	}
+
+	isTarget := p.allTargets || (p.target != nil && arc.ID == p.target.ID)
+	plan := planArc(arc, p.modes, isTarget)
 
 	switch plan.material {
 	case TreatmentElide:
 		return
 	case TreatmentNote:
 		p.emitArcNote(arc, plan)
+		return
+	}
+
+	// The line passes through this arc. Where the arc's own log does not fit
+	// the arc threshold, the spent prefix renders as a skeleton and the live
+	// part stays whole below the line; where it fits, the arc renders whole
+	// against the line. Skeletons are a turn's rendering, so a capped
+	// projection — the compactor's input — never draws one.
+	if p.ceiling < 0 && arc.Seq <= p.floor && arcEndSeq(arc) > p.floor &&
+		p.opts.ArcThresholdTokens > 0 && p.history.EstimateArc(arc) > p.opts.ArcThresholdTokens {
+		p.keepSpanningArc(arc)
 		return
 	}
 
@@ -391,6 +531,74 @@ func (p *projector) projectArc(arc *Arc) {
 	if plan.status != arcNoteNone {
 		p.emitArcNote(arc, plan)
 	}
+}
+
+// arcEndSeq is the sequence number of the arc's last record, which is where
+// the arc ends as a whole: the opening where nothing followed it.
+func arcEndSeq(arc *Arc) int {
+	end := arc.Seq
+	for _, response := range arc.Responses {
+		if response.Seq > end {
+			end = response.Seq
+		}
+	}
+	for _, failure := range arc.Errors {
+		if failure.Seq > end {
+			end = failure.Seq
+		}
+	}
+	if arc.Cancel != nil && arc.Cancel.Seq > end {
+		end = arc.Cancel.Seq
+	}
+	if arc.Closed != nil && arc.Closed.Seq > end {
+		end = arc.Closed.Seq
+	}
+	for _, suspension := range arc.Suspensions {
+		if suspension.Seq > end {
+			end = suspension.Seq
+		}
+	}
+	return end
+}
+
+// keepSpanningArc renders an arc the cut passes through: the opening request
+// verbatim, the tool calls of the spent prefix above the line without their
+// results, a note standing at the cut, and the live part below the line whole.
+func (p *projector) keepSpanningArc(arc *Arc) {
+	role := ModelRoleUser
+	if arc.OpenedByTask != "" {
+		role = ModelRoleTask
+	}
+	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: role, Content: p.history.OpeningContent(arc)})
+
+	for _, message := range arc.Responses {
+		if message.Seq <= p.floor {
+			// The spent prefix: the reply's text and its results are dropped —
+			// the summary covers that region once, in prose — and the calls
+			// stay, so the model can see what was tried.
+			assistant := ModelAssistantMessage{}
+			for _, call := range message.ToolCalls {
+				assistant.ToolCalls = append(assistant.ToolCalls, modelToolCall(call))
+			}
+			if len(assistant.ToolCalls) > 0 {
+				p.emit(message.Seq, 0, assistant)
+			}
+			continue
+		}
+		p.projectResponse(message, false)
+	}
+	p.projectErrors(arc)
+	p.projectTasks(arc, 0, false)
+
+	// The note stands at the cut, separating the two regions on the page the
+	// way the watermark separates them in the log, and says which record
+	// wins: the arc's own log is verbatim, the summary is not.
+	note := "[earlier work in this request was summarised into the summary at the head of this transcript. " +
+		"This arc's own log below this note is verbatim and wins over the summary where the two disagree.]"
+	if len(arc.Suspensions) > 0 {
+		note += " [this request was paused while its context was being compacted]"
+	}
+	p.emit(p.floor, 3, ModelNoteMessage{Content: note})
 }
 
 // quote renders a request for a note: one line, cut to the length the session
@@ -450,17 +658,27 @@ func (p *projector) keepArc(arc *Arc) {
 	if arc.OpenedByTask != "" {
 		role = ModelRoleTask
 	}
-	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: role, Content: p.history.OpeningContent(arc)})
+	if !p.aboveCeiling(arc.Seq) {
+		p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: role, Content: p.history.OpeningContent(arc)})
+	}
 
 	// An arc that was cancelled or died is not coming back, which changes what
 	// an unanswered call under it means: not "no result yet" but "no result,
 	// and none is coming".
 	stoppedSeq, stopped := arcEnd(arc)
 	for _, message := range arc.Responses {
+		if p.aboveCeiling(message.Seq) {
+			continue
+		}
 		p.projectResponse(message, stopped)
 	}
 	p.projectErrors(arc)
 	p.projectTasks(arc, stoppedSeq, stopped)
+}
+
+// aboveCeiling reports whether a sequence number is past the projection's cap.
+func (p *projector) aboveCeiling(seq int) bool {
+	return p.ceiling >= 0 && seq > p.ceiling
 }
 
 // projectResponse emits one assistant message with its calls, their results
@@ -495,7 +713,7 @@ func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) 
 		}
 
 		assistant.ToolCalls = append(assistant.ToolCalls, modelToolCall(call))
-		results = append(results, toolResult(call))
+		results = append(results, p.toolResult(call))
 
 		if p.modes.ToolEvents == TreatmentNote {
 			for _, event := range call.Events {
@@ -548,10 +766,14 @@ func pendingStandIn(call *ToolCall, arcStopped bool) string {
 }
 
 // projectErrors emits the non-fatal errors an arc survived. The fatal one is
-// the arc's status and is reported by planArc.
+// the arc's status and is reported by planArc. Errors at or below the
+// watermark are part of the summary now.
 func (p *projector) projectErrors(arc *Arc) {
 	for _, failure := range arc.Errors {
 		if failure.IsFatal || p.modes.Error != TreatmentNote {
+			continue
+		}
+		if failure.Seq <= p.floor || p.aboveCeiling(failure.Seq) {
 			continue
 		}
 		if failure.CausationID != nil {
@@ -635,6 +857,11 @@ func taskLabel(task *AsyncTask) string {
 // the startup reaper) gets its completion note where it finished.
 func (p *projector) projectTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
 	for _, task := range p.history.TasksOfArc(arc.ID) {
+		// An invocation at or below the watermark is summarised with everything
+		// else; its note is synthesized from the task table at the cut instead.
+		if task.Seq <= p.floor || p.aboveCeiling(task.Seq) {
+			continue
+		}
 		// Fixed rule: the invocation note stays in the origin arc.
 		p.emitNote(task.Seq, 0, "[task %s started: %s]", taskLabel(task), formatValue(task.Args))
 
@@ -650,7 +877,7 @@ func (p *projector) projectTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
 			}
 			continue
 		}
-		if task.ResultArc != "" {
+		if task.ResultArc != "" || *task.FinishedSeq <= p.floor || p.aboveCeiling(*task.FinishedSeq) {
 			continue
 		}
 		switch task.Status {
@@ -713,11 +940,38 @@ func lastResponseSeq(arc *Arc) int {
 	return seq
 }
 
-// modelToolCall carries a call to the model under the log's own ID. The
-// provider's identifier for it is ToolCall.VendorID and belongs to the
-// encoder.
+// modelToolCall carries a call to the model under the log's own ID, with the
+// provider's identifier for it alongside, so an encoder can answer the call
+// without the log.
 func modelToolCall(call *ToolCall) ModelToolCall {
-	return ModelToolCall{ID: call.ID, Name: call.ToolName, Args: call.Args}
+	return ModelToolCall{ID: call.ID, VendorID: call.VendorID, Name: call.ToolName, Args: call.Args}
+}
+
+// toolResult renders a settled call's outcome, thinned to the configured cap.
+func (p *projector) toolResult(call *ToolCall) ModelToolMessage {
+	message := toolResult(call)
+	message.Content = p.thinToolResult(call, message.Content)
+	return message
+}
+
+// thinToolResult caps what one tool result may contribute to the transcript.
+// The log keeps the whole result; what the model is told is truncated with a
+// marker naming the call and the omitted size. The thinning is the harness's
+// own doing, so it is never an IsError outcome — the model must not read it as
+// the tool failing.
+func (p *projector) thinToolResult(call *ToolCall, content string) string {
+	limit := p.opts.MaxToolResultChars
+	if limit <= 0 {
+		return content
+	}
+	runes := []rune(content)
+	if len(runes) <= limit {
+		return content
+	}
+	omitted := len(runes) - limit
+	return string(runes[:limit]) + fmt.Sprintf(
+		"\n… [truncated by the harness: the result of call %s (%s) was %d characters, %d omitted; the log holds the whole result]",
+		call.ID, call.ToolName, len(runes), omitted)
 }
 
 // toolResult renders a settled call's outcome. Every terminal status is

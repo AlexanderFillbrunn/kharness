@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"fmt"
@@ -23,7 +24,7 @@ type cancelledArcs struct {
 	asks  int
 }
 
-func (c *cancelledArcs) Cancelled(_ context.Context, ref ArcRef) (*events.Event, error) {
+func (c *cancelledArcs) Cancelled(_ context.Context, ref common.ArcRef) (*events.Event, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.asks++
@@ -62,7 +63,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 	})
 
 	persistor := &fakePersistor{next: 1}
-	guarded := GuardCancellation(persistor, cancels)
+	guarded := common.GuardCancellation(persistor, cancels)
 	agent, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{
 		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "list_pods"}}},
 		{ModelID: "gpt-5", Content: "two are pending"},
@@ -83,7 +84,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 // arc the run is reading is settled rather than left looking open.
 func TestTheGuardStopsARunOnACancelledArc(t *testing.T) {
 	h, persistor, err := runGuarded(t, &cancelledArcs{arcs: map[string]*events.Event{testArcID: cancelOf(testArcID)}})
-	if !errors.Is(err, ErrCancelled) {
+	if !errors.Is(err, common.ErrCancelled) {
 		t.Fatalf("Run returned %v, want it to report the cancellation", err)
 	}
 
@@ -129,7 +130,7 @@ func TestAGuardThatCannotAnswerFailsOpen(t *testing.T) {
 // calls it requests cost nothing further, so they are never asked about.
 func TestTheGuardOnlyAsksAboutWritesThatStartWork(t *testing.T) {
 	cancels := &cancelledArcs{}
-	guarded := GuardCancellation(&fakePersistor{next: 1}, cancels)
+	guarded := common.GuardCancellation(&fakePersistor{next: 1}, cancels)
 	arc := testArcID
 
 	for _, typ := range []events.EventType{
@@ -163,14 +164,14 @@ func TestTheGuardOnlyAsksAboutWritesThatStartWork(t *testing.T) {
 // one read, since a refusal ends the run at the first dispatch it reaches.
 func TestTheGuardRemembersNothingBetweenWrites(t *testing.T) {
 	cancels := &cancelledArcs{arcs: map[string]*events.Event{testArcID: cancelOf(testArcID)}}
-	guarded := GuardCancellation(&fakePersistor{next: 1}, cancels)
+	guarded := common.GuardCancellation(&fakePersistor{next: 1}, cancels)
 	arc := testArcID
 
 	for range 3 {
 		_, err := guarded.Persist(context.Background(), &events.Event{
 			SessionID: testSessionID, Typ: events.ToolDispatchedEventType, CorrelationID: &arc,
 		})
-		if !errors.Is(err, ErrCancelled) {
+		if !errors.Is(err, common.ErrCancelled) {
 			t.Fatalf("Persist returned %v, want every dispatch refused", err)
 		}
 	}
@@ -192,7 +193,7 @@ func TestTheGuardServesConcurrentRuns(t *testing.T) {
 			cancels.arcs[arc] = cancelOf(arc)
 		}
 	}
-	guarded := GuardCancellation(&fakePersistor{next: 1}, cancels)
+	guarded := common.GuardCancellation(&fakePersistor{next: 1}, cancels)
 
 	var wg sync.WaitGroup
 	for i := range arcs {
@@ -204,7 +205,7 @@ func TestTheGuardServesConcurrentRuns(t *testing.T) {
 				_, err := guarded.Persist(context.Background(), &events.Event{
 					SessionID: testSessionID, Typ: events.ToolDispatchedEventType, CorrelationID: &arc,
 				})
-				if refused := errors.Is(err, ErrCancelled); refused != (i%2 == 0) {
+				if refused := errors.Is(err, common.ErrCancelled); refused != (i%2 == 0) {
 					t.Errorf("arc %s: Persist returned %v, want refused=%v", arc, err, i%2 == 0)
 					return
 				}
@@ -214,16 +215,16 @@ func TestTheGuardServesConcurrentRuns(t *testing.T) {
 	wg.Wait()
 }
 
-// recordingController is a TaskController that remembers what it was asked to
+// recordingController is a common.TaskController that remembers what it was asked to
 // stop, and can refuse.
 type recordingController struct {
 	mu      sync.Mutex
-	stopped []TaskRef
+	stopped []common.TaskRef
 	reasons []string
 	err     error
 }
 
-func (c *recordingController) Cancel(_ context.Context, ref TaskRef, reason string) error {
+func (c *recordingController) Cancel(_ context.Context, ref common.TaskRef, reason string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err != nil {
@@ -234,7 +235,7 @@ func (c *recordingController) Cancel(_ context.Context, ref TaskRef, reason stri
 	return nil
 }
 
-func (c *recordingController) ProvideInput(context.Context, TaskRef, string, string) error {
+func (c *recordingController) ProvideInput(context.Context, common.TaskRef, string, string) error {
 	return nil
 }
 
@@ -255,10 +256,10 @@ func cancelledTaskArc(t *testing.T, reason string) *logStore {
 }
 
 // workerOver builds a worker whose agent can start and reach tasks.
-func workerOver(t *testing.T, store *logStore, controller TaskController, options ...ArcWorkerOption) *ArcWorker {
+func workerOver(t *testing.T, store *logStore, controller common.TaskController, options ...ArcWorkerOption) *ArcWorker {
 	t.Helper()
 	tasks := NewTaskRegistry()
-	if err := tasks.RegisterTask(TaskMetadata{Name: "auditor"}, func(context.Context, TaskRef, any) error {
+	if err := tasks.RegisterTask(common.TaskMetadata{Name: "auditor"}, func(context.Context, common.TaskRef, any) error {
 		return nil
 	}); err != nil {
 		t.Fatalf("RegisterTask: %v", err)
@@ -314,12 +315,12 @@ func taskCancelOf(taskID, reason string) *events.Event {
 }
 
 // A write whose causation reaches a cancelled task is refused like a write that
-// starts work on a cancelled arc: the whole batch, ErrCancelled, nothing
+// starts work on a cancelled arc: the whole batch, common.ErrCancelled, nothing
 // written. A late report from a cancelled task's runner is exactly this.
 func TestTheGuardRefusesAWritingAboutACancelledTask(t *testing.T) {
 	cancels := &cancelledArcs{tasks: map[string]*events.Event{"task-1": taskCancelOf("task-1", "not needed")}}
 	inner := &fakePersistor{next: 1}
-	guarded := GuardCancellation(inner, cancels)
+	guarded := common.GuardCancellation(inner, cancels)
 	arc := testArcID
 
 	batch := []*events.Event{
@@ -330,7 +331,7 @@ func TestTheGuardRefusesAWritingAboutACancelledTask(t *testing.T) {
 				CausationID: "task-1", Result: "too late", Outcome: events.AsyncTaskOutcomeSuccess,
 				LLMVisibility: events.LLMVisibilityNone}},
 	}
-	if _, err := guarded.Persist(context.Background(), batch...); !errors.Is(err, ErrCancelled) {
+	if _, err := guarded.Persist(context.Background(), batch...); !errors.Is(err, common.ErrCancelled) {
 		t.Fatalf("Persist returned %v, want the whole batch refused", err)
 	}
 	if len(inner.persisted) != 0 {
@@ -442,7 +443,7 @@ func TestNotifyingOneArcLeavesAnotherAlone(t *testing.T) {
 	cancels := NewLocalCancels()
 	mine, stopMine := cancels.Watch(context.Background(), testRef())
 	defer stopMine()
-	theirs, stopTheirs := cancels.Watch(context.Background(), ArcRef{SessionID: testSessionID, ArcID: "arc-2"})
+	theirs, stopTheirs := cancels.Watch(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: "arc-2"})
 	defer stopTheirs()
 
 	if err := cancels.NotifyCancel(context.Background(), testRef()); err != nil {

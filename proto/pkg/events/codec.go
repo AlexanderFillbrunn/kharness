@@ -71,6 +71,15 @@ func (JSONCodec) Decode(t EventType, data []byte) (EventPayload, error) {
 	case ArcClosedEventType:
 		var p ArcClosedPayload
 		return p, json.Unmarshal(data, &p)
+	case CompactionRequestedEventType:
+		var p CompactionRequestedPayload
+		return p, json.Unmarshal(data, &p)
+	case ArcSuspendedEventType:
+		var p ArcSuspendedPayload
+		return p, json.Unmarshal(data, &p)
+	case CompactedEventType:
+		var p CompactedPayload
+		return p, json.Unmarshal(data, &p)
 	default:
 		return nil, fmt.Errorf("unrecognized event type %q", t)
 	}

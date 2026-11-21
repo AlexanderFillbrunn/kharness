@@ -1,13 +1,13 @@
 package redisinfra
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
@@ -20,12 +20,12 @@ func openStore(t *testing.T) *RedisEventStore {
 }
 
 // userMessage opens an arc. It arrives named and timed, as everything written
-// through agent.MintIdentity does.
+// through common.MintIdentity does.
 func userMessage(sessionID, arcID, content string) *events.Event {
 	actor := users.Actor{UserID: "dev", TenantID: "dev"}
 	return &events.Event{
 		SessionID:     sessionID,
-		ID:            agent.NewEventID(),
+		ID:            common.NewEventID(),
 		Timestamp:     time.Now().UTC(),
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
@@ -37,7 +37,7 @@ func userMessage(sessionID, arcID, content string) *events.Event {
 func assistantMessage(sessionID, arcID, content string) *events.Event {
 	return &events.Event{
 		SessionID:     sessionID,
-		ID:            agent.NewEventID(),
+		ID:            common.NewEventID(),
 		Timestamp:     time.Now().UTC(),
 		Typ:           events.AssistantMessageEventType,
 		CorrelationID: &arcID,
@@ -169,7 +169,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	selected, err := store.GetEventsForArc(ctx, agent.ArcRef{SessionID: "session", ArcID: "arc-1"})
+	selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-1"})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 	// A later arc sees the earlier one whole, because it is conversation
 	// history by then.
-	selected, err = store.GetEventsForArc(ctx, agent.ArcRef{SessionID: "session", ArcID: "arc-2"})
+	selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-2"})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 func TestStoreGetEventsForArcRejectsAnUnknownArc(t *testing.T) {
 	store := openStore(t)
-	ref := agent.ArcRef{SessionID: "session", ArcID: "absent"}
+	ref := common.ArcRef{SessionID: "session", ArcID: "absent"}
 	if _, err := store.GetEventsForArc(context.Background(), ref); err == nil {
 		t.Error("an unknown arc was accepted")
 	}
@@ -217,7 +217,7 @@ func TestStoreGetEventsForArcIsScopedToItsSession(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	elsewhere := agent.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
+	elsewhere := common.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
 	if _, err := store.GetEventsForArc(ctx, elsewhere); err == nil {
 		t.Error("an arc was served to a ref naming a different session")
 	}
@@ -252,7 +252,7 @@ func TestStoreKeepsSessionsApart(t *testing.T) {
 func TestStoreCancelledFindsTheArcsCancel(t *testing.T) {
 	store := openStore(t)
 	ctx := context.Background()
-	ref := agent.ArcRef{SessionID: "session", ArcID: "arc-1"}
+	ref := common.ArcRef{SessionID: "session", ArcID: "arc-1"}
 
 	if cancel, err := store.Cancelled(ctx, ref); err != nil {
 		t.Fatalf("Cancelled: %v", err)
@@ -263,7 +263,7 @@ func TestStoreCancelledFindsTheArcsCancel(t *testing.T) {
 	arcID := ref.ArcID
 	reason := "enough"
 	if _, err := store.Persist(ctx, &events.Event{
-		SessionID: "session", ID: agent.NewEventID(), Timestamp: time.Now().UTC(),
+		SessionID: "session", ID: common.NewEventID(), Timestamp: time.Now().UTC(),
 		Typ: events.CancelEventType, CorrelationID: &arcID,
 		Payload: events.CancelPayload{Reason: &reason},
 	}); err != nil {
@@ -331,7 +331,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 		stored = append(stored, *persisted[0])
 	}
 
-	selected, err := store.GetEventsForArc(ctx, agent.ArcRef{SessionID: "session", ArcID: taskArc})
+	selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: taskArc})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 
 	// The origin arc's read includes the task-correlated event, so a run sees
 	// the task table the session holds.
-	selected, err = store.GetEventsForArc(ctx, agent.ArcRef{SessionID: "session", ArcID: arc1})
+	selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: arc1})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -386,5 +386,49 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 	}
 	if out := h.RenderChat(); !strings.Contains(out, "asks a question") {
 		t.Errorf("RenderChat does not show the task-opened arc:\n%s", out)
+	}
+}
+
+// GetEventsForSession returns one session's whole log in write order and
+// nothing of any other session's. The compaction worker folds the session
+// through exactly this read, so a leak across sessions would corrupt the cut.
+func TestStoreGetEventsForSessionReadsOnlyItsOwnLog(t *testing.T) {
+	store := openStore(t)
+	ctx := context.Background()
+
+	if _, err := store.Persist(ctx, userMessage("session-a", "arc-1", "first in a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if _, err := store.Persist(ctx, userMessage("session-b", "arc-9", "only in b")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if _, err := store.Persist(ctx,
+		assistantMessage("session-a", "arc-1", "second in a"),
+		userMessage("session-a", "arc-2", "third in a"),
+	); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	got, err := store.GetEventsForSession(ctx, "session-a")
+	if err != nil {
+		t.Fatalf("GetEventsForSession: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("session-a holds %d events, want its own three", len(got))
+	}
+	for i, ev := range got {
+		if ev.SessionID != "session-a" {
+			t.Errorf("event %d belongs to %s, want session-a", i, ev.SessionID)
+		}
+		if ev.Seq != i {
+			t.Errorf("event %d carries seq %d, want the write order %d", i, ev.Seq, i)
+		}
+	}
+	if got[0].Payload.(events.UserMessagePayload).Content != "first in a" ||
+		got[2].Payload.(events.UserMessagePayload).Content != "third in a" {
+		t.Errorf("the log reads %q, %q, %q, want the writes in order",
+			got[0].Payload.(events.UserMessagePayload).Content,
+			got[1].Payload.(events.AssistantMessagePayload).Content,
+			got[2].Payload.(events.UserMessagePayload).Content)
 	}
 }

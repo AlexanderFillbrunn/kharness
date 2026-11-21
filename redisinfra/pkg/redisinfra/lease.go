@@ -1,8 +1,8 @@
 // Package redisinfra holds the distributed halves the agent framework left
-// local: the lease that keeps two runs off one arc when they are in two
-// processes, the cancellation notice that reaches a run already under way,
-// the queue that delivers the runs a write owes an arc, and the event log
-// those processes share.
+// local: the leases that keep two runs off one arc and two compactions off
+// one session when they are in two processes, the cancellation notice that
+// reaches a run already under way, the queue that delivers the runs a write
+// owes an arc, and the event log those processes share.
 //
 // Everything here talks to Redis by address from configuration. Nothing
 // listens, nothing is reachable from outside, and nothing knows about an
@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
 	"time"
 
@@ -29,8 +30,16 @@ import (
 // leaseKey names the key one arc's lease lives under. The session and the arc
 // ID are both in the key, because nothing that locks by arc can be
 // partitioned by session without being told the session as well.
-func leaseKey(ref agent.ArcRef) string {
+func leaseKey(ref common.ArcRef) string {
 	return "kube-agent:lease:" + ref.SessionID + ":" + ref.ArcID
+}
+
+// sessionLeaseKey names the key one session's compaction lease lives under.
+// The lease is scoped to the session rather than to an arc or an item,
+// because a compaction is a fact about the session's log, not about anything
+// a work item names.
+func sessionLeaseKey(sessionID string) string {
+	return "kube-agent:session-lease:" + sessionID
 }
 
 // releaseScript deletes the lease only while it still names the holder asking
@@ -55,90 +64,81 @@ end
 return 0
 `)
 
-// RedisLease is an ArcLease for many processes, on the same rule as the
-// local one: one holder per arc, and an arc left to whoever holds it.
-//
-// The lease is a Redis key with a TTL. The TTL is the backstop for a holder
-// that dies without releasing, and it is also the honest limit of what the
-// lease promises: the existing ArcLease contract has no fencing, so a holder
-// whose TTL expired can still be writing, and the persistor cannot detect
-// it. A generous TTL makes that a run finishing late rather than a run
-// overlapping its successor, which is why the default is minutes and not
-// seconds.
-//
-// A holder that stays alive keeps its lease by heartbeating it before the
-// TTL runs out. The heartbeat proves it still holds the lease before
-// extending it, so a slow run does not lose the arc to its own expiry, and a
-// run whose lease was lost anyway does not steal it back. Renewal is
-// optional: a lease configured without a renewal interval is held for the
-// TTL and no longer.
-type RedisLease struct {
+// keyLease is the machinery both leases share: a holder token under one key
+// with a TTL, heartbeated while the holder lives and released only by its
+// own token. The TTL is the backstop for a holder that dies without
+// releasing, and it is also the honest limit of what the lease promises: the
+// lease contracts in pkg/agent have no fencing, so a holder whose TTL
+// expired can still be writing, and the persistor cannot detect it. A
+// generous TTL makes that a run finishing late rather than a run overlapping
+// its successor, which is why the default is minutes and not seconds.
+type keyLease struct {
 	client *redis.Client
 	ttl    time.Duration
 	renew  time.Duration
 }
 
-// LeaseOption configures a RedisLease.
-type LeaseOption func(*RedisLease)
+// LeaseOption configures a lease.
+type LeaseOption func(*keyLease)
 
 // WithLeaseTTL sets how long a lease survives a holder that stops
 // heartbeating it. It should stay generous: shrinking it trades a rare
 // overlapping run for a common stranded arc.
 func WithLeaseTTL(ttl time.Duration) LeaseOption {
-	return func(l *RedisLease) { l.ttl = ttl }
+	return func(l *keyLease) { l.ttl = ttl }
 }
 
 // WithRenewalInterval sets how often a holder extends its lease, or 0 to
 // hold for the TTL alone.
 func WithRenewalInterval(interval time.Duration) LeaseOption {
-	return func(l *RedisLease) { l.renew = interval }
+	return func(l *keyLease) { l.renew = interval }
 }
 
-// NewRedisLease builds a lease over a Redis client. The client is used by
-// every acquisition, so it must not be closed while a lease may be taken.
-func NewRedisLease(client *redis.Client, options ...LeaseOption) *RedisLease {
-	l := &RedisLease{client: client, ttl: time.Minute, renew: 20 * time.Second}
+// newKeyLease builds the shared part of a lease over a Redis client. The
+// client is used by every acquisition, so it must not be closed while a
+// lease may be taken.
+func newKeyLease(client *redis.Client, options ...LeaseOption) keyLease {
+	l := keyLease{client: client, ttl: time.Minute, renew: 20 * time.Second}
 	for _, option := range options {
-		option(l)
+		option(&l)
 	}
 	return l
 }
 
-var _ agent.ArcLease = (*RedisLease)(nil)
-
-// Acquire takes the arc by writing a holder token under its key, which
+// Acquire takes the lease by writing a holder token under the key, which
 // fails without error when somebody else's token is already there.
 //
-// The three outcomes are the contract's, and they are kept apart exactly:
-// ok false means the arc is held and is not a failure, and an error means
+// The three outcomes are the contracts', and they are kept apart exactly:
+// ok false means the lease is held and is not a failure, and an error means
 // Redis could not be reached and the caller learns nothing about who holds
-// the arc. A caller that read an unreachable lock service as "nobody holds
-// it" would run the arc twice, so nothing here turns a reachability failure
-// into a refusal.
+// it. A caller that read an unreachable lock service as "nobody holds it"
+// would run twice, so nothing here turns a reachability failure into a
+// refusal.
 //
 // The release func returned on success stops the heartbeat and then deletes
 // the key only if it still names this holder. It runs on its own context, so
-// a run cancelled through its own context still lets go of the arc.
-func (l *RedisLease) Acquire(ctx context.Context, ref agent.ArcRef) (func(), bool, error) {
+// a run cancelled through its own context still lets go of the lease.
+func (l *keyLease) Acquire(ctx context.Context, key string) (func(), bool, error) {
 	token, err := newLeaseToken()
 	if err != nil {
-		return nil, false, fmt.Errorf("could not mint a holder token for arc %s: %w", ref, err)
+		return nil, false, fmt.Errorf("could not mint a holder token for %s: %w", key, err)
 	}
-	ok, err := l.client.SetNX(ctx, leaseKey(ref), token, l.ttl).Result()
+	ok, err := l.client.SetNX(ctx, key, token, l.ttl).Result()
 	if err != nil {
-		return nil, false, fmt.Errorf("could not reach the lease on arc %s: %w", ref, err)
+		return nil, false, fmt.Errorf("could not reach the lease on %s: %w", key, err)
 	}
 	if !ok {
 		return nil, false, nil
 	}
-	stopHeartbeat := l.startHeartbeat(ctx, ref, token)
+	stopHeartbeat := l.startHeartbeat(ctx, key, token)
 	return func() {
 		stopHeartbeat()
-		// The release runs even when the run's context is done, since an
-		// arc held past its run is an arc nobody else can take for a TTL.
+		// The release runs even when the run's context is done, since a
+		// lease held past its holder is held against everybody else for a
+		// TTL.
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := releaseScript.Run(releaseCtx, l.client, []string{leaseKey(ref)}, token).Result(); err != nil {
+		if _, err := releaseScript.Run(releaseCtx, l.client, []string{key}, token).Result(); err != nil {
 			// A release that cannot reach Redis leaves the key to expire
 			// on its TTL. That is the backstop the TTL exists for, and a
 			// caller has nothing left to do about it.
@@ -156,8 +156,8 @@ func (l *RedisLease) Acquire(ctx context.Context, ref agent.ArcRef) (func(), boo
 // connection is not evidence the lease is gone. A renewal that reaches Redis
 // and finds another holder's token is evidence the lease is gone, and the
 // heartbeat stops: the run keeps writing, which is the unfenced-writer hole
-// the ArcLease contract already owns.
-func (l *RedisLease) startHeartbeat(ctx context.Context, ref agent.ArcRef, token string) (stop func()) {
+// the lease contracts already own.
+func (l *keyLease) startHeartbeat(ctx context.Context, key, token string) (stop func()) {
 	if l.renew <= 0 {
 		return func() {}
 	}
@@ -172,7 +172,7 @@ func (l *RedisLease) startHeartbeat(ctx context.Context, ref agent.ArcRef, token
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				held, err := renewScript.Run(ctx, l.client, []string{leaseKey(ref)}, token, l.ttl.Milliseconds()).Int()
+				held, err := renewScript.Run(ctx, l.client, []string{key}, token, l.ttl.Milliseconds()).Int()
 				if err != nil {
 					continue
 				}
@@ -186,6 +186,45 @@ func (l *RedisLease) startHeartbeat(ctx context.Context, ref agent.ArcRef, token
 		cancel()
 		<-done
 	}
+}
+
+// RedisLease is an ArcLease for many processes, on the same rule as the
+// local one: one holder per arc, and an arc left to whoever holds it.
+type RedisLease struct {
+	keyLease
+}
+
+// NewRedisLease builds an arc lease over a Redis client.
+func NewRedisLease(client *redis.Client, options ...LeaseOption) *RedisLease {
+	return &RedisLease{newKeyLease(client, options...)}
+}
+
+var _ agent.ArcLease = (*RedisLease)(nil)
+
+// Acquire takes the arc's lease. See keyLease.Acquire for the outcomes.
+func (l *RedisLease) Acquire(ctx context.Context, ref common.ArcRef) (func(), bool, error) {
+	return l.keyLease.Acquire(ctx, leaseKey(ref))
+}
+
+// RedisSessionLease is a SessionLease for many processes: one holder per
+// session's compaction, whatever compaction item they hold, so parallel
+// computation of one session's compactions is excluded process-wide. The
+// lease's expiry bounds a worker that died computing, and the queue's
+// autoclaim re-offers its item, so the lease needs no other reaping.
+type RedisSessionLease struct {
+	keyLease
+}
+
+// NewRedisSessionLease builds a session lease over a Redis client.
+func NewRedisSessionLease(client *redis.Client, options ...LeaseOption) *RedisSessionLease {
+	return &RedisSessionLease{newKeyLease(client, options...)}
+}
+
+var _ agent.SessionLease = (*RedisSessionLease)(nil)
+
+// Acquire takes the session's lease. See keyLease.Acquire for the outcomes.
+func (l *RedisSessionLease) Acquire(ctx context.Context, sessionID string) (func(), bool, error) {
+	return l.keyLease.Acquire(ctx, sessionLeaseKey(sessionID))
 }
 
 // newLeaseToken mints the value a holder writes under the lease key. It is

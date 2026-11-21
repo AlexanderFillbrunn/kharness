@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fmt"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
@@ -110,7 +111,7 @@ func toolFor(meta common.TaskMetadata) *mcp.Tool {
 
 func cancelTaskTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: CancelTaskTool,
+		Name: events.CancelTaskToolName,
 		Description: "Ask a running task to stop. The task reports what became of it, " +
 			"so a cancelled task may still have done some of its work.",
 		InputSchema: map[string]any{
@@ -132,7 +133,7 @@ func cancelTaskTool() *mcp.Tool {
 
 func provideTaskInputTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: ProvideTaskInputTool,
+		Name: events.ProvideTaskInputToolName,
 		Description: "Answer a question a running task has asked. Only for a question you have " +
 			"been given: a task you expect to ask something has not asked it yet, and a guess " +
 			"made ahead of the question is not an answer to it. You may answer the task directly, " +
@@ -176,9 +177,9 @@ func classify(tasks *TaskRegistry, name string) taskOperation {
 		return opTool
 	}
 	switch name {
-	case CancelTaskTool:
+	case events.CancelTaskToolName:
 		return opCancel
-	case ProvideTaskInputTool:
+	case events.ProvideTaskInputToolName:
 		return opProvideInput
 	}
 	if _, ok := tasks.Get(name); ok {

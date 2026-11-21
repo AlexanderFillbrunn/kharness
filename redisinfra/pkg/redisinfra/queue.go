@@ -44,34 +44,62 @@ type WorkItem struct {
 	// once the new one is written.
 	Attempts    int   `json:"attempts,omitempty"`
 	NotBeforeMs int64 `json:"not_before_ms,omitempty"`
+
+	// Kind says what the item is: an arc run (the zero value, so an entry
+	// written before kinds existed still reads as the arc it names) or a
+	// compaction. A compaction item names no arc; it names the
+	// COMPACTION_REQUESTED event whose watermark the compaction is to reach.
+	// The wire names match common.WorkItem, so both shapes read one stream.
+	Kind string `json:"kind,omitempty"`
+
+	// RequestID is the ID of the COMPACTION_REQUESTED event a compaction
+	// item serves. Empty for arc items.
+	RequestID string `json:"request_id,omitempty"`
 }
 
-// ref names the arc the item wants a run of.
+// ref names the arc the item wants a run of. It is meaningless for a
+// compaction item.
 func (i WorkItem) ref() common.ArcRef {
 	return common.ArcRef{SessionID: i.SessionID, ArcID: i.ArcID}
 }
 
+// isCompaction reports whether the item is a compaction rather than an arc run.
+func (i WorkItem) isCompaction() bool { return i.Kind == common.WorkItemKindCompaction }
+
 // ArcRunner is the shape of ArcWorker.Work, which the consumer calls on
-// every item it claims. It is an interface so that the queue serves the
+// every arc item it claims. It is an interface so that the queue serves the
 // worker without depending on how one is built, and so that a test can run
 // the queue against a worker that is not an agent.
 type ArcRunner interface {
 	Work(ctx context.Context, ref common.ArcRef, agentID string) (worked bool, err error)
 }
 
-// WorkQueue is the queue that delivers the runs a write owes an arc. Every
-// write that changes what an arc has to do must be followed by a run of
-// that arc, and no trigger may be lost, so an enqueue must not fail
-// silently and a consume must not drop an item it could not work.
+// CompactionRunner is the shape of CompactionWorker.Work, which the consumer
+// calls on every compaction item it claims. A compaction item names no arc:
+// it names the session and the COMPACTION_REQUESTED event being served.
+type CompactionRunner interface {
+	Work(ctx context.Context, sessionID, requestID, agentID string) (worked bool, err error)
+}
+
+// WorkQueue is the queue that delivers the runs a write owes an arc, and the
+// compactions a due round owes a session. Every write that changes what an
+// arc has to do must be followed by a run of that arc, and no trigger may be
+// lost, so an enqueue must not fail silently and a consume must not drop an
+// item it could not work.
 type WorkQueue interface {
 	// Enqueue adds an item for the arc named to the queue. It is the sliver of
 	// the queue the framework's report path needs, so pkg/agent can hand over
 	// an arc it opened without importing this package.
 	Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error
-	// Consume claims items and runs the worker over them, until the
-	// context is cancelled or the queue cannot go on. It returns only
-	// when there is nothing left to consume with.
-	Consume(ctx context.Context, runner ArcRunner) error
+	// EnqueueCompaction adds an item for the compaction request named, served
+	// by the compaction worker rather than the arc worker.
+	EnqueueCompaction(ctx context.Context, sessionID, requestID, agentID string) error
+	// Consume claims items and runs the workers over them, until the
+	// context is cancelled or the queue cannot go on: arc items go to arcs,
+	// compaction items to compactions. A nil compactions serves no compaction
+	// and leaves those items pending for a consumer that does. It returns
+	// only when there is nothing left to consume with.
+	Consume(ctx context.Context, arcs ArcRunner, compactions CompactionRunner) error
 }
 
 // RedisWorkQueue is a WorkQueue on Redis streams.
@@ -216,8 +244,40 @@ func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref common.ArcRef, agentID
 	return nil
 }
 
-// redisinfra's queue satisfies the framework's sliver of it.
-var _ common.WorkEnqueuer = (*RedisWorkQueue)(nil)
+// EnqueueCompaction adds a compaction item for the request named to the
+// stream, in the same queue arc items travel. The item names no arc, so
+// consumers route it by its kind to the compaction worker.
+//
+// Like Enqueue, an item naming no agent is refused before anything is
+// written, and a compaction naming no request is refused too: an item with
+// no request names nothing to compute.
+func (q *RedisWorkQueue) EnqueueCompaction(ctx context.Context, sessionID, requestID, agentID string) error {
+	if agentID == "" {
+		return fmt.Errorf("a compaction item for session %s names no agent", sessionID)
+	}
+	if requestID == "" {
+		return fmt.Errorf("a compaction item for session %s names no request", sessionID)
+	}
+	item := WorkItem{
+		SessionID: sessionID,
+		AgentID:   agentID,
+		Kind:      common.WorkItemKindCompaction,
+		RequestID: requestID,
+	}
+	if err := q.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: q.stream,
+		Values: map[string]any{"payload": string(mustMarshal(item))},
+	}).Err(); err != nil {
+		return fmt.Errorf("could not enqueue a compaction of session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// redisinfra's queue satisfies the framework's slivers of it.
+var (
+	_ common.WorkEnqueuer       = (*RedisWorkQueue)(nil)
+	_ common.CompactionEnqueuer = (*RedisWorkQueue)(nil)
+)
 
 // Consume claims items and works them until the context is cancelled.
 //
@@ -233,21 +293,25 @@ var _ common.WorkEnqueuer = (*RedisWorkQueue)(nil)
 // the dead stream. Only a queue that cannot be read or written ends the
 // loop, since a consumer that cannot reach its queue can settle nothing
 // and should not pretend to go on.
-func (q *RedisWorkQueue) Consume(ctx context.Context, runner ArcRunner) error {
-	if runner == nil {
-		return errors.New("a work queue consumes through a worker")
+//
+// A nil compactions is allowed: the consumer then serves arc items only and
+// leaves compaction items pending, for autoclaim to offer a consumer that
+// has a compaction worker.
+func (q *RedisWorkQueue) Consume(ctx context.Context, arcs ArcRunner, compactions CompactionRunner) error {
+	if arcs == nil {
+		return errors.New("a work queue consumes through an arc worker")
 	}
 	if err := q.ensureGroup(ctx); err != nil {
 		return err
 	}
 	for {
-		if err := q.claimAbandoned(ctx, runner); err != nil {
+		if err := q.claimAbandoned(ctx, arcs, compactions); err != nil {
 			return err
 		}
-		if err := q.workPending(ctx, runner); err != nil {
+		if err := q.workPending(ctx, arcs, compactions); err != nil {
 			return err
 		}
-		if err := q.workNew(ctx, runner); err != nil {
+		if err := q.workNew(ctx, arcs, compactions); err != nil {
 			return err
 		}
 		if err := ctx.Err(); err != nil {
@@ -271,7 +335,7 @@ func (q *RedisWorkQueue) ensureGroup(ctx context.Context) error {
 // them for longer than the claim idle time. A consumer that died mid-run
 // leaves its entries pending here, and this is what keeps its death from
 // stranding the runs those entries owed.
-func (q *RedisWorkQueue) claimAbandoned(ctx context.Context, runner ArcRunner) error {
+func (q *RedisWorkQueue) claimAbandoned(ctx context.Context, arcs ArcRunner, compactions CompactionRunner) error {
 	cursor := "0-0"
 	for {
 		claimed, next, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
@@ -286,7 +350,7 @@ func (q *RedisWorkQueue) claimAbandoned(ctx context.Context, runner ArcRunner) e
 			return fmt.Errorf("could not claim abandoned entries on %s: %w", q.stream, err)
 		}
 		for _, msg := range claimed {
-			q.work(ctx, runner, msg)
+			q.work(ctx, arcs, compactions, msg)
 		}
 		if next == "0-0" {
 			return nil
@@ -298,19 +362,19 @@ func (q *RedisWorkQueue) claimAbandoned(ctx context.Context, runner ArcRunner) e
 // workPending reconsiders the entries this consumer has read and not
 // settled. They are the items whose time had not come when they were
 // read, and they stay pending until a pass finds their time arrived.
-func (q *RedisWorkQueue) workPending(ctx context.Context, runner ArcRunner) error {
-	return q.read(ctx, runner, "0")
+func (q *RedisWorkQueue) workPending(ctx context.Context, arcs ArcRunner, compactions CompactionRunner) error {
+	return q.read(ctx, arcs, compactions, "0")
 }
 
 // workNew claims entries nobody has read yet.
-func (q *RedisWorkQueue) workNew(ctx context.Context, runner ArcRunner) error {
-	return q.read(ctx, runner, ">")
+func (q *RedisWorkQueue) workNew(ctx context.Context, arcs ArcRunner, compactions CompactionRunner) error {
+	return q.read(ctx, arcs, compactions, ">")
 }
 
 // read claims entries at an ID: ">" for entries never delivered, and "0"
 // for the entries this consumer already holds. A read that times out with
 // nothing to claim is a pass with no work in it, and not a failure.
-func (q *RedisWorkQueue) read(ctx context.Context, runner ArcRunner, id string) error {
+func (q *RedisWorkQueue) read(ctx context.Context, arcs ArcRunner, compactions CompactionRunner, id string) error {
 	streams, err := q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    q.group,
 		Consumer: q.consumer,
@@ -326,14 +390,14 @@ func (q *RedisWorkQueue) read(ctx context.Context, runner ArcRunner, id string) 
 	}
 	for _, stream := range streams {
 		for _, msg := range stream.Messages {
-			q.work(ctx, runner, msg)
+			q.work(ctx, arcs, compactions, msg)
 		}
 	}
 	return nil
 }
 
-// work runs the worker over one claimed entry, and settles the entry
-// according to what the run did.
+// work routes one claimed entry to the worker its kind calls for, and
+// settles the entry according to what the run did.
 //
 // An entry is settled by an acknowledgement, and nothing is acknowledged
 // before whatever replaces it is written: a re-enqueued item is written
@@ -342,13 +406,14 @@ func (q *RedisWorkQueue) read(ctx context.Context, runner ArcRunner, id string) 
 //
 // The outcomes are the three the worker reports:
 //
-// A run that worked settles its entry. A run that found the arc held
+// A run that worked settles its entry. A run that found its lease held
 // cannot tell a holder that will cover the item from one that replayed
 // too early, so the item goes back after the contention delay and the
-// entry is settled. A run that failed goes back with its attempt counted,
-// and one that failed too often is moved to the dead stream, so a poison
-// item is visible rather than retried forever.
-func (q *RedisWorkQueue) work(ctx context.Context, runner ArcRunner, msg redis.XMessage) {
+// entry is settled; autoclaim re-offers an entry whose consumer died
+// before settling it. A run that failed goes back with its attempt
+// counted, and one that failed too often is moved to the dead stream, so
+// a poison item is visible rather than retried forever.
+func (q *RedisWorkQueue) work(ctx context.Context, arcs ArcRunner, compactions CompactionRunner, msg redis.XMessage) {
 	item, err := q.item(msg)
 	if err != nil {
 		// An entry that cannot be read is moved to the dead stream
@@ -360,7 +425,27 @@ func (q *RedisWorkQueue) work(ctx context.Context, runner ArcRunner, msg redis.X
 	if item.NotBeforeMs > 0 && time.Now().UnixMilli() < item.NotBeforeMs {
 		return
 	}
-	worked, err := runner.Work(ctx, item.ref(), item.AgentID)
+	if item.isCompaction() {
+		if compactions == nil {
+			// This consumer serves no compactions: leave the entry pending
+			// without counting an attempt, so autoclaim offers it to a
+			// consumer that has a compaction worker.
+			return
+		}
+		q.workItem(ctx, msg, item, func() (bool, error) {
+			return compactions.Work(ctx, item.SessionID, item.RequestID, item.AgentID)
+		})
+		return
+	}
+	q.workItem(ctx, msg, item, func() (bool, error) {
+		return arcs.Work(ctx, item.ref(), item.AgentID)
+	})
+}
+
+// workItem runs one item's worker and settles the entry the outcome calls
+// for, as work documents.
+func (q *RedisWorkQueue) workItem(ctx context.Context, msg redis.XMessage, item WorkItem, run func() (bool, error)) {
+	worked, err := run()
 	item.Attempts++
 	switch {
 	case err == nil && worked:

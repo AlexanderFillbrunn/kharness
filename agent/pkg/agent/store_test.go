@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"sync"
 	"testing"
 	"time"
@@ -56,8 +57,10 @@ func (s *logStore) GetEventsForSession(_ context.Context, sessionID string) ([]*
 
 // GetEventsForArc applies the projection's cutoff the way the real store does:
 // everything up to the arc's own opening event, plus everything correlated to
-// it or to a task afterwards.
-func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Event, error) {
+// it or to a task afterwards, plus the session-level records that carry no
+// correlation ID, so a COMPACTED that landed after the arc opened still
+// reaches the run that resumes it.
+func (s *logStore) GetEventsForArc(_ context.Context, ref common.ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -76,14 +79,15 @@ func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Eve
 	}
 	var selected []*events.Event
 	for _, ev := range s.events {
-		if ev.Seq <= opening || (ev.CorrelationID != nil && (*ev.CorrelationID == ref.ArcID || taskIDs[*ev.CorrelationID])) {
+		if ev.Seq <= opening || ev.CorrelationID == nil ||
+			(*ev.CorrelationID == ref.ArcID || taskIDs[*ev.CorrelationID]) {
 			selected = append(selected, ev)
 		}
 	}
 	return selected, nil
 }
 
-func (s *logStore) Cancelled(_ context.Context, ref ArcRef) (*events.Event, error) {
+func (s *logStore) Cancelled(_ context.Context, ref common.ArcRef) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, ev := range s.events {
@@ -105,11 +109,11 @@ func (s *logStore) CancelledTask(_ context.Context, _, taskID string) (*events.E
 	return nil, nil
 }
 
-// TaskState scans the in-memory log, the way a store scans its file.
-func (s *logStore) TaskState(_ context.Context, sessionID, taskID string) (*TaskState, error) {
+// common.TaskState scans the in-memory log, the way a store scans its file.
+func (s *logStore) TaskState(_ context.Context, sessionID, taskID string) (*common.TaskState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return TaskStateOf(sessionID, taskID, s.events), nil
+	return common.TaskStateOf(sessionID, taskID, s.events), nil
 }
 
 // runningTaskStore is a log holding one arc that started a task and answered

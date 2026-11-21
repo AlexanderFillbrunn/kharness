@@ -1,6 +1,7 @@
 package filestore
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"os"
 	"path/filepath"
@@ -8,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
@@ -25,7 +25,7 @@ func openTemp(t *testing.T) *Store {
 }
 
 // userMessage opens an arc. It arrives named and timed, as everything written
-// through agent.MintIdentity does.
+// through common.MintIdentity does.
 func userMessage(arcID, content string) *events.Event {
 	actor := users.Actor{UserID: "dev", TenantID: "dev"}
 	return &events.Event{
@@ -139,8 +139,8 @@ func TestOpenResumesTheSequence(t *testing.T) {
 }
 
 // ref addresses an arc of the session the fixtures write under.
-func ref(arcID string) agent.ArcRef {
-	return agent.ArcRef{SessionID: "session", ArcID: arcID}
+func ref(arcID string) common.ArcRef {
+	return common.ArcRef{SessionID: "session", ArcID: arcID}
 }
 
 // The cutoff is the contract the projection rests on: everything up to the
@@ -214,7 +214,7 @@ func TestGetEventsForArcIsScopedToItsSession(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	elsewhere := agent.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
+	elsewhere := common.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
 	if _, err := store.GetEventsForArc(ctx, elsewhere); err == nil {
 		t.Error("an arc was served to a ref naming a different session")
 	}

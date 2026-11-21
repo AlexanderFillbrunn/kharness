@@ -4,6 +4,7 @@
 package harness
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
+	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
@@ -96,8 +98,8 @@ func Run(storePath, settingsPath, userID string) error {
 	// everything written reaches the screen: the user's own message and a
 	// cancel as much as what a run records. The guard turns a cancel recorded
 	// in the log into a run that stops, wherever the cancel was recorded.
-	persistor := agent.PublishEvents(
-		agent.MintIdentity(agent.GuardCancellation(store, store)),
+	persistor := common.PublishEvents(
+		common.MintIdentity(common.GuardCancellation(store, store)),
 		screenEvents{relay: relay},
 	)
 
@@ -110,17 +112,34 @@ func Run(storePath, settingsPath, userID string) error {
 	// run's own CancelFunc, but then the harness would exercise a path nothing
 	// else has.
 	cancels := agent.NewLocalCancels()
+	// The two enqueuers are built before the workers they dispatch to,
+	// because each worker is built with the other's queue: the arc worker
+	// starts the compactions its runs report, and the compaction worker's
+	// completion scan re-enqueues the arcs a landed compaction releases.
+	enqueuer := &arcEnqueuer{relay: relay}
+	compactionStart := &compactionStarter{relay: relay}
 	worker, err := agent.NewArcWorker(persistor, store, resolver, agent.NewLocalLease(),
 		agent.WithTokenSink(screenTokens{relay: relay}),
-		agent.WithCancelWatcher(cancels))
+		agent.WithCancelWatcher(cancels),
+		agent.WithCompactionStarter(compactionStart))
 	if err != nil {
 		return err
 	}
+	enqueuer.worker = worker
+
+	// The compaction worker serves the compactions a due round reports, under
+	// a lease scoped to the session rather than to an arc, since a compaction
+	// names no arc.
+	compactionWorker, err := agent.NewCompactionWorker(persistor, store, resolver,
+		agent.NewLocalSessionLease(), enqueuer, history.DefaultModes())
+	if err != nil {
+		return err
+	}
+	compactionStart.worker = compactionWorker
 
 	// The work queue in this harness is the worker itself: an arc a report
 	// opened becomes a work item served from the same place a person's turn
 	// is, in arrival order, and the lease keeps two runs off one arc.
-	enqueuer := &arcEnqueuer{worker: worker, relay: relay}
 
 	session := &session{
 		id:         storePath,
@@ -140,7 +159,7 @@ func Run(storePath, settingsPath, userID string) error {
 		return err
 	}
 	runner.attach(reports, localAgentID,
-		func(ref agent.TaskRef, err error) { relay.send(taskUnfiledMsg{ref: ref, err: err}) },
+		func(ref common.TaskRef, err error) { relay.send(taskUnfiledMsg{ref: ref, err: err}) },
 	)
 
 	// The conversation already on disk is shown before anything is asked, so
@@ -153,7 +172,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// The only runner here is this process, so a task in that log is one an
 	// earlier process died on. Left alone it would hold its arc open for
 	// ever.
-	settled, err := ingress.SettleAbandonedTasks(context.Background(), agent.AsAgent(localAgentID, persistor), recorded)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), common.AsAgent(localAgentID, persistor), recorded)
 	if err != nil {
 		return err
 	}
@@ -182,7 +201,7 @@ type arcEnqueuer struct {
 	relay  *sender
 }
 
-func (e *arcEnqueuer) Enqueue(_ context.Context, ref agent.ArcRef, agentID string) error {
+func (e *arcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, agentID string) error {
 	go func() {
 		for {
 			worked, err := e.worker.Work(context.Background(), ref, agentID)
@@ -198,6 +217,34 @@ func (e *arcEnqueuer) Enqueue(_ context.Context, ref agent.ArcRef, agentID strin
 		}
 	}()
 	return nil
+}
+
+// compactionStarter starts a compaction outside the run that reported it: the
+// compaction worker runs on its own goroutine, in parallel with the run, the
+// same way an arc item is served by the arc worker on its own. A run that
+// finds the session's lease held comes back later, since the holder's
+// compaction covers the request by then.
+type compactionStarter struct {
+	worker *agent.CompactionWorker
+	relay  *sender
+}
+
+func (s *compactionStarter) StartCompaction(_ context.Context, sessionID, requestID, agentID string) {
+	go func() {
+		for {
+			worked, err := s.worker.Work(context.Background(), sessionID, requestID, agentID)
+			if err != nil {
+				s.relay.send(arcDoneMsg{err: err})
+				return
+			}
+			if worked {
+				return
+			}
+			// The session is held by another compaction, which is reading
+			// the same log.
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 }
 
 // writeDefaultSettings leaves a settings file for the resolver to read, so a

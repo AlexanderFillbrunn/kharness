@@ -108,7 +108,7 @@ func (s *Store) Close() error {
 // number is the store's to assign, since nothing outside the lock knows the
 // position in the log, and it is the only thing the store assigns.
 //
-// An event arrives named and timed, which is agent.MintIdentity's job on the
+// An event arrives named and timed, which is common.MintIdentity's job on the
 // way in. One that does not is a bug in the writer and is refused, since a log
 // line with no ID is one nothing can refer to afterwards.
 //

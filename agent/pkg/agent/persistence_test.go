@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"testing"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 // saying so.
 func TestMintIdentityRefusesAnEventWithNoSession(t *testing.T) {
 	store := &fakePersistor{}
-	persistor := MintIdentity(store)
+	persistor := common.MintIdentity(store)
 
 	arcID := testArcID
 	_, err := persistor.Persist(context.Background(), &events.Event{
@@ -32,7 +33,7 @@ func TestMintIdentityRefusesAnEventWithNoSession(t *testing.T) {
 // The session the writer named is the one the log is handed.
 func TestMintIdentityKeepsTheWritersSession(t *testing.T) {
 	store := &fakePersistor{}
-	persistor := MintIdentity(store)
+	persistor := common.MintIdentity(store)
 
 	arcID := testArcID
 	written, err := persistor.Persist(context.Background(), &events.Event{
@@ -57,7 +58,7 @@ func TestMintIdentityKeepsTheWritersSession(t *testing.T) {
 // no opinion about IDs or clocks still writes a complete record.
 func TestMintIdentityMintsAnIDAndATime(t *testing.T) {
 	store := &fakePersistor{}
-	persistor := MintIdentity(store)
+	persistor := common.MintIdentity(store)
 
 	before := time.Now().UTC()
 	writtenFirst, err := persistor.Persist(context.Background(), &events.Event{
@@ -93,7 +94,7 @@ func TestMintIdentityMintsAnIDAndATime(t *testing.T) {
 // caller ties two events together before either is written, and how a record
 // of something that happened earlier keeps the time it happened.
 func TestMintIdentityKeepsWhatTheCallerSet(t *testing.T) {
-	persistor := MintIdentity(&fakePersistor{})
+	persistor := common.MintIdentity(&fakePersistor{})
 
 	at := time.Unix(1000, 0).UTC()
 	written, err := persistor.Persist(context.Background(), &events.Event{
@@ -116,7 +117,7 @@ func TestMintIdentityKeepsWhatTheCallerSet(t *testing.T) {
 // A caller may still be holding the event it handed over, so the stamp lands
 // on the copy that goes to the log and not on theirs.
 func TestMintIdentityLeavesTheCallersEventAlone(t *testing.T) {
-	persistor := MintIdentity(&fakePersistor{})
+	persistor := common.MintIdentity(&fakePersistor{})
 
 	original := &events.Event{
 		SessionID: testSessionID,
@@ -145,7 +146,7 @@ func (s *recordingSink) Consume(_ context.Context, evs ...*events.Event) {
 // all, since that number is how it knows what it missed.
 func TestPublishEventsPublishesWhatWasStored(t *testing.T) {
 	sink := &recordingSink{}
-	persistor := PublishEvents(&fakePersistor{next: 7}, sink)
+	persistor := common.PublishEvents(&fakePersistor{next: 7}, sink)
 
 	arcID := testArcID
 	if _, err := persistor.Persist(context.Background(),
@@ -171,7 +172,7 @@ func TestPublishEventsPublishesWhatWasStored(t *testing.T) {
 // A write that failed is not news.
 func TestPublishEventsSaysNothingAboutAFailedWrite(t *testing.T) {
 	sink := &recordingSink{}
-	persistor := PublishEvents(failingPersistor{}, sink)
+	persistor := common.PublishEvents(failingPersistor{}, sink)
 
 	arcID := testArcID
 	if _, err := persistor.Persist(context.Background(), &events.Event{
@@ -200,7 +201,7 @@ func TestARunPublishesEverythingItWrites(t *testing.T) {
 
 	h := userArcHistory(t)
 	if err := agent.Run(context.Background(), RunOptions{
-		Persistor: PublishEvents(store, sink),
+		Persistor: common.PublishEvents(store, sink),
 		History:   h,
 		ArcID:     testArcID,
 	}); err != nil {
@@ -218,7 +219,7 @@ func TestARunPublishesEverythingItWrites(t *testing.T) {
 
 func TestMintIdentityRefusesAnEventWithNoAgent(t *testing.T) {
 	store := &fakePersistor{}
-	persistor := MintIdentity(store)
+	persistor := common.MintIdentity(store)
 
 	arcID := testArcID
 	_, err := persistor.Persist(context.Background(), &events.Event{

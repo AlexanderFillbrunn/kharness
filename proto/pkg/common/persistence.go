@@ -39,7 +39,11 @@ type EventPersistor interface {
 type EventSource interface {
 	// GetEventsForArc returns the events one arc is run from: everything in
 	// its session up to and including the arc's opening event, plus everything
-	// correlated to the arc or to a task afterwards.
+	// correlated to the arc or to a task afterwards — COMPACTION_REQUESTED
+	// included, since it correlates to the arc it was produced in — plus the
+	// session-level records that carry no correlation ID, which is COMPACTED
+	// alone, so a compaction that landed after the arc opened still reaches
+	// the run that resumes it.
 	GetEventsForArc(ctx context.Context, ref ArcRef) ([]*events.Event, error)
 
 	// GetEventsForSession returns the session's whole log in the order it was

@@ -18,6 +18,12 @@ func (h *History) RenderChat() string {
 
 	var sections []string
 	sections = append(sections, fmt.Sprintf("Chat · session %s", h.SessionID))
+	// A compacted session is a summary block followed by the arcs that
+	// survived the cut.
+	if h.LastCompaction != nil {
+		sections = append(sections, fmt.Sprintf("Summary (through seq %d, %s)\n%s",
+			h.LastCompaction.ThroughSeq, h.LastCompaction.Method, h.LastCompaction.Summary))
+	}
 	for _, arc := range h.Arcs {
 		sections = append(sections, renderArc(h, arc))
 	}

@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"fmt"
@@ -23,7 +24,7 @@ type session struct {
 	// persistor is the store with the session's own writing rules around it:
 	// what it files is filed under this session, and it refuses work on an arc
 	// somebody has cancelled.
-	persistor agent.EventPersistor
+	persistor common.EventPersistor
 
 	// worker runs the arc, under the lease that keeps two runs off it. A
 	// person's turn acquires it like everything else that enters an arc.
@@ -36,7 +37,7 @@ type session struct {
 
 	// controller reaches the tasks this harness runs, for the cancels a
 	// command writes.
-	controller agent.TaskController
+	controller common.TaskController
 
 	actor users.Actor
 }
@@ -49,8 +50,8 @@ func (s *session) newArcID() string { return filestore.NewID() }
 // ref addresses one of this session's arcs. Everything that stores, locks or
 // routes by arc is told the session too, since nothing outside this harness
 // can assume there is only one.
-func (s *session) ref(arcID string) agent.ArcRef {
-	return agent.ArcRef{SessionID: s.id, ArcID: arcID}
+func (s *session) ref(arcID string) common.ArcRef {
+	return common.ArcRef{SessionID: s.id, ArcID: arcID}
 }
 
 // turn opens an arc with what the user said and runs the agent to the end of
@@ -131,7 +132,7 @@ func (s *session) cancelTask(ctx context.Context, taskID, reason string) error {
 	if s.controller == nil {
 		return nil
 	}
-	return s.controller.Cancel(ctx, agent.TaskRef{SessionID: s.id, ID: taskID}, reason)
+	return s.controller.Cancel(ctx, common.TaskRef{SessionID: s.id, ID: taskID}, reason)
 }
 
 // cancelArcTasks stops every unfinished task the arc started: a loop over the

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -142,11 +143,11 @@ func TestFileResolverIgnoresTheAgentIDAndRereadsOnChange(t *testing.T) {
 // a client says it back.
 type namedLLM struct{ name string }
 
-func (l *namedLLM) StreamResponse(context.Context, *history.History, *LLMOptions, Sink[RawToken]) (*LLMResponse, error) {
+func (l *namedLLM) StreamResponse(context.Context, *history.ModelTranscript, *LLMOptions, common.Sink[RawToken]) (*LLMResponse, error) {
 	return nil, fmt.Errorf("the named model %s was asked for a reply", l.name)
 }
 
-func (l *namedLLM) Response(context.Context, *history.History, *LLMOptions) (*LLMResponse, error) {
+func (l *namedLLM) Response(context.Context, *history.ModelTranscript, *LLMOptions) (*LLMResponse, error) {
 	return nil, fmt.Errorf("the named model %s was asked for a reply", l.name)
 }
 
@@ -313,5 +314,79 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 	resolver = NewFileResolver(path, nil, scriptedModels)
 	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("task_role against a model without a setter resolved")
+	}
+}
+
+// The compaction block resolves into the agent's config: the method, the
+// budgets with their defaults off the context window, the limits, and the
+// compactor the method names. The context window comes from the catalog,
+// overridable globally and per model in the defaults section.
+func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agents.json")
+	settings := `{
+		"system_prompt": "a prompt",
+		"model": {"source": "test", "name": "gpt-4o"},
+		"compaction": {"method": "prune", "keep_recent_tokens": 500, "max_tool_result_chars": 2000},
+		"defaults": {"context_window": 64000, "context_windows": {"test/gpt-4o": 90000}}
+	}`
+	if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	resolver := NewFileResolver(path, nil, scriptedModels)
+	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	cfg := agent.config
+	if !cfg.Compaction {
+		t.Error("compaction is off for a prune method in the settings")
+	}
+	if cfg.ContextWindow != 90000 {
+		t.Errorf("context window = %d, want the per-model override 90000", cfg.ContextWindow)
+	}
+	if cfg.HigherBudget != 90000-ContextWindowReserve {
+		t.Errorf("higher budget = %d, want the context window less the reserve (%d)", cfg.HigherBudget, 90000-ContextWindowReserve)
+	}
+	if cfg.LowerBudget != 90000*3/4 {
+		t.Errorf("lower budget = %d, want 3/4 of the context window", cfg.LowerBudget)
+	}
+	if cfg.MaxToolResultChars != 2000 {
+		t.Errorf("max tool result chars = %d, want the settings' 2000", cfg.MaxToolResultChars)
+	}
+	// The arc threshold and the user-message cap default to disabled (-1).
+	if cfg.MaxUserMessageChars != -1 || cfg.ArcThresholdTokens != -1 {
+		t.Errorf("limits default = %d/%d, want -1 (disabled)", cfg.MaxUserMessageChars, cfg.ArcThresholdTokens)
+	}
+	// The compactor is not on the agent anymore; the resolver equips a
+	// compaction worker with a plan instead.
+	plan, err := resolver.ResolveCompaction(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveCompaction: %v", err)
+	}
+	if _, ok := plan.Compactor.(PruneCompactor); !ok {
+		t.Errorf("compactor = %T, want PruneCompactor for the prune method", plan.Compactor)
+	}
+	if plan.Limits.KeepRecentTokens != 500 || plan.Limits.MaxToolResultChars != 2000 || plan.Limits.ArcThresholdTokens != -1 {
+		t.Errorf("plan limits = %+v, want the settings' 500/2000 and the -1 default", plan.Limits)
+	}
+
+	// A settings file with no compaction block disables compaction.
+	plain := filepath.Join(t.TempDir(), "plain.json")
+	if err := os.WriteFile(plain, []byte(settingsJSON("p", "unknown-model")), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	resolver = NewFileResolver(plain, nil, scriptedModels)
+	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if agent.config.Compaction || agent.config.compactionEnabled() {
+		t.Errorf("compaction is on without a block: %+v", agent.config)
+	}
+	if _, err := resolver.ResolveCompaction(context.Background(), testAgentID); err == nil {
+		t.Error("ResolveCompaction succeeded without a compaction block")
+	}
+	if agent.config.ContextWindow != DefaultContextWindow {
+		t.Errorf("context window = %d, want the catalog default %d for an unknown model", agent.config.ContextWindow, DefaultContextWindow)
 	}
 }

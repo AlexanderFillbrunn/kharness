@@ -100,8 +100,9 @@ Triggers and suspension.
 *REQ-9* `CompactionDue(lower)`: the last reply's input tokens (usage, else
 the estimate) exceed the lower budget, that reply sits above the watermark
 in force, and no `COMPACTION_REQUESTED` is unsatisfied. The loop checks
-after every round, writes the request and enqueues the work item, and the
-run continues (mid-run async). See When compaction runs.
+after every round, writes the request and notifies the worker, which starts
+the compaction outside the run, and the run continues (mid-run async). See
+When compaction runs.
 
 *REQ-10* The higher budget is checked before a run (the admission check
 estimates the would-be transcript; over budget it writes the request and an
@@ -135,11 +136,13 @@ messages are never thinned. See Overflow recovery.
 Overflow recovery.
 
 *REQ-15* The `LLM` interface gains a typed error (status, type, code,
-message), a stop reason on the reply, and a per-vendor classifier
-`IsContextOverflow`: status plus a context code, a 413, a message pattern
-where no code exists, an error object inside a 200 stream, a final length
-stop — never the status alone, never an output-limit stop. See Overflow
-recovery.
+message) and returns a `*ContextOverflowError` — that error, plus the stop
+reason where the whole signal was a final length stop on an otherwise
+successful reply, which then comes back as a non-nil partial reply alongside
+the error — where the vendor recognises the context budget: status plus a
+context code, a 413, a message pattern where no code exists, an error object
+inside a 200 stream — never the status alone, never an output-limit stop. See
+Overflow recovery.
 
 *REQ-16* A classified rejection mid-run writes a non-fatal `Error`
 correlated to the arc, then a `COMPACTION_REQUESTED` if none stands, then an
@@ -245,10 +248,11 @@ mechanism.
 
 *The worked arc is the last arc of the fetched history.* `RunOptions.ArcID`
 names the arc that is fetched and worked, and because the fetch cuts the
-log at that arc, it is the last arc in the history the run holds — which is
-what the LLM client's target selection assumes. Keep that explicit (pass
-the arc ID through `LLMOptions`) when compaction lands; the `Compactor`
-takes a `ModelTranscript`, so it is unaffected.
+log at that arc, it is the last arc in the history the run holds. The run
+projects that arc itself (`h.Project(arcID, modes, opts)`) and hands the
+`ModelTranscript` to the model client, so the LLM interface never sees the
+log — and the `Compactor` takes the same `ModelTranscript`, so both model
+calls have one input shape.
 
 *The context window is a lookup, not a field.* `ContextWindow(modelRef) int`
 over a catalog keyed by model ref in `pkg/agent`, with `DefaultContextWindow`
@@ -261,11 +265,14 @@ cross-cutting defaults.
 codec cases; `LastCompaction`, `CompactionDue` and the suspension states in
 the fold; the summary/skeleton/thinning/invocation-note rendering in the
 projection (and the PROJECTION.md sections, including dropping "a note is
-one line"); the typed LLM error, the stop reason on the reply and the
-per-vendor classifier (`openAIError` flattens to a string today and
-`finishReason` is parsed but dropped); the `ceil(chars/4)` estimator in
+one line"); the typed LLM error and the `*ContextOverflowError` a vendor
+returns for an over-budget rejection (`openAIError` flattens to a string
+today and `finishReason` is parsed but dropped); the `ceil(chars/4)`
+estimator in
 `pkg/history`; a non-arc work-item kind and a session-scoped lease in the
-queue and worker (queue items are arc-shaped today); the budget and limit
+queue and worker (built: `WorkItem.Kind`/`RequestID`, `RedisWorkQueue.EnqueueCompaction`
+and a kind-routed `Consume`, `RedisSessionLease`; devchat serves compaction
+items through a local `CompactionWorker`); the budget and limit
 fields on `AgentConfig` and in the settings schema. Note the module
 boundaries: `devchat/` and `redisinfra/` are separate Go modules with no
 `go.work` at the root.
@@ -779,8 +786,8 @@ a provider that reports nothing would otherwise never be found due.
 
 *In the loop, after every round, the lower budget.* The loop consults the
 predicate after each reply. Where due, it writes a `COMPACTION_REQUESTED`
-naming the current watermark and enqueues the compaction work item, and
-nothing is deferred: the compaction proceeds in parallel with the runs
+naming the current watermark and notifies the worker's compaction starter,
+and nothing is deferred: the compaction proceeds in parallel with the runs
 still going. A run in flight is unaffected by its landing, and the next
 turn reads the compaction in force then. The check after the final round
 subsumes a check at arc close. The request in the log makes the decision
@@ -844,7 +851,8 @@ in the log serves every suspension this way, which is what the
 completion scan's link is made of. A suspension written by the
 admission check, with no other arc suspended anywhere, names the same
 kind of cause. The run then ends its in-flight period and the arc is
-left unworked; nothing is enqueued and nothing waits on a condition. A
+left unworked; nothing waits on a condition, and the request in the log is
+what the notified starter's compaction serves. A
 suspension has three derived states, all read from the log: *outstanding*
 until a `COMPACTED` covering the request's watermark lands; *released*
 from then until the arc is worked again; *resolved* once a response
@@ -906,17 +914,19 @@ request; and the run ends its in-flight period. The completion scan
 resumes the arc on the compacted transcript.
 
 Recognising the rejection is the vendor's job at the `LLM` boundary, not
-the loop's: the interface gains a typed error carrying the status, type,
-code and message of the provider's complaint, a stop reason on the reply,
-and a classifier saying whether an error or a stop is a budget rejection.
-Each vendor maps its own wire format — a status with a context code
-(OpenAI's `context_length_exceeded`), a 413 where a gateway uses one, a
-message pattern where no code exists (Anthropic's "prompt is too long"),
-an error object inside an otherwise-200 stream, and a final length stop,
-never an output-limit stop such as `max_tokens`. Never the status alone. A
-vendor with no reliable signal classifies nothing, its rejections stay
-fatal, and the proactive budgets carry it: the backstop simply never fires
-for that vendor.
+the loop's: `Response` and `StreamResponse` return a `*ContextOverflowError`
+where the provider's complaint is the budget — the error carrying the status,
+type, code and message of the rejection, plus the stop reason where a final
+length stop was the whole signal (the partial reply comes back non-nil
+alongside it, so it is still recorded). Each vendor maps its own wire format
+— a status with a context code (OpenAI's `context_length_exceeded`), a 413
+where a gateway uses one, a message pattern where no code exists
+(Anthropic's "prompt is too long"), an error object inside an
+otherwise-200 stream, and a final length stop, never an output-limit stop
+such as `max_tokens`. Never the status alone. A vendor with no reliable
+signal returns no `ContextOverflowError` at all, its rejections stay fatal,
+and the proactive budgets carry it: the backstop simply never fires for that
+vendor.
 
 The recovery is bounded to one per arc, and the bound is derived, not
 recorded: the fold already derives the suspension states, so a classified
@@ -942,8 +952,8 @@ the arc unworked; the completion scan requeues it. Every arc is worked
 entirely against one transcript.
 
 *Never mid-run, async.* The same checks, but the requesting run is not
-suspended: the request is written, the work item enqueued, and the run
-starts on the transcript in force. The next run reads the compaction in
+suspended: the request is written, the worker's starter notified, and the run
+continues on the transcript in force. The next run reads the compaction in
 force at its start. `ARC_SUSPENDED` is never written for the lower
 budget; the higher budget suspends as in every mode, at the admission
 check and between rounds.
@@ -1081,8 +1091,9 @@ requests were written in the same instant by two workers crossing the lower
 budget together; the predicate's unsatisfied-request clause narrows that
 case to the instant itself. The lease's expiry bounds a worker that died
 computing, and autoclaim is the whole of the reaping a compaction needs.
-A taker first checks the log: an item whose request is covered by a
-`COMPACTED` that has landed is discarded, and otherwise the item is computed.
+A taker that finds the lease free reads the log once, under the lease: an
+item whose request is covered by a `COMPACTED` that has landed is discarded,
+and otherwise the item is computed on that same read.
 A worker whose lease expires while it is still working writes a `COMPACTED`
 that is accepted anyway, because the coverage rule does not care about
 arrival order.
@@ -1189,8 +1200,8 @@ bound rule tests, the
 bound rule itself that computes the watermark from the open arcs and the
 tail cap — an arc's opening or its live boundary, whichever the threshold
 allows — the loop's check after every round that writes a
-`COMPACTION_REQUESTED` and enqueues the compaction
-work item when the fold says one is due, the compaction lease scoped to
+`COMPACTION_REQUESTED` and notifies the worker's compaction starter
+when the fold says one is due, the compaction lease scoped to
 the session and the leaving-unacknowledged of an item that finds it held,
 the discard of an item whose request a landed `COMPACTED` already covers,
 the write of an `ARC_SUSPENDED` by a suspending run and by the admission
@@ -1200,11 +1211,12 @@ an outstanding suspension, the higher-budget check before a run and between
 rounds, and
 the autoclaim that reaps an expired item so that a dead worker's compaction
 is taken up by another; and the LLM-boundary classification for overflow
-recovery — a typed error with the status, type, code and message, a stop
-reason on the reply, and an `IsContextOverflow`-style classifier each vendor
-fills in — with the loop's handling of a classified rejection: the
-non-fatal `Error`, the request where none stands, the `ARC_SUSPENDED`, and
-the one-recovery-per-arc bound read off the derived suspension states.
+recovery — each vendor returns a `*ContextOverflowError` (its typed error
+with the status, type, code and message, plus the stop reason where a final
+length stop was the whole signal and the partial reply alongside it) — with
+the loop's handling of a classified rejection: the non-fatal `Error`, the
+request where none stands, the `ARC_SUSPENDED`, and the one-recovery-per-arc
+bound read off the derived suspension states.
 `TaskReports` is unchanged, since a report is never held. The settings
 schema (`AgentSettings`) gains the compaction block and a defaults section —
 context window, timeouts — which `FileResolver.build` resolves into
@@ -1363,8 +1375,8 @@ is a note, never an `IsError` tool failure.
 over-budget transcript: non-fatal `Error`, request if none stands,
 `ARC_SUSPENDED`, resume after the compaction lands; once per arc.
 
-*Classified rejection* — a provider error or length stop that the vendor's
-`IsContextOverflow` classifier maps to the context budget.
+*Classified rejection* — a provider error or final length stop that the
+vendor maps to the context budget and returns as a `*ContextOverflowError`.
 
 *Stop reason* — why the provider ended a reply; a final `length` stop may
 signal the budget, while an output-limit stop such as `max_tokens` never

@@ -25,6 +25,9 @@ const (
 	blockNote
 	// blockTask is an async task: what it is, and the last thing it said.
 	blockTask
+	// blockSummary is a compaction's summary: what the model is told in place
+	// of everything below the watermark.
+	blockSummary
 )
 
 // toolState is how a call is doing, which is not its recorded status: a call
@@ -85,6 +88,11 @@ func newTranscript() *transcript {
 
 // fromHistory fills a transcript with a conversation that is already recorded.
 func (t *transcript) fromHistory(h *history.History) {
+	// A compacted session opens with the summary in force, followed by the
+	// arcs above the watermark — the same shape RenderChat draws.
+	if h.LastCompaction != nil {
+		t.blocks = append(t.blocks, summaryBlock(h.LastCompaction.ThroughSeq, h.LastCompaction.Method, h.LastCompaction.Summary))
+	}
 	for _, arc := range h.Arcs {
 		author := "you"
 		if arc.Actor != nil {
@@ -251,6 +259,24 @@ func (t *transcript) event(ev *events.Event) {
 
 	case events.ErrorPayload:
 		t.blocks = append(t.blocks, &block{kind: blockError, text: payload.Message})
+
+	case events.CompactionRequestedPayload:
+		t.note(fmt.Sprintf("compaction requested (watermark seq %d)", payload.Watermark))
+
+	case events.ArcSuspendedPayload:
+		t.note("arc suspended until the compaction lands")
+
+	case events.CompactedPayload:
+		t.blocks = append(t.blocks, summaryBlock(payload.ThroughSeq, payload.Method, payload.Summary))
+	}
+}
+
+// summaryBlock is the block one compaction's summary gets, in the transcript
+// a recorded session opens with and in the event stream as a COMPACTED lands.
+func summaryBlock(through int, method, summary string) *block {
+	return &block{
+		kind: blockSummary,
+		text: fmt.Sprintf("Summary (through seq %d, %s)\n%s", through, method, summary),
 	}
 }
 

@@ -2,13 +2,12 @@ package redisinfra
 
 import (
 	"context"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
-
-	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // newRedis starts an in-process Redis and returns a client on it, so that no
@@ -23,7 +22,7 @@ func newRedis(t *testing.T) (*redis.Client, *miniredis.Miniredis) {
 
 // acquire takes the lease on a ref, failing the test on the outcomes an
 // acquirer is not supposed to see.
-func acquire(t *testing.T, lease *RedisLease, ref agent.ArcRef) func() {
+func acquire(t *testing.T, lease *RedisLease, ref common.ArcRef) func() {
 	t.Helper()
 	release, ok, err := lease.Acquire(context.Background(), ref)
 	if err != nil || !ok {
@@ -35,7 +34,7 @@ func acquire(t *testing.T, lease *RedisLease, ref agent.ArcRef) func() {
 func TestLeaseExcludesASecondHolder(t *testing.T) {
 	client, _ := newRedis(t)
 	lease := NewRedisLease(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	release := acquire(t, lease, ref)
 	defer release()
@@ -52,7 +51,7 @@ func TestLeaseExcludesASecondHolder(t *testing.T) {
 func TestLeaseReleaseLetsTheNextHolderIn(t *testing.T) {
 	client, _ := newRedis(t)
 	lease := NewRedisLease(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	acquire(t, lease, ref)()
 
@@ -62,7 +61,7 @@ func TestLeaseReleaseLetsTheNextHolderIn(t *testing.T) {
 func TestLeaseReleaseDoesNotDeleteAnotherHoldersLease(t *testing.T) {
 	client, server := newRedis(t)
 	lease := NewRedisLease(client, WithLeaseTTL(50*time.Millisecond), WithRenewalInterval(0))
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	// The first holder's TTL runs out, so the second takes the arc over.
 	staleRelease := acquire(t, lease, ref)
@@ -82,7 +81,7 @@ func TestLeaseReleaseDoesNotDeleteAnotherHoldersLease(t *testing.T) {
 func TestLeaseTTLExpiryFreesTheArc(t *testing.T) {
 	client, server := newRedis(t)
 	lease := NewRedisLease(client, WithLeaseTTL(50*time.Millisecond), WithRenewalInterval(0))
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	acquire(t, lease, ref)
 	server.FastForward(100 * time.Millisecond)
@@ -95,7 +94,7 @@ func TestLeaseUnreachableIsAnErrorNotARefusal(t *testing.T) {
 	lease := NewRedisLease(client)
 	server.Close()
 
-	_, ok, err := lease.Acquire(context.Background(), agent.ArcRef{SessionID: "s", ArcID: "a"})
+	_, ok, err := lease.Acquire(context.Background(), common.ArcRef{SessionID: "s", ArcID: "a"})
 	if err == nil {
 		t.Fatal("an unreachable lease service must be an error, since a caller that read it as a refusal would run the arc twice")
 	}
@@ -108,7 +107,7 @@ func TestLeaseHeartbeatKeepsASlowRunHolding(t *testing.T) {
 	client, server := newRedis(t)
 	ttl := 150 * time.Millisecond
 	lease := NewRedisLease(client, WithLeaseTTL(ttl), WithRenewalInterval(50*time.Millisecond))
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	release := acquire(t, lease, ref)
 	defer release()
@@ -135,7 +134,7 @@ func TestLeaseHeartbeatDoesNotResurrectALostLease(t *testing.T) {
 	client, server := newRedis(t)
 	ttl := 100 * time.Millisecond
 	lease := NewRedisLease(client, WithLeaseTTL(ttl), WithRenewalInterval(50*time.Millisecond))
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	// The first holder's lease expires while its heartbeat is running, and
 	// the second holder takes the arc over.
@@ -151,4 +150,80 @@ func TestLeaseHeartbeatDoesNotResurrectALostLease(t *testing.T) {
 		t.Fatalf("a heartbeat extended a lease its holder had lost: ok %v, err %v", ok, err)
 	}
 	staleRelease()
+}
+
+// acquireSession takes the session lease, failing the test on the outcomes
+// an acquirer is not supposed to see.
+func acquireSession(t *testing.T, lease *RedisSessionLease, sessionID string) func() {
+	t.Helper()
+	release, ok, err := lease.Acquire(context.Background(), sessionID)
+	if err != nil || !ok {
+		t.Fatalf("could not take the session lease on %s: ok %v, err %v", sessionID, ok, err)
+	}
+	return release
+}
+
+func TestSessionLeaseExcludesASecondCompactionOfTheSession(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := NewRedisSessionLease(client)
+
+	release := acquireSession(t, lease, "s")
+	defer release()
+
+	_, ok, err := lease.Acquire(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("a held session is not an error: %v", err)
+	}
+	if ok {
+		t.Fatal("a held session's compaction lease was taken twice")
+	}
+}
+
+func TestSessionLeaseIsScopedToTheSession(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := NewRedisSessionLease(client)
+
+	// One session's compaction lease says nothing about another's.
+	release := acquireSession(t, lease, "s1")
+	defer release()
+
+	acquireSession(t, lease, "s2")()
+}
+
+func TestSessionLeaseReleaseLetsTheNextWorkerIn(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := NewRedisSessionLease(client)
+
+	acquireSession(t, lease, "s")()
+
+	acquireSession(t, lease, "s")()
+}
+
+func TestSessionLeaseTTLExpiryFreesTheSession(t *testing.T) {
+	client, server := newRedis(t)
+	lease := NewRedisSessionLease(client, WithLeaseTTL(50*time.Millisecond), WithRenewalInterval(0))
+
+	acquireSession(t, lease, "s")
+	server.FastForward(100 * time.Millisecond)
+
+	acquireSession(t, lease, "s")()
+}
+
+func TestSessionLeaseReleaseDoesNotDeleteAnotherHoldersLease(t *testing.T) {
+	client, server := newRedis(t)
+	lease := NewRedisSessionLease(client, WithLeaseTTL(50*time.Millisecond), WithRenewalInterval(0))
+
+	// The first holder's TTL runs out, so the second takes the session over.
+	staleRelease := acquireSession(t, lease, "s")
+	server.FastForward(100 * time.Millisecond)
+	freshRelease := acquireSession(t, lease, "s")
+	defer freshRelease()
+
+	// The first holder finishes and releases, which must leave the second
+	// holder's lease alone.
+	staleRelease()
+
+	if _, ok, err := lease.Acquire(context.Background(), "s"); err != nil || ok {
+		t.Fatalf("a late release took the next holder's lease: ok %v, err %v", ok, err)
+	}
 }

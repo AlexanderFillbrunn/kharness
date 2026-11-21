@@ -280,6 +280,11 @@ type Arc struct {
 	Responses []*AssistantMessage `json:"responses"`
 
 	Errors []*Error `json:"errors"`
+
+	// Suspensions are the ARC_SUSPENDED records against this arc, in order:
+	// each one pauses the arc until the compaction named by its causation
+	// lands. The derived state of each is read off the log, never stored.
+	Suspensions []*ArcSuspension `json:"suspensions,omitempty"`
 }
 
 // Status computes the status of an arc. It is not a field lookup and should be
@@ -474,6 +479,17 @@ type History struct {
 	// in increasing sequence order and may skip numbers, since a history holds
 	// one arc's slice of the log.
 	LastSeq int
+
+	// LastCompaction is the compaction in force: the COMPACTED with the
+	// greatest ThroughSeq, regardless of when it arrived. Coverage, not
+	// recency, decides, so a duplicated or out-of-order compaction is
+	// harmless. Nil where the session has never compacted.
+	LastCompaction *Compacted
+
+	// CompactionRequests holds every COMPACTION_REQUESTED in the log, keyed by
+	// event ID, in the order they were written. A request is satisfied once a
+	// COMPACTED covering its watermark has landed.
+	CompactionRequests []*CompactionRequest
 }
 
 // NewHistory returns an empty history for a session. LastSeq starts at -1 so
@@ -557,6 +573,9 @@ func FoldStateFromHistory(h *History) *FoldState {
 	for _, task := range h.Tasks {
 		state.asyncTasks[task.ID] = task
 	}
+	for _, req := range h.CompactionRequests {
+		state.compactionRequests[req.ID] = req
+	}
 	return state
 }
 
@@ -622,6 +641,9 @@ var applyFuncs = map[events.EventType]applyFunc{
 	events.GuardrailBlockedEventType:        (*History).applyGuardrailBlocked,
 	events.CancelEventType:                  (*History).applyCancel,
 	events.ArcClosedEventType:               (*History).applyArcClosed,
+	events.CompactionRequestedEventType:     (*History).applyCompactionRequested,
+	events.ArcSuspendedEventType:            (*History).applyArcSuspended,
+	events.CompactedEventType:               (*History).applyCompacted,
 }
 
 // applyEvent routes an event to its fold function.

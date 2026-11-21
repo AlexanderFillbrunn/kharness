@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"testing"
@@ -15,7 +16,7 @@ type streamingLLM struct {
 	reply  *LLMResponse
 }
 
-func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, tokens Sink[RawToken]) (*LLMResponse, error) {
+func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.ModelTranscript, _ *LLMOptions, tokens common.Sink[RawToken]) (*LLMResponse, error) {
 	for i, piece := range l.pieces {
 		if err := tokens.Consume(RawToken{Content: piece, Seq: i}); err != nil {
 			return nil, err
@@ -24,15 +25,15 @@ func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.History, _ *
 	return l.reply, nil
 }
 
-func (l *streamingLLM) Response(ctx context.Context, h *history.History, opts *LLMOptions) (*LLMResponse, error) {
-	return l.StreamResponse(ctx, h, opts, SinkFromFunc(func(RawToken) error { return nil }))
+func (l *streamingLLM) Response(ctx context.Context, t *history.ModelTranscript, opts *LLMOptions) (*LLMResponse, error) {
+	return l.StreamResponse(ctx, t, opts, common.SinkFromFunc(func(RawToken) error { return nil }))
 }
 
 // A run nobody is watching streams into nothing and records the same log, so a
 // worker with no interface attached does not take a different path through the
 // agent from one that has.
 func TestARunWithNoTokenSinkRecordsTheSameLog(t *testing.T) {
-	log := func(tokens Sink[Token]) string {
+	log := func(tokens common.Sink[Token]) string {
 		t.Helper()
 		store := &fakePersistor{next: 1}
 		agent, err := NewAgent(nil, nil, &streamingLLM{
@@ -50,7 +51,7 @@ func TestARunWithNoTokenSinkRecordsTheSameLog(t *testing.T) {
 		return typesOf(store.persisted)
 	}
 
-	watched := log(SinkFromFunc(func(Token) error { return nil }))
+	watched := log(common.SinkFromFunc(func(Token) error { return nil }))
 	if unwatched := log(nil); unwatched != watched {
 		t.Errorf("unwatched run wrote %s, watched run wrote %s", unwatched, watched)
 	}
@@ -74,7 +75,7 @@ func TestStreamedTokensNameTheMessageThatRecordsThem(t *testing.T) {
 		Persistor: store,
 		History:   userArcHistory(t),
 		ArcID:     testArcID,
-		Tokens: SinkFromFunc(func(tok Token) error {
+		Tokens: common.SinkFromFunc(func(tok Token) error {
 			streamed = append(streamed, tok)
 			return nil
 		}),
@@ -124,7 +125,7 @@ func TestAFailingTokenSinkDoesNotFailTheRun(t *testing.T) {
 	h := userArcHistory(t)
 	if err := agent.Run(context.Background(), RunOptions{
 		Persistor: store, History: h, ArcID: testArcID,
-		Tokens: SinkFromFunc(func(Token) error { return errors.New("the watcher is gone") }),
+		Tokens: common.SinkFromFunc(func(Token) error { return errors.New("the watcher is gone") }),
 	}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -170,7 +171,7 @@ func TestAWorkerAddressesTheTokensItStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	if _, err := worker.Work(context.Background(), ArcRef{SessionID: testSessionID, ArcID: resultArc}, testAgentID); err != nil {
+	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: resultArc}, testAgentID); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"fmt"
@@ -25,7 +26,7 @@ type StreamToken struct {
 
 // TokenSink takes a reply as it is written.
 //
-// Like EventSink it returns nothing, so a watcher cannot fail a run, and it
+// Like common.EventSink it returns nothing, so a watcher cannot fail a run, and it
 // must return promptly: it is called from inside the model's stream.
 //
 // A token is not a record. It is lost on a dropped connection and never
@@ -44,8 +45,8 @@ type TokenSink interface {
 // It holds nothing belonging to one session. The session arrives with the arc,
 // so one worker serves a whole tier.
 type ArcWorker struct {
-	persistor EventPersistor
-	source    EventSource
+	persistor common.EventPersistor
+	source    common.EventSource
 	resolver  AgentResolver
 	lease     ArcLease
 
@@ -56,6 +57,14 @@ type ArcWorker struct {
 	// cancels stops a run that is already inside a tool or a stream, and is
 	// nil for a worker that only stops between steps.
 	cancels CancelWatcher
+
+	// compactions starts the compaction a due round reports, outside the run,
+	// and is nil for a worker that leaves the request standing in the log.
+	compactions CompactionStarter
+
+	// modes is how much of the log the worker's runs disclose in their
+	// projections.
+	modes history.Modes
 }
 
 // ArcWorkerOption configures parts of a worker that not every worker has.
@@ -73,16 +82,37 @@ func WithCancelWatcher(cancels CancelWatcher) ArcWorkerOption {
 	return func(w *ArcWorker) { w.cancels = cancels }
 }
 
+// CompactionStarter starts the compaction a COMPACTION_REQUESTED asks for,
+// outside the run that wrote it: a queue deployment enqueues the work item
+// for the compaction worker to be served off it, a queue-less one runs the
+// worker on a goroutine. It must return promptly — the run is waiting on the
+// notification, not on the compaction.
+type CompactionStarter interface {
+	StartCompaction(ctx context.Context, sessionID, requestID, agentID string)
+}
+
+// WithCompactionStarter gives a worker the starter a run's compaction
+// notification reaches, when a round finds compaction due.
+func WithCompactionStarter(starter CompactionStarter) ArcWorkerOption {
+	return func(w *ArcWorker) { w.compactions = starter }
+}
+
+// WithModes sets how much of the log the worker's runs disclose in their
+// projections. Without one, DefaultModes.
+func WithModes(modes history.Modes) ArcWorkerOption {
+	return func(w *ArcWorker) { w.modes = modes }
+}
+
 // NewArcWorker builds a worker from the parts a run is made of. A nil lease
 // becomes a LocalLease.
-func NewArcWorker(persistor EventPersistor, source EventSource, resolver AgentResolver, lease ArcLease, options ...ArcWorkerOption) (*ArcWorker, error) {
+func NewArcWorker(persistor common.EventPersistor, source common.EventSource, resolver AgentResolver, lease ArcLease, options ...ArcWorkerOption) (*ArcWorker, error) {
 	if persistor == nil || source == nil || resolver == nil {
 		return nil, errors.New("an arc worker needs a persistor, a source and a resolver")
 	}
 	if lease == nil {
 		lease = NewLocalLease()
 	}
-	worker := &ArcWorker{persistor: persistor, source: source, resolver: resolver, lease: lease}
+	worker := &ArcWorker{persistor: persistor, source: source, resolver: resolver, lease: lease, modes: history.DefaultModes()}
 	for _, option := range options {
 		option(worker)
 	}
@@ -97,7 +127,7 @@ func NewArcWorker(persistor EventPersistor, source EventSource, resolver AgentRe
 // a caller that cannot name one has nothing to hand the worker. The agent is
 // resolved once the arc is held, so a resolver that cannot build it fails a
 // worker that owns the arc rather than one queued behind somebody else.
-func (w *ArcWorker) Work(ctx context.Context, ref ArcRef, agentID string) (bool, error) {
+func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string) (bool, error) {
 	if agentID == "" {
 		return false, errors.New("a work item names no agent")
 	}
@@ -123,11 +153,27 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef, agentID string) (bool,
 		return false, err
 	}
 	return true, agent.Run(ctx, RunOptions{
-		Persistor: AsAgent(agentID, w.persistor),
+		Persistor: common.AsAgent(agentID, w.persistor),
 		History:   h,
 		ArcID:     ref.ArcID,
+		Modes:     w.modes,
 		Tokens:    w.tokenSink(ctx, ref),
+		OnCompactionDue: func(notifyCtx context.Context, sessionID, requestID string) {
+			w.notifyCompactionDue(notifyCtx, sessionID, requestID, agentID)
+		},
 	})
+}
+
+// notifyCompactionDue hands a run's compaction notification to the starter.
+// The context is detached from the run's, because a run that suspends right
+// after writing the request is over by the time the compaction should start,
+// and the compaction must not end with it. A nil starter leaves the request
+// standing in the log for anyone to take.
+func (w *ArcWorker) notifyCompactionDue(ctx context.Context, sessionID, requestID, agentID string) {
+	if w.compactions == nil {
+		return
+	}
+	w.compactions.StartCompaction(context.WithoutCancel(ctx), sessionID, requestID, agentID)
 }
 
 // watchForCancel derives the context the run is stopped through, and a stop to
@@ -138,7 +184,7 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef, agentID string) (bool,
 // delivered here, so nothing falls between the two. A watcher that misses it
 // anyway only costs latency, because the guard still refuses the run's next
 // guarded write.
-func (w *ArcWorker) watchForCancel(ctx context.Context, ref ArcRef) (context.Context, func()) {
+func (w *ArcWorker) watchForCancel(ctx context.Context, ref common.ArcRef) (context.Context, func()) {
 	if w.cancels == nil {
 		return ctx, func() {}
 	}
@@ -166,12 +212,12 @@ func (w *ArcWorker) watchForCancel(ctx context.Context, ref ArcRef) (context.Con
 //
 // It is nil for a worker nobody is watching, which is what stops the agent
 // paying for a sink that discards.
-func (w *ArcWorker) tokenSink(ctx context.Context, ref ArcRef) Sink[Token] {
+func (w *ArcWorker) tokenSink(ctx context.Context, ref common.ArcRef) common.Sink[Token] {
 	if w.tokens == nil {
 		return nil
 	}
 	sink := w.tokens
-	return SinkFromFunc(func(tok Token) error {
+	return common.SinkFromFunc(func(tok Token) error {
 		sink.Token(ctx, StreamToken{
 			SessionID: ref.SessionID,
 			ArcID:     ref.ArcID,
@@ -184,7 +230,7 @@ func (w *ArcWorker) tokenSink(ctx context.Context, ref ArcRef) Sink[Token] {
 }
 
 // arcHistory loads and folds the events one arc is run from.
-func (w *ArcWorker) arcHistory(ctx context.Context, ref ArcRef) (*history.History, error) {
+func (w *ArcWorker) arcHistory(ctx context.Context, ref common.ArcRef) (*history.History, error) {
 	stored, err := w.source.GetEventsForArc(ctx, ref)
 	if err != nil {
 		return nil, err

@@ -360,3 +360,74 @@ func (CancelPayload) EventType() EventType {
     return CancelEventType
 }
 func (CancelPayload) eventPayload() {}
+
+// ProjectionModes is the wire form of the projection settings a summary was
+// made under. The projection itself lives in the agent module
+// (history.Modes), which this package cannot import — the dependency runs the
+// other way — so the record carries the same settings as plain strings and
+// the agent module converts between the two.
+type ProjectionModes struct {
+	ForeignArc string `json:"foreign_arc,omitempty"`
+	Pending    string `json:"pending,omitempty"`
+	ToolEvents string `json:"tool_events,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Interrupt  string `json:"interrupt,omitempty"`
+	QuoteLimit int    `json:"quote_limit,omitempty"`
+}
+
+// CompactionRequestedPayload records that a compaction of the session was
+// asked for. The event correlates to the arc the asking run was working, or
+// to no arc for a request written outside any run, and is satisfied by the
+// first COMPACTED whose watermark covers Watermark.
+type CompactionRequestedPayload struct {
+	// Watermark is the cut the compaction is to be computed against: the
+	// watermark of the compaction in force when the request was written.
+	Watermark int `json:"watermark"`
+
+	// Actor is who asked, where a person did.
+	Actor *users.Actor `json:"actor,omitempty"`
+}
+
+func (CompactionRequestedPayload) EventType() EventType {
+	return CompactionRequestedEventType
+}
+func (CompactionRequestedPayload) eventPayload() {}
+
+// ArcSuspendedPayload pauses an arc until the compaction it names has landed.
+// The event correlates to the arc it pauses and carries no other payload.
+type ArcSuspendedPayload struct {
+	// CausationID names the COMPACTION_REQUESTED event the suspension waits
+	// on: the wait is for the compaction that satisfies that request.
+	CausationID string `json:"causation_id"`
+}
+
+func (ArcSuspendedPayload) EventType() EventType {
+	return ArcSuspendedEventType
+}
+func (ArcSuspendedPayload) eventPayload() {}
+
+// CompactedPayload is the result of one compaction. The event carries no
+// correlation ID — the cutoff rule gives it its scope — and ThroughSeq is the
+// watermark: the last event the summary accounts for, carried in the payload
+// rather than taken from the record's own position, so a compaction computed
+// through seq 100 but written at 141 still reads the events in between.
+type CompactedPayload struct {
+	ThroughSeq int    `json:"through_seq"`
+	Summary    string `json:"summary"`
+
+	// Method names which compactor ran: an LLM summary, pruning with a note,
+	// or a provider's compaction endpoint.
+	Method string `json:"method"`
+
+	// Modes records the projection settings the summarised transcript was
+	// built under.
+	Modes ProjectionModes `json:"modes,omitempty"`
+
+	ModelID string      `json:"model_id,omitempty"`
+	Usage   *TokenUsage `json:"usage,omitempty"`
+}
+
+func (CompactedPayload) EventType() EventType {
+	return CompactedEventType
+}
+func (CompactedPayload) eventPayload() {}

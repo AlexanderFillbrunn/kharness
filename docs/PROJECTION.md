@@ -65,8 +65,12 @@ Input
 A projection is made for one arc. The history it receives holds every event up
 to that arc's own opening event — its user message, or a task event whose
 payload carries `AS_MESSAGE` visibility, which opened the arc — plus every
-later event correlated to it or to one of the session's tasks. The read-model
-applies that cutoff when it builds the history.
+later event correlated to it or to one of the session's tasks — a
+`COMPACTION_REQUESTED` correlates to the arc it was produced in — plus the
+session-level records that carry no correlation ID, which is `COMPACTED`
+alone, so a compaction that landed after the arc opened still reaches the run
+that resumes it. The read-model applies that cutoff when it builds the
+history.
 
 Four consequences:
 
@@ -88,6 +92,62 @@ Four consequences:
 The slice has gaps. Another arc's events fall between this arc's whenever the
 two overlapped, and the query keeps only one of them, so the fold requires
 events in increasing sequence order.
+
+Compacted transcript
+--------------------
+A session that has compacted reads differently: the transcript is the summary
+of the compaction in force plus the projection of the events above its
+watermark. The compaction in force is the `COMPACTED` with the greatest
+`ThroughSeq` among those in the history — coverage by watermark, not arrival,
+so an out-of-order or duplicated compaction is harmless. A `COMPACTED`'s
+watermark is in its payload, not its position: a compaction computed through
+seq 100 but written at 141 still reads the events in between.
+
+    summary of Seq <= ThroughSeq, plus
+    projection of Seq > ThroughSeq
+
+The summary goes at the head of the transcript, before the first surviving
+arc, as a note — `n{…}` — and nothing precedes it but the system prompt. It is
+synthesized, so it is a note by the definition above, and it is the one note
+that is not short: the "a note is one line" rule in Settings yields to it. No
+mode governs it; a session that compacts has decided the material is gone. It
+is not an INSTRUCTION message.
+
+Everything at or below the watermark is replaced by the summary: arcs that end
+at or below it are skipped whole, and an arc the line passes through renders
+against the cut. The only arcs the line passes through are open arcs too large
+for the arc threshold — an unworked or in-flight arc pins the line at its
+opening or below its last turn, and a suspended arc that fits took the opening
+bound — so a spanning arc renders as a skeleton: its opening request verbatim,
+the tool calls of its spent prefix without their results, a note standing at
+the cut, and its live part — the last response, an unanswered ask — whole below
+the line. The note at the cut states that the arc's own log is verbatim and
+wins over the summary where the two disagree, and where an `ARC_SUSPENDED`
+stands it also says the request was paused while its context was compacted. A
+spanning arc that fits the threshold renders whole against the line instead.
+
+A tool call and its result are never separated by the cut: the watermark is
+drawn on a turn boundary, which is exactly where the projection keeps the pair
+contiguous.
+
+A task whose invocation falls below the watermark is still in the fold's task
+table, so its invocation note is synthesized from the table at the cut: the
+name, the ID verbatim — never from the summary's prose, which will not
+reliably reproduce it — and the status, including a waiting task's outstanding
+question.
+
+Tool results are thinned before every call, compacted or not: a result over
+`MaxToolResultChars` is truncated to the cap with a marker naming the call and
+the omitted size. The log keeps the whole result. The thinning is the
+harness's own doing, so the `ModelToolMessage` keeps its outcome and never
+carries `IsError` for it — the model must not read a thinned result as the tool
+failing.
+
+The compactor's own input is the same shape: the region a compaction
+summarises — the previous summary at the head plus the events between its
+watermark and the new one — is projected, so a summary is made from the
+projected transcript, never from the log, and elided material cannot come back
+through the one message no mode reaches.
 
 Event shorthand
 --------------------
@@ -267,9 +327,9 @@ model twice, once as itself and once as the note about it, and under
 `foreign_arc: note` the quote becomes the only trace of a request the mode
 just decided to reduce. Enough to recognise it is enough.
 
-A quote is folded onto one line, because a note is one line. A request that
-was cut ends in `…`, so that a shortened request cannot be read as one that
-was always that short.
+A quote is folded onto one line. A request that was cut ends in `…`, so that a
+shortened request cannot be read as one that was always that short. The one
+note that is not one line is a compaction summary; see Compacted transcript.
 
 Fixed rules
 --------------------
@@ -405,7 +465,9 @@ Every note names its task by name and ID. The ID is there because the model
 answers a waiting task by naming it, and a note is the only place it is told
 which task is meant. It is written whole: a shortened ID would have to be
 matched by prefix, which resolves the wrong task rather than failing to find
-one.
+one. Where a task's invocation falls below the compaction watermark, its
+invocation note is synthesized from the task table at the cut instead of
+projected from the event, with the ID verbatim; see Compacted transcript.
 
 A task that was called off is not one that went wrong, so `cancelled` is an
 outcome of its own rather than an error: a task-addressed cancel (a `CANCEL`

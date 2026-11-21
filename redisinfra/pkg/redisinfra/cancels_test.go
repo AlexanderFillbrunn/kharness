@@ -2,10 +2,9 @@ package redisinfra
 
 import (
 	"context"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"testing"
 	"time"
-
-	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 )
 
 // cancelledSoonerThan reports whether a watcher's channel closed within the
@@ -24,7 +23,7 @@ func cancelledSoonerThan(t *testing.T, cancelled <-chan struct{}, wait time.Dura
 func TestNotifyClosesTheWatchChannel(t *testing.T) {
 	client, _ := newRedis(t)
 	cancels := NewRedisCancels(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	cancelled, stop := cancels.Watch(context.Background(), ref)
 	defer stop()
@@ -40,7 +39,7 @@ func TestNotifyClosesTheWatchChannel(t *testing.T) {
 func TestNotifyClosesEveryWatcherOfTheArc(t *testing.T) {
 	client, _ := newRedis(t)
 	cancels := NewRedisCancels(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	first, stopFirst := cancels.Watch(context.Background(), ref)
 	defer stopFirst()
@@ -60,8 +59,8 @@ func TestNotifyClosesEveryWatcherOfTheArc(t *testing.T) {
 func TestNotifyReachesOnlyTheArcItNames(t *testing.T) {
 	client, _ := newRedis(t)
 	cancels := NewRedisCancels(client)
-	watched := agent.ArcRef{SessionID: "s", ArcID: "a"}
-	other := agent.ArcRef{SessionID: "s", ArcID: "b"}
+	watched := common.ArcRef{SessionID: "s", ArcID: "a"}
+	other := common.ArcRef{SessionID: "s", ArcID: "b"}
 
 	cancelled, stop := cancels.Watch(context.Background(), watched)
 	defer stop()
@@ -82,7 +81,7 @@ func TestNotifyReachesOnlyTheArcItNames(t *testing.T) {
 func TestStopEndsTheWatch(t *testing.T) {
 	client, _ := newRedis(t)
 	cancels := NewRedisCancels(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	cancelled, stop := cancels.Watch(context.Background(), ref)
 	stop()
@@ -98,7 +97,7 @@ func TestStopEndsTheWatch(t *testing.T) {
 func TestNotifyBeforeTheWatchCostsLatencyNotCorrectness(t *testing.T) {
 	client, _ := newRedis(t)
 	cancels := NewRedisCancels(client)
-	ref := agent.ArcRef{SessionID: "s", ArcID: "a"}
+	ref := common.ArcRef{SessionID: "s", ArcID: "a"}
 
 	if err := cancels.NotifyCancel(context.Background(), ref); err != nil {
 		t.Fatalf("could not announce the cancel: %v", err)

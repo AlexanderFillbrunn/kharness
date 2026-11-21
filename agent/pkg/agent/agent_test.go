@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
 	"fmt"
@@ -123,14 +124,16 @@ func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 	}
 }
 
-// scriptedLLM replies with a canned response per turn, or fails.
+// scriptedLLM replies with a canned response per turn, or fails with the
+// scripted error — a *ContextOverflowError where the script means an
+// over-budget rejection.
 type scriptedLLM struct {
 	replies []*LLMResponse
 	failure error
 	calls   int
 }
 
-func (l *scriptedLLM) StreamResponse(ctx context.Context, _ *history.History, _ *LLMOptions, _ Sink[RawToken]) (*LLMResponse, error) {
+func (l *scriptedLLM) StreamResponse(ctx context.Context, _ *history.ModelTranscript, _ *LLMOptions, _ common.Sink[RawToken]) (*LLMResponse, error) {
 	if l.failure != nil {
 		l.calls++
 		return nil, l.failure
@@ -143,8 +146,8 @@ func (l *scriptedLLM) StreamResponse(ctx context.Context, _ *history.History, _ 
 	return reply, nil
 }
 
-func (l *scriptedLLM) Response(ctx context.Context, h *history.History, opts *LLMOptions) (*LLMResponse, error) {
-	return l.StreamResponse(ctx, h, opts, nil)
+func (l *scriptedLLM) Response(ctx context.Context, t *history.ModelTranscript, opts *LLMOptions) (*LLMResponse, error) {
+	return l.StreamResponse(ctx, t, opts, nil)
 }
 
 // A call the model requests has to be run and settled, and the arc has to
@@ -539,12 +542,12 @@ type cancellingLLM struct {
 	cancel context.CancelFunc
 }
 
-func (l *cancellingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, _ Sink[RawToken]) (*LLMResponse, error) {
+func (l *cancellingLLM) StreamResponse(_ context.Context, _ *history.ModelTranscript, _ *LLMOptions, _ common.Sink[RawToken]) (*LLMResponse, error) {
 	l.cancel()
 	return l.reply, nil
 }
 
-func (l *cancellingLLM) Response(context.Context, *history.History, *LLMOptions) (*LLMResponse, error) {
+func (l *cancellingLLM) Response(context.Context, *history.ModelTranscript, *LLMOptions) (*LLMResponse, error) {
 	l.cancel()
 	return l.reply, nil
 }

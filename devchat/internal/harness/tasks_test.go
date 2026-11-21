@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"path/filepath"
 	"strings"
@@ -22,7 +23,7 @@ type scriptLLM struct {
 	calls   int
 }
 
-func (l *scriptLLM) StreamResponse(_ context.Context, _ *history.History, _ *agent.LLMOptions, _ agent.Sink[agent.RawToken]) (*agent.LLMResponse, error) {
+func (l *scriptLLM) StreamResponse(_ context.Context, _ *history.ModelTranscript, _ *agent.LLMOptions, _ common.Sink[agent.RawToken]) (*agent.LLMResponse, error) {
 	if l.calls >= len(l.replies) {
 		return &agent.LLMResponse{ModelID: "test", Content: "(nothing scripted)"}, nil
 	}
@@ -31,8 +32,8 @@ func (l *scriptLLM) StreamResponse(_ context.Context, _ *history.History, _ *age
 	return reply, nil
 }
 
-func (l *scriptLLM) Response(ctx context.Context, h *history.History, opts *agent.LLMOptions) (*agent.LLMResponse, error) {
-	return l.StreamResponse(ctx, h, opts, nil)
+func (l *scriptLLM) Response(ctx context.Context, t *history.ModelTranscript, opts *agent.LLMOptions) (*agent.LLMResponse, error) {
+	return l.StreamResponse(ctx, t, opts, nil)
 }
 
 // harness is devchat's wiring with a scripted model in place of a real one.
@@ -70,7 +71,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.MintIdentity(agent.GuardCancellation(store, store))
+	persistor := common.MintIdentity(common.GuardCancellation(store, store))
 	cancels := agent.NewLocalCancels()
 	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), agent.NewLocalLease(),
 		agent.WithCancelWatcher(cancels))
@@ -104,7 +105,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 // straight away, the way the queue serves it.
 type workEnqueuer struct{ worker *agent.ArcWorker }
 
-func (e workEnqueuer) Enqueue(ctx context.Context, ref agent.ArcRef, agentID string) error {
+func (e workEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
 	_, _ = e.worker.Work(ctx, ref, agentID)
 	return nil
 }
@@ -168,7 +169,7 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 		&agent.LLMResponse{ModelID: "test", Content: "which namespace should I look at?"},
 		// The user answers in an arc of their own, and it is handed on.
 		&agent.LLMResponse{ModelID: "test", ToolCalls: []agent.LLMToolCall{
-			{VendorID: "call_2", ToolName: agent.ProvideTaskInputTool,
+			{VendorID: "call_2", ToolName: events.ProvideTaskInputToolName,
 				Args: map[string]any{"task_id": "", "input": "kube-system"}}}},
 		&agent.LLMResponse{ModelID: "test", Content: "passed it on"},
 		// Woken by the result, it reports what came of the work.
@@ -312,7 +313,7 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 func (h *harness) scriptAnswer(taskID string) {
 	for _, reply := range h.llm.replies {
 		for i := range reply.ToolCalls {
-			if reply.ToolCalls[i].ToolName != agent.ProvideTaskInputTool {
+			if reply.ToolCalls[i].ToolName != events.ProvideTaskInputToolName {
 				continue
 			}
 			args := reply.ToolCalls[i].Args.(map[string]any)
@@ -408,7 +409,7 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	settled, err := ingress.SettleAbandonedTasks(ctx, agent.AsAgent(localAgentID, h.session.persistor), folded)
+	settled, err := ingress.SettleAbandonedTasks(ctx, common.AsAgent(localAgentID, h.session.persistor), folded)
 	if err != nil {
 		t.Fatalf("SettleAbandonedTasks: %v", err)
 	}
@@ -450,7 +451,7 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 // replay taken before it called, and both read that the task was waiting.
 func TestOnlyTheFirstAnswerToAQuestionReachesTheTask(t *testing.T) {
 	tasks := newLocalTasks()
-	ref := agent.TaskRef{ID: "task-1"}
+	ref := common.TaskRef{ID: "task-1"}
 	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
 	tasks.await(ref.ID, "ask-1")
 
@@ -470,7 +471,7 @@ func TestOnlyTheFirstAnswerToAQuestionReachesTheTask(t *testing.T) {
 // than taken for the one it is waiting on now.
 func TestAnAnswerToASupersededQuestionIsRefused(t *testing.T) {
 	tasks := newLocalTasks()
-	ref := agent.TaskRef{ID: "task-1"}
+	ref := common.TaskRef{ID: "task-1"}
 	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
 	tasks.await(ref.ID, "ask-2")
 

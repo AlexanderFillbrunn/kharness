@@ -49,6 +49,26 @@ func (f *FixedResolver) ResolveAgent(_ context.Context, _ string) (*Agent, error
 	return f.agent, nil
 }
 
+// FixedCompactionResolver answers every id with the same compaction plan. It
+// is the resolver a process with one compaction already equipped has, and the
+// one tests run under.
+type FixedCompactionResolver struct {
+	plan *CompactionPlan
+}
+
+// NewFixedCompactionResolver answers every id with the plan given.
+func NewFixedCompactionResolver(plan *CompactionPlan) *FixedCompactionResolver {
+	return &FixedCompactionResolver{plan: plan}
+}
+
+// ResolveCompaction returns the plan, whatever the id.
+func (f *FixedCompactionResolver) ResolveCompaction(_ context.Context, _ string) (*CompactionPlan, error) {
+	if f.plan == nil {
+		return nil, errors.New("no compaction plan was given to resolve")
+	}
+	return f.plan, nil
+}
+
 // ModelRef names the model an agent asks: which source serves it, and what
 // the model is called there. A source groups the models one endpoint serves,
 // so a local OpenAI-compatible API is a source of its own — "local", say —
@@ -83,6 +103,56 @@ type AgentSettings struct {
 	// speaking. Empty means "user", the default. The model source must be
 	// able to carry it; one that cannot is a settings error, not a fallback.
 	TaskRole string `json:"task_role,omitempty"`
+
+	// Compaction is the session-past-its-own-history block: which compactor
+	// runs and the budgets and limits the loop checks. Empty disables
+	// compaction.
+	Compaction CompactionSettings `json:"compaction,omitempty"`
+
+	// Defaults holds the cross-cutting defaults: the context window the
+	// higher budget sits close to, globally and per model.
+	Defaults DefaultsSettings `json:"defaults,omitempty"`
+}
+
+// CompactionSettings is what a definition says about compaction.
+type CompactionSettings struct {
+	// Method names the compactor: "llm", "prune" or "provider".
+	Method string `json:"method,omitempty"`
+
+	// Model is the model the "llm" method summarises with. Nil means the
+	// agent's own model.
+	Model *ModelRef `json:"model,omitempty"`
+
+	// LowerBudget triggers a compaction request, in input tokens. Defaults
+	// to three quarters of the context window.
+	LowerBudget int `json:"lower_budget,omitempty"`
+
+	// HigherBudget suspends runs, in estimated tokens. Defaults to the
+	// context window.
+	HigherBudget int `json:"higher_budget,omitempty"`
+
+	// KeepRecentTokens is the tail the cut always leaves above it.
+	KeepRecentTokens int `json:"keep_recent_tokens,omitempty"`
+
+	// MaxToolResultChars caps one tool result's contribution to a transcript.
+	MaxToolResultChars int `json:"max_tool_result_chars,omitempty"`
+
+	// MaxUserMessageChars rejects an over-long user message outright.
+	MaxUserMessageChars int `json:"max_user_message_chars,omitempty"`
+
+	// ArcThresholdTokens is the arc size that moves the cut to the arc's
+	// live boundary.
+	ArcThresholdTokens int `json:"arc_threshold_tokens,omitempty"`
+}
+
+// DefaultsSettings holds the cross-cutting defaults a definition can set.
+type DefaultsSettings struct {
+	// ContextWindow overrides DefaultContextWindow for every model.
+	ContextWindow int `json:"context_window,omitempty"`
+
+	// ContextWindows overrides the context window per model, keyed by
+	// "source/name" or by the bare model name.
+	ContextWindows map[string]int `json:"context_windows,omitempty"`
 }
 
 // TaskRoleSetter is implemented by an LLM client whose encoder can carry a
@@ -136,13 +206,9 @@ func (f *FileResolver) ResolveAgent(_ context.Context, _ string) (*Agent, error)
 		return f.agent, nil
 	}
 
-	raw, err := os.ReadFile(f.path)
+	settings, err := f.loadSettings()
 	if err != nil {
-		return nil, fmt.Errorf("read agent settings %s: %w", f.path, err)
-	}
-	var settings AgentSettings
-	if err := json.Unmarshal(raw, &settings); err != nil {
-		return nil, fmt.Errorf("parse agent settings %s: %w", f.path, err)
+		return nil, err
 	}
 
 	agent, err := f.build(settings)
@@ -152,6 +218,61 @@ func (f *FileResolver) ResolveAgent(_ context.Context, _ string) (*Agent, error)
 	f.modTime = info.ModTime()
 	f.agent = agent
 	return agent, nil
+}
+
+// loadSettings reads and parses the settings file. The caller holds f.mu.
+func (f *FileResolver) loadSettings() (AgentSettings, error) {
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		return AgentSettings{}, fmt.Errorf("read agent settings %s: %w", f.path, err)
+	}
+	var settings AgentSettings
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return AgentSettings{}, fmt.Errorf("parse agent settings %s: %w", f.path, err)
+	}
+	return settings, nil
+}
+
+// ResolveCompaction equips a compaction under any agent this resolver
+// describes: the compactor the settings' method names and the limits the cut
+// and the projection are drawn under. It reads the same file as ResolveAgent
+// and never builds the agent, so a process that only compacts pays for
+// neither its tools nor its prompt.
+func (f *FileResolver) ResolveCompaction(_ context.Context, _ string) (*CompactionPlan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	settings, err := f.loadSettings()
+	if err != nil {
+		return nil, err
+	}
+	compaction := settings.Compaction
+	if compaction.Method == "" {
+		return nil, fmt.Errorf("the settings in %s name no compaction method", f.path)
+	}
+	if settings.Model.Name == "" || settings.Model.Source == "" {
+		return nil, errors.New("the settings name no model to ask")
+	}
+	factory, ok := f.modelSources[settings.Model.Source]
+	if !ok {
+		return nil, fmt.Errorf("no model source %s is held by this process", settings.Model.Source)
+	}
+	llm, err := factory(settings.Model)
+	if err != nil {
+		return nil, err
+	}
+	compactor, err := buildCompactor(compaction.Method, compaction.Model, llm, f.modelSources)
+	if err != nil {
+		return nil, err
+	}
+	return &CompactionPlan{
+		Compactor: compactor,
+		Limits: CompactionLimits{
+			KeepRecentTokens:   orDefault(compaction.KeepRecentTokens, DefaultKeepRecentTokens),
+			MaxToolResultChars: orDefault(compaction.MaxToolResultChars, DefaultMaxToolResultChars),
+			ArcThresholdTokens: orDefault(compaction.ArcThresholdTokens, DefaultArcThresholdTokens),
+		},
+	}, nil
 }
 
 // build turns what the file says into the agent that runs it.
@@ -180,7 +301,84 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 			return nil, fmt.Errorf("task_role %q: %w", settings.TaskRole, err)
 		}
 	}
-	return NewAgent(&AgentConfig{SystemPrompt: settings.SystemPrompt}, tools, llm, f.options...)
+
+	config := &AgentConfig{SystemPrompt: settings.SystemPrompt}
+	config.ContextWindow = contextWindowFor(settings.Model, settings.Defaults)
+	compaction := settings.Compaction
+	if compaction.Method != "" {
+		// The method names which compactor the worker resolves, not the
+		// agent: the agent's config only records that compaction is on.
+		config.Compaction = true
+		config.LowerBudget = orDefault(compaction.LowerBudget, config.ContextWindow*3/4)
+		// The higher budget sits just below the context window, leaving a
+		// reserve for one more tool result.
+		config.HigherBudget = orDefault(compaction.HigherBudget, config.ContextWindow-ContextWindowReserve)
+		config.MaxToolResultChars = orDefault(compaction.MaxToolResultChars, DefaultMaxToolResultChars)
+		config.MaxUserMessageChars = orDefault(compaction.MaxUserMessageChars, DefaultMaxUserMessageChars)
+		config.ArcThresholdTokens = orDefault(compaction.ArcThresholdTokens, DefaultArcThresholdTokens)
+	}
+
+	// The compactor the method names is not built here: the agent only checks
+	// budgets and writes records, and ResolveCompaction equips the worker.
+	return NewAgent(config, tools, llm, f.options...)
+}
+
+// contextWindowFor resolves the context window of a model: the settings'
+// per-model override, then its global default, then the built-in catalog.
+func contextWindowFor(ref ModelRef, defaults DefaultsSettings) int {
+	window := ContextWindow(ref)
+	if defaults.ContextWindow > 0 {
+		window = defaults.ContextWindow
+	}
+	key := ref.Source + "/" + ref.Name
+	if v, ok := defaults.ContextWindows[key]; ok {
+		window = v
+	} else if v, ok := defaults.ContextWindows[ref.Name]; ok {
+		window = v
+	}
+	return window
+}
+
+// orDefault returns value where the settings set one, and fallback where they
+// left it at zero. A negative value is not "unset": -1 is the explicit marker
+// for a disabled limit, and it travels through as it is.
+func orDefault(value, fallback int) int {
+	if value != 0 {
+		return value
+	}
+	return fallback
+}
+
+// buildCompactor builds the compactor a method names. The LLM method may name
+// its own model, defaulting to the agent's; the provider method uses the
+// agent's client and needs an endpoint on it.
+func buildCompactor(method string, modelRef *ModelRef, agentLLM LLM, sources map[string]ModelFactory) (Compactor, error) {
+	switch method {
+	case CompactionMethodPrune:
+		return PruneCompactor{}, nil
+	case CompactionMethodLLM:
+		llm := agentLLM
+		if modelRef != nil {
+			factory, ok := sources[modelRef.Source]
+			if !ok {
+				return nil, fmt.Errorf("no model source %s is held by this process", modelRef.Source)
+			}
+			built, err := factory(*modelRef)
+			if err != nil {
+				return nil, err
+			}
+			llm = built
+		}
+		transcriptLLM, ok := llm.(TranscriptLLM)
+		if !ok {
+			return nil, fmt.Errorf("the model %T cannot be called over a transcript to summarise one", llm)
+		}
+		return &LLMCompactor{LLM: transcriptLLM}, nil
+	case CompactionMethodProvider:
+		return &ProviderCompactor{LLM: agentLLM}, nil
+	default:
+		return nil, fmt.Errorf("unknown compaction method %q", method)
+	}
 }
 
 // SelectTools turns the tools a definition names into the provider that

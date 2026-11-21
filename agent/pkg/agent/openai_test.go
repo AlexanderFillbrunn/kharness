@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +25,7 @@ const (
 
 // testRef addresses the arc the fixtures build, the way everything that
 // stores, locks or routes by arc is addressed.
-func testRef() ArcRef { return ArcRef{SessionID: testSessionID, ArcID: testArcID} }
+func testRef() common.ArcRef { return common.ArcRef{SessionID: testSessionID, ArcID: testArcID} }
 
 // testAgentID names the agent the fixtures run under, the way a work item
 // would name it.
@@ -71,9 +73,20 @@ func userArcHistory(t *testing.T) *history.History {
 	return h
 }
 
-func collectTokens() (*[]string, Sink[RawToken]) {
+// projectLast projects the last arc of a history the way a run projects the
+// arc it is working: default modes, no extra projection options.
+func projectLast(t *testing.T, h *history.History) *history.ModelTranscript {
+	t.Helper()
+	transcript, err := h.Project(h.Arcs[len(h.Arcs)-1].ID, history.DefaultModes(), history.ProjectionOptions{})
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	return transcript
+}
+
+func collectTokens() (*[]string, common.Sink[RawToken]) {
 	var tokens []string
-	return &tokens, SinkFromFunc(func(tok RawToken) error {
+	return &tokens, common.SinkFromFunc(func(tok RawToken) error {
 		tokens = append(tokens, tok.Content)
 		return nil
 	})
@@ -94,7 +107,7 @@ func TestStreamResponseYieldsTokensAndReply(t *testing.T) {
 	llm := newTestLLM(t, newTestServer(t, stream, nil))
 	tokens, tokSink := collectTokens()
 
-	response, err := llm.StreamResponse(context.Background(), userArcHistory(t), &LLMOptions{}, tokSink)
+	response, err := llm.StreamResponse(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{}, tokSink)
 	if err != nil {
 		t.Fatalf("StreamResponse: %v", err)
 	}
@@ -137,7 +150,7 @@ func TestStreamAsksForUsage(t *testing.T) {
 	llm := newTestLLM(t, newTestServer(t, stream, &captured))
 	_, tokSink := collectTokens()
 
-	if _, err := llm.StreamResponse(context.Background(), userArcHistory(t), &LLMOptions{}, tokSink); err != nil {
+	if _, err := llm.StreamResponse(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{}, tokSink); err != nil {
 		t.Fatalf("StreamResponse: %v", err)
 	}
 	if captured.StreamOptions == nil || !captured.StreamOptions.IncludeUsage {
@@ -151,7 +164,7 @@ func TestUnreportedUsageStaysNil(t *testing.T) {
 	body := `{"id":"chatcmpl-3","model":"gpt-5","choices":[{"message":{"content":"two"},"finish_reason":"stop"}]}`
 	llm := newTestLLM(t, newTestServer(t, body, nil))
 
-	response, err := llm.Response(context.Background(), userArcHistory(t), &LLMOptions{})
+	response, err := llm.Response(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{})
 	if err != nil {
 		t.Fatalf("Response: %v", err)
 	}
@@ -179,7 +192,7 @@ func TestResponseEncodesPromptAndTools(t *testing.T) {
 	llm := newTestLLM(t, newTestServer(t, body, &captured))
 
 	opts := &LLMOptions{SystemPrompt: "you are a cluster operator", Tools: &registry}
-	response, err := llm.Response(context.Background(), userArcHistory(t), opts)
+	response, err := llm.Response(context.Background(), projectLast(t, userArcHistory(t)), opts)
 	if err != nil {
 		t.Fatalf("Response: %v", err)
 	}
@@ -246,7 +259,7 @@ func TestEncodePairsCallsUnderVendorIDs(t *testing.T) {
 	body := `{"id":"chatcmpl-2","model":"gpt-5","choices":[{"message":{"content":"two"},"finish_reason":"stop"}]}`
 	llm := newTestLLM(t, newTestServer(t, body, &captured))
 
-	if _, err := llm.Response(context.Background(), h, &LLMOptions{}); err != nil {
+	if _, err := llm.Response(context.Background(), projectLast(t, h), &LLMOptions{}); err != nil {
 		t.Fatalf("Response: %v", err)
 	}
 
@@ -318,7 +331,7 @@ func TestEncodeCarriesATaskArcUnderTheConfiguredRole(t *testing.T) {
 	var captured openAIRequest
 	captureServer := newTestServer(t, body, &captured)
 	def := NewOpenAI("test-key", "gpt-5", WithBaseURL(captureServer.URL))
-	if _, err := def.Response(context.Background(), h, &LLMOptions{}); err != nil {
+	if _, err := def.Response(context.Background(), projectLast(t, h), &LLMOptions{}); err != nil {
 		t.Fatalf("default Response: %v", err)
 	}
 	opening := taskOpening(&captured)
@@ -335,7 +348,7 @@ func TestEncodeCarriesATaskArcUnderTheConfiguredRole(t *testing.T) {
 	captured = openAIRequest{}
 	captureServer = newTestServer(t, body, &captured)
 	dev := NewOpenAI("test-key", "gpt-5", WithBaseURL(captureServer.URL), WithTaskRole(openAIRoleDeveloper))
-	if _, err := dev.Response(context.Background(), h, &LLMOptions{}); err != nil {
+	if _, err := dev.Response(context.Background(), projectLast(t, h), &LLMOptions{}); err != nil {
 		t.Fatalf("developer Response: %v", err)
 	}
 	opening = taskOpening(&captured)
@@ -359,5 +372,152 @@ func TestSetTaskRoleRefusesAnUnknownRole(t *testing.T) {
 	}
 	if llm.taskRole != openAIRoleDeveloper {
 		t.Errorf("taskRole = %q, want developer", llm.taskRole)
+	}
+}
+
+// A final length stop is a context-budget signal: the partial reply comes
+// back non-nil alongside a *ContextOverflowError, so the caller records what
+// the model did say and still recognises the budget. An output-limit stop
+// such as max_tokens never is: the reply returns with no error at all.
+func TestLengthStopReturnsPartialReplyWithOverflow(t *testing.T) {
+	body := `{"id":"c1","model":"gpt-5","choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}`
+	llm := newTestLLM(t, newTestServer(t, body, nil))
+	response, err := llm.Response(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{})
+	var overflow *ContextOverflowError
+	if !errors.As(err, &overflow) {
+		t.Fatalf("error is %T (%v), want *ContextOverflowError", err, err)
+	}
+	if overflow.StopReason != "length" {
+		t.Errorf("StopReason = %q, want %q", overflow.StopReason, "length")
+	}
+	if response == nil || response.Content != "partial" || response.StopReason != "length" {
+		t.Errorf("response = %+v, want the partial reply carrying its stop reason", response)
+	}
+
+	body = `{"id":"c1","model":"gpt-5","choices":[{"message":{"content":"two"},"finish_reason":"max_tokens"}]}`
+	llm = newTestLLM(t, newTestServer(t, body, nil))
+	response, err = llm.Response(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{})
+	if err != nil {
+		t.Fatalf("an output-limit stop is not an overflow: %v", err)
+	}
+	if response.StopReason != "max_tokens" {
+		t.Errorf("StopReason = %q, want %q", response.StopReason, "max_tokens")
+	}
+}
+
+// An over-budget rejection decodes into a *ContextOverflowError carrying the
+// status and the error object's type, code and message — typed, and still
+// unwrapping to the provider's plain *LLMError.
+func TestErrorResponseIsTyped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"message":"This model's maximum context length is 32000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}`)
+	}))
+	t.Cleanup(server.Close)
+	llm := NewOpenAI("k", "gpt-5", WithBaseURL(server.URL))
+
+	_, err := llm.Response(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{})
+	var overflow *ContextOverflowError
+	if !errors.As(err, &overflow) {
+		t.Fatalf("error is %T (%v), want *ContextOverflowError", err, err)
+	}
+	if overflow.Status != 400 || overflow.Code != "context_length_exceeded" || overflow.Type != "invalid_request_error" {
+		t.Errorf("ContextOverflowError = %+v", &overflow.LLMError)
+	}
+	var lerr *LLMError
+	if !errors.As(err, &lerr) {
+		t.Errorf("the overflow does not unwrap to *LLMError: %v", err)
+	}
+}
+
+// A rejection that is not over budget stays a plain *LLMError: the vendor's
+// classification never rewrites an unrelated complaint.
+func TestNonOverflowErrorStaysPlain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"message":"some other complaint","type":"invalid_request_error","code":"bad_request"}}`)
+	}))
+	t.Cleanup(server.Close)
+	llm := NewOpenAI("k", "gpt-5", WithBaseURL(server.URL))
+
+	_, err := llm.Response(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{})
+	var lerr *LLMError
+	if !errors.As(err, &lerr) {
+		t.Fatalf("error is %T (%v), want *LLMError", err, err)
+	}
+	var overflow *ContextOverflowError
+	if errors.As(err, &overflow) {
+		t.Errorf("a non-overflow rejection was classified as one: %v", overflow)
+	}
+}
+
+// An error object inside an otherwise-200 stream is a typed overflow too,
+// with the status the stream carried.
+func TestStreamErrorObjectIsTyped(t *testing.T) {
+	body := "data: {\"error\":{\"message\":\"prompt is too long\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\n" +
+		"data: [DONE]\n\n"
+	llm := newTestLLM(t, newTestServer(t, body, nil))
+	_, tokSink := collectTokens()
+	_, err := llm.StreamResponse(context.Background(), projectLast(t, userArcHistory(t)), &LLMOptions{}, tokSink)
+	var overflow *ContextOverflowError
+	if !errors.As(err, &overflow) {
+		t.Fatalf("error is %T (%v), want *ContextOverflowError", err, err)
+	}
+	if overflow.Code != "context_length_exceeded" || overflow.Status != 200 {
+		t.Errorf("ContextOverflowError = %+v, want the in-stream code with status 200", &overflow.LLMError)
+	}
+}
+
+// The vendor classifies where the provider's own fields are read: a context
+// code, a 413, a message pattern where no code exists, or an error object
+// inside a 200 stream come back as a *ContextOverflowError — never from the
+// status alone. A final length stop is classified where the reply is built,
+// not from an error (see TestLengthStopReturnsPartialReplyWithOverflow), and a
+// non-overflow error crosses unchanged.
+func TestAsOverflow(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"the context code", &LLMError{Status: 400, Type: "invalid_request_error", Code: "context_length_exceeded", Message: "too long"}, true},
+		{"a 413", &LLMError{Status: 413, Message: "request entity too large"}, true},
+		{"a message pattern, no code", &LLMError{Status: 400, Message: "prompt is too long for this model"}, true},
+		{"an in-stream error object", &LLMError{Status: 200, Code: "context_length_exceeded", Message: "x"}, true},
+		{"the status alone is not enough", &LLMError{Status: 400, Message: "some other complaint"}, false},
+		{"an unrelated error", errors.New("connection reset"), false},
+	}
+	for _, c := range cases {
+		got := asOverflow(c.err)
+		if (got != nil) != c.want {
+			t.Errorf("%s: asOverflow = %v, want overflow %v", c.name, got, c.want)
+		}
+		if !c.want && overflowOr(c.err) != c.err {
+			t.Errorf("%s: overflowOr rewrote a non-overflow error to %v", c.name, overflowOr(c.err))
+		}
+	}
+}
+
+// The compactor's call goes over a transcript, not a history: the request
+// carries the transcript's messages and no tools.
+func TestRespondToTranscriptSendsNoTools(t *testing.T) {
+	var captured openAIRequest
+	body := `{"id":"c1","model":"gpt-5","choices":[{"message":{"content":"SUMMARY"},"finish_reason":"stop"}]}`
+	llm := newTestLLM(t, newTestServer(t, body, &captured))
+	transcript := history.ModelTranscript{Messages: []history.ModelMessage{
+		history.ModelTextMessage{MessageRole: history.ModelRoleUser, Content: "what happened?"},
+	}}
+	response, err := llm.RespondToTranscript(context.Background(), transcript, "summarise")
+	if err != nil {
+		t.Fatalf("RespondToTranscript: %v", err)
+	}
+	if response.Content != "SUMMARY" {
+		t.Errorf("content = %q, want SUMMARY", response.Content)
+	}
+	if len(captured.Tools) != 0 {
+		t.Errorf("tools = %d, want none on a summarising call", len(captured.Tools))
+	}
+	if len(captured.Messages) != 2 || captured.Messages[0].Role != "system" || captured.Messages[0].Content == nil || *captured.Messages[0].Content != "summarise" {
+		t.Errorf("messages = %+v, want the system prompt then the transcript", captured.Messages)
 	}
 }

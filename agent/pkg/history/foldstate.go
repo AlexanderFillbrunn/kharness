@@ -6,11 +6,12 @@ package history
 // The maps hold the same pointers as the history, so updating a record through
 // FoldState updates the history with it.
 type FoldState struct {
-	toolCalls  map[string]*ToolCall
-	arcs       map[string]*Arc
-	interrupts map[string]*Interrupt
-	asyncTasks map[string]*AsyncTask
-	responses  map[string]*AssistantMessage
+	toolCalls          map[string]*ToolCall
+	arcs               map[string]*Arc
+	interrupts         map[string]*Interrupt
+	asyncTasks         map[string]*AsyncTask
+	responses          map[string]*AssistantMessage
+	compactionRequests map[string]*CompactionRequest
 }
 
 // NewFoldState returns the empty index a history is folded from the first
@@ -18,10 +19,11 @@ type FoldState struct {
 // that already has records in it.
 func NewFoldState() *FoldState {
 	return &FoldState{
-		toolCalls:  make(map[string]*ToolCall),
-		arcs:       make(map[string]*Arc),
-		interrupts: make(map[string]*Interrupt),
-		asyncTasks: make(map[string]*AsyncTask),
-		responses:  make(map[string]*AssistantMessage),
+		toolCalls:          make(map[string]*ToolCall),
+		arcs:               make(map[string]*Arc),
+		interrupts:         make(map[string]*Interrupt),
+		asyncTasks:         make(map[string]*AsyncTask),
+		responses:          make(map[string]*AssistantMessage),
+		compactionRequests: make(map[string]*CompactionRequest),
 	}
 }

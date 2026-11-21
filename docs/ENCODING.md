@@ -251,7 +251,10 @@ A `ModelTextMessage` with role INSTRUCTION is a real system prompt.
     Gemini      the `systemInstruction` field
 
 Do not move a note into these. A system prompt is stable across the session and
-sits in the cached prefix. A note is per turn and belongs at its position.
+sits in the cached prefix. A note is per turn and belongs at its position — the
+one exception being a compaction summary, which belongs at the head of the
+transcript, before the first surviving arc, and is carried like any other note
+(see PROJECTION.md's Compacted transcript).
 
 Open questions
 --------------------

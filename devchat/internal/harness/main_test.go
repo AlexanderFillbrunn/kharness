@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"encoding/json"
 	"io"
@@ -83,7 +84,7 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.PublishEvents(agent.MintIdentity(store), captureEvents{shown: shown})
+	persistor := common.PublishEvents(common.MintIdentity(store), captureEvents{shown: shown})
 	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), nil,
 		agent.WithTokenSink(captureTokens{text: &tokens}))
 	if err != nil {
@@ -206,7 +207,7 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.MintIdentity(store)
+	persistor := common.MintIdentity(store)
 	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)

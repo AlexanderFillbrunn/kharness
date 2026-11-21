@@ -2,6 +2,7 @@ package ingress_test
 
 import (
 	"context"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
 	"strings"
 
@@ -23,7 +24,7 @@ type fakeLLM struct {
 	calls   int
 }
 
-func (l *fakeLLM) StreamResponse(_ context.Context, _ *history.History, _ *agent.LLMOptions, _ agent.Sink[agent.RawToken]) (*agent.LLMResponse, error) {
+func (l *fakeLLM) StreamResponse(_ context.Context, _ *history.ModelTranscript, _ *agent.LLMOptions, _ common.Sink[agent.RawToken]) (*agent.LLMResponse, error) {
 	if l.calls >= len(l.replies) {
 		return nil, fmt.Errorf("the model was asked %d times, with %d replies scripted", l.calls+1, len(l.replies))
 	}
@@ -32,8 +33,8 @@ func (l *fakeLLM) StreamResponse(_ context.Context, _ *history.History, _ *agent
 	return reply, nil
 }
 
-func (l *fakeLLM) Response(ctx context.Context, h *history.History, opts *agent.LLMOptions) (*agent.LLMResponse, error) {
-	return l.StreamResponse(ctx, h, opts, nil)
+func (l *fakeLLM) Response(ctx context.Context, t *history.ModelTranscript, opts *agent.LLMOptions) (*agent.LLMResponse, error) {
+	return l.StreamResponse(ctx, t, opts, nil)
 }
 
 func typesOf(stored []*events.Event) string {

@@ -34,11 +34,31 @@ type TaskRef struct {
 // WorkItem is one unit of work on the queue: an arc, named, and the agent
 // that is to work it. Producers push items when they write an opening event;
 // the agent worker pops them.
+// Work item kinds. The zero value of Kind is an arc item, so an entry written
+// before kinds existed still reads as the arc it names.
+const (
+	WorkItemKindArc        = "arc"
+	WorkItemKindCompaction = "compaction"
+)
+
 type WorkItem struct {
 	SessionID string `json:"session_id"`
 	ArcID     string `json:"arc_id"`
 	AgentID   string `json:"agent_id"`
+
+	// Kind says what the item is: an arc run (the default, also for entries
+	// written before kinds existed) or a compaction. A compaction item names
+	// no arc; it names the COMPACTION_REQUESTED event whose watermark the
+	// compaction is to reach.
+	Kind string `json:"kind,omitempty"`
+
+	// RequestID is the ID of the COMPACTION_REQUESTED event a compaction item
+	// serves. Empty for arc items.
+	RequestID string `json:"request_id,omitempty"`
 }
 
-// Ref returns the arc the item names.
+// Ref returns the arc the item names. It is meaningless for a compaction item.
 func (i WorkItem) Ref() ArcRef { return ArcRef{SessionID: i.SessionID, ArcID: i.ArcID} }
+
+// IsCompaction reports whether the item is a compaction rather than an arc run.
+func (i WorkItem) IsCompaction() bool { return i.Kind == WorkItemKindCompaction }

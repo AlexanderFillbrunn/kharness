@@ -2,12 +2,13 @@ package agent
 
 import (
 	"context"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"sync"
 )
 
 // This file holds the worker's half of cancellation: how a running arc is told
 // it has been cancelled while it is mid-tool or mid-stream. The write-path
-// guard — GuardCancellation, CancelSource, ErrCancelled — lives in common,
+// guard — common.GuardCancellation, common.CancelSource, common.ErrCancelled — lives in common,
 // since producers write through it too.
 
 // CancelNotifier tells watchers that an arc has been cancelled.
@@ -16,7 +17,7 @@ import (
 // is in the log, and the guard stops the run at its next step whatever happens
 // to the notification.
 type CancelNotifier interface {
-	NotifyCancel(ctx context.Context, ref ArcRef) error
+	NotifyCancel(ctx context.Context, ref common.ArcRef) error
 }
 
 // CancelWatcher reports that an arc has been cancelled, as soon as it can.
@@ -32,24 +33,24 @@ type CancelWatcher interface {
 	// stop to call once the caller is done with the arc. A watcher that
 	// cannot subscribe returns a channel nobody will close, because the run
 	// has to go on either way.
-	Watch(ctx context.Context, ref ArcRef) (cancelled <-chan struct{}, stop func())
+	Watch(ctx context.Context, ref common.ArcRef) (cancelled <-chan struct{}, stop func())
 }
 
 // LocalCancels is a CancelNotifier and a CancelWatcher for one process.
 type LocalCancels struct {
 	mu       sync.Mutex
-	watchers map[ArcRef]map[chan struct{}]bool
+	watchers map[common.ArcRef]map[chan struct{}]bool
 }
 
 func NewLocalCancels() *LocalCancels {
-	return &LocalCancels{watchers: map[ArcRef]map[chan struct{}]bool{}}
+	return &LocalCancels{watchers: map[common.ArcRef]map[chan struct{}]bool{}}
 }
 
-func (c *LocalCancels) Watch(_ context.Context, ref ArcRef) (<-chan struct{}, func()) {
+func (c *LocalCancels) Watch(_ context.Context, ref common.ArcRef) (<-chan struct{}, func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.watchers == nil {
-		c.watchers = map[ArcRef]map[chan struct{}]bool{}
+		c.watchers = map[common.ArcRef]map[chan struct{}]bool{}
 	}
 	if c.watchers[ref] == nil {
 		c.watchers[ref] = map[chan struct{}]bool{}
@@ -74,7 +75,7 @@ func (c *LocalCancels) Watch(_ context.Context, ref ArcRef) (<-chan struct{}, fu
 // NotifyCancel closes every channel watching the arc. Watching again after
 // this gets a channel nobody closes, which is correct: the cancel is in the
 // log, and a run that starts after it reads it there.
-func (c *LocalCancels) NotifyCancel(_ context.Context, ref ArcRef) error {
+func (c *LocalCancels) NotifyCancel(_ context.Context, ref common.ArcRef) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for cancelled := range c.watchers[ref] {

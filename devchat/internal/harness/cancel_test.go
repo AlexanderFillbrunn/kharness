@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"path/filepath"
 	"testing"
@@ -31,7 +32,7 @@ func runningModel(t *testing.T, arc string) (model, context.Context, *filestore.
 	s := &session{
 		id:        "session",
 		store:     store,
-		persistor: agent.MintIdentity(agent.GuardCancellation(store, store)),
+		persistor: common.MintIdentity(common.GuardCancellation(store, store)),
 		actor:     actor,
 	}
 

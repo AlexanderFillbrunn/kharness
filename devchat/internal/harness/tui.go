@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ type (
 	// from the task rather than the log for the one reason the log cannot
 	// carry it: there is nothing in the log to carry.
 	taskUnfiledMsg struct {
-		ref agent.TaskRef
+		ref common.TaskRef
 		err error
 	}
 )
@@ -159,7 +160,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case arcDoneMsg:
 		switch {
 		case msg.err == nil:
-		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, agent.ErrCancelled):
+		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, common.ErrCancelled):
 			m.transcript.note("stopped")
 		default:
 			m.transcript.fail(msg.err)
@@ -171,7 +172,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.arc = ""
 		switch {
 		case msg.err == nil:
-		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, agent.ErrCancelled):
+		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, common.ErrCancelled):
 			// The cancel is already written down, so the screen only says the
 			// run is over. A run the guard refused a write to arrives as
 			// ErrCancelled and reads the same way.

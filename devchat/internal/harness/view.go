@@ -41,6 +41,11 @@ var (
 			Foreground(lipgloss.Color("8")).
 			Italic(true).
 			PaddingLeft(2)
+	summaryStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderLeft(true).
+			BorderForeground(lipgloss.Color("13")).
+			PaddingLeft(1)
 	toolNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	taskBadgeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("0")).
@@ -102,6 +107,9 @@ func renderBlock(b *block, width int) string {
 
 	case blockNote:
 		return noteStyle.Width(body).Render(b.text)
+
+	case blockSummary:
+		return summaryStyle.Width(body).Render(b.text)
 
 	case blockTool:
 		return renderTool(b, body)

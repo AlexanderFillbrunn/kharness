@@ -52,7 +52,7 @@ type localTasks struct {
 	// unfiled is told about a report that could not be written. Everything a
 	// task says that does reach the log reaches the screen through the event
 	// sink; this is the one case there is nothing in the log to publish.
-	unfiled func(ref agent.TaskRef, err error)
+	unfiled func(ref common.TaskRef, err error)
 }
 
 // localTask is one running goroutine and the two ways to reach it.
@@ -77,7 +77,7 @@ func newLocalTasks() *localTasks {
 
 // attach gives the tasks somewhere to report to, once there is one, and names
 // the agent their reports are worked under.
-func (l *localTasks) attach(reports *ingress.TaskReports, agentID string, unfiled func(agent.TaskRef, error)) {
+func (l *localTasks) attach(reports *ingress.TaskReports, agentID string, unfiled func(common.TaskRef, error)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.reports, l.agentID, l.unfiled = reports, agentID, unfiled
@@ -101,12 +101,12 @@ func (l *localTasks) register(registry *agent.TaskRegistry) error {
 			},
 		},
 	},
-		func(ctx context.Context, ref agent.TaskRef, args any) error {
+		func(ctx context.Context, ref common.TaskRef, args any) error {
 			return l.start(ctx, ref, args, registry)
 		},
 		// Progress reports are arc-opening and coalesced in a two-second
 		// window; detail notes are invisible to the model.
-		agent.WithNotificationClasses(map[string]agent.NotificationClass{
+		common.WithNotificationClasses(map[string]common.NotificationClass{
 			"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: 2 * time.Second},
 			"detail":   {Visibility: events.LLMVisibilityNone},
 		}),
@@ -116,7 +116,7 @@ func (l *localTasks) register(registry *agent.TaskRegistry) error {
 // start launches an audit and returns, the way a call to a job runner would.
 // The context is not the run's, since a task outlives the run that started
 // it.
-func (l *localTasks) start(_ context.Context, ref agent.TaskRef, args any, registry *agent.TaskRegistry) error {
+func (l *localTasks) start(_ context.Context, ref common.TaskRef, args any, registry *agent.TaskRegistry) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	task := &localTask{input: make(chan string, 1), cancel: cancel}
 
@@ -132,7 +132,7 @@ func (l *localTasks) start(_ context.Context, ref agent.TaskRef, args any, regis
 
 // Cancel asks a running audit to stop. It settles nothing: the goroutine
 // reports what became of it, which is what a job runner would do too.
-func (l *localTasks) Cancel(_ context.Context, ref agent.TaskRef, _ string) error {
+func (l *localTasks) Cancel(_ context.Context, ref common.TaskRef, _ string) error {
 	task, ok := l.lookup(ref.ID)
 	if !ok {
 		return fmt.Errorf("task %s is not running here", ref.ID)
@@ -144,7 +144,7 @@ func (l *localTasks) Cancel(_ context.Context, ref agent.TaskRef, _ string) erro
 // ProvideInput hands a waiting audit its answer, and refuses an answer to a
 // question it has moved on from. This is the only place that can: whoever
 // calls decided from a replay taken before the call.
-func (l *localTasks) ProvideInput(_ context.Context, ref agent.TaskRef, requestID, input string) error {
+func (l *localTasks) ProvideInput(_ context.Context, ref common.TaskRef, requestID, input string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -191,7 +191,7 @@ func (l *localTasks) forget(id string) {
 // audit is the work. It reports twice, stops to ask a question, and finishes.
 // Every report goes through the ingress: write the event, and where the event
 // opens an arc, hand it to the work queue.
-func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTask) {
+func (l *localTasks) audit(ctx context.Context, ref common.TaskRef, task *localTask) {
 	defer l.forget(ref.ID)
 
 	if !l.pause(ctx, ref, "scanning namespaces") {
@@ -206,7 +206,7 @@ func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTa
 
 	// The request is named and taken up before it is filed, because filing it
 	// opens the arc, and the answer can be back before report returns.
-	requestID := agent.NewEventID()
+	requestID := common.NewEventID()
 	l.await(ref.ID, requestID)
 	l.report(ref, ingress.TaskReport{
 		Kind: ingress.TaskReportInputRequested, RequestID: requestID,
@@ -232,7 +232,7 @@ func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTa
 
 // pause waits, and says whether the task should carry on. A task that was
 // stopped reports that it was, because nothing else can say so.
-func (l *localTasks) pause(ctx context.Context, ref agent.TaskRef, _ string) bool {
+func (l *localTasks) pause(ctx context.Context, ref common.TaskRef, _ string) bool {
 	select {
 	case <-time.After(auditDelay):
 		return true
@@ -242,7 +242,7 @@ func (l *localTasks) pause(ctx context.Context, ref agent.TaskRef, _ string) boo
 	}
 }
 
-func (l *localTasks) stopped(ref agent.TaskRef) {
+func (l *localTasks) stopped(ref common.TaskRef) {
 	l.report(ref, ingress.TaskReport{
 		Kind:    ingress.TaskReportCompleted,
 		Outcome: events.AsyncTaskOutcomeCancelled,
@@ -259,7 +259,7 @@ func (l *localTasks) stopped(ref agent.TaskRef) {
 // holds it for its class's group window and files one merged report when the
 // window closes; a report that cannot be filed at all is the exception, since
 // there is nothing to publish and nobody above a task to hand the failure to.
-func (l *localTasks) report(ref agent.TaskRef, report ingress.TaskReport) {
+func (l *localTasks) report(ref common.TaskRef, report ingress.TaskReport) {
 	l.mu.Lock()
 	reports, agentID, unfiled := l.reports, l.agentID, l.unfiled
 	metadata, hasDef := l.defs[ref.ID]

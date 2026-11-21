@@ -28,6 +28,9 @@ const (
 	GuardrailBlockedEventType        EventType = "GUARDRAIL_BLOCKED"
 	CancelEventType                  EventType = "CANCEL"
 	ArcClosedEventType               EventType = "ARC_CLOSED"
+	CompactionRequestedEventType     EventType = "COMPACTION_REQUESTED"
+	ArcSuspendedEventType            EventType = "ARC_SUSPENDED"
+	CompactedEventType               EventType = "COMPACTED"
 )
 
 // The names of the two tools every task-carrying agent offers to the model,
