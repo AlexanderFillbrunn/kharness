@@ -1402,4 +1402,5 @@ resolve.
 *`Modes`* — the session's projection settings: how much of each record kind a
 projection discloses. Fixed for the life of the conversation and owned by the
 session layer, which stores them with the session and enforces that they do
-not change; never log content, so no event records them.
+not change; never log content, so no event records them. See
+SETTINGS-HASH.md for how configuration provenance is recorded instead.
