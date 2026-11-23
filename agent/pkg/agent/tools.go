@@ -112,6 +112,20 @@ func SafeToRepeat(tool *mcp.Tool) bool {
 	return tool.Annotations.ReadOnlyHint || tool.Annotations.IdempotentHint
 }
 
+// ReadOnly reports whether a tool declares that it only reads, so calls to it
+// may run beside each other. It answers from the tool's own annotations, so a
+// tool that declares no hint is not read-only.
+//
+// This is deliberately narrower than SafeToRepeat: an idempotent call may
+// still mutate, and two of those racing is what parallel waves exist to
+// prevent. See docs/PARALLEL-TOOLS.md.
+func ReadOnly(tool *mcp.Tool) bool {
+	if tool == nil || tool.Annotations == nil {
+		return false
+	}
+	return tool.Annotations.ReadOnlyHint
+}
+
 // ToolOutcome is what a tool produced, in the terms the log records it in.
 type ToolOutcome struct {
 	Result  any

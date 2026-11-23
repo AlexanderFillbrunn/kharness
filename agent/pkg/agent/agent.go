@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
@@ -80,6 +81,28 @@ type AgentConfig struct {
 	// ContextWindow is the context window of the run's model, resolved from
 	// the catalog at build.
 	ContextWindow int
+
+	// MaxParallelToolCalls caps how many read-only calls one wave of a tool
+	// step runs at once. Zero means DefaultMaxParallelToolCalls, negative
+	// means no cap, and one is fully sequential. See docs/PARALLEL-TOOLS.md.
+	MaxParallelToolCalls int
+}
+
+// DefaultMaxParallelToolCalls is how many read-only calls run at once when
+// the config says nothing.
+const DefaultMaxParallelToolCalls = 4
+
+// parallelCap resolves MaxParallelToolCalls: the configured value where it is
+// positive, the default for zero, and -1 (no cap) for negative.
+func (c *AgentConfig) parallelCap() int {
+	switch {
+	case c.MaxParallelToolCalls < 0:
+		return -1
+	case c.MaxParallelToolCalls == 0:
+		return DefaultMaxParallelToolCalls
+	default:
+		return c.MaxParallelToolCalls
+	}
 }
 
 // inResultTrail resolves how many InResult events one task kind's result
@@ -197,6 +220,13 @@ type agentState struct {
 	foldState *history.FoldState
 	persistor common.EventPersistor
 	tokens    common.Sink[Token]
+
+	// writeMu serializes persistAndFold. A wave settles its calls from
+	// several goroutines at once, and the fold demands events in seq order,
+	// so the persist and the fold have to be one critical section: two
+	// goroutines could otherwise persist out of order and fold the later
+	// one first.
+	writeMu sync.Mutex
 
 	// onCompactionDue is who the run tells when a round writes a new
 	// compaction request. Nil means nobody is told.
@@ -394,6 +424,8 @@ func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*ev
 		ev.SessionID = state.history.SessionID
 	}
 
+	state.writeMu.Lock()
+	defer state.writeMu.Unlock()
 	stored, err := state.persistor.Persist(ctx, evs...)
 	if err != nil {
 		return nil, fmt.Errorf("error persisting %s: %w", eventTypes(evs), err)
@@ -527,6 +559,10 @@ func recordedUsage(usage *TokenUsage) *events.TokenUsage {
 // toolStep runs every call the arc is still waiting on, in the order they were
 // requested. Every pending call it finds has to end settled, since the loop
 // reads the arc to decide what to do next.
+//
+// The calls run in waves, per docs/PARALLEL-TOOLS.md: a contiguous run of
+// read-only calls runs concurrently (chunked to the configured cap), and
+// every other call runs alone. Waves run in emission order.
 func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 	// Collected before any of them runs, because running one writes to the
 	// arc being read.
@@ -539,6 +575,7 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 		}
 	}
 
+	var toRun []*history.ToolCall
 	for _, call := range pending {
 		// A call another run already dispatched may have taken effect. Only a
 		// tool declared safe to repeat gets a second attempt.
@@ -549,12 +586,86 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 			}
 			continue
 		}
+		toRun = append(toRun, call)
+	}
 
-		if err := a.runCall(ctx, call, state); err != nil {
+	for _, wave := range a.waves(toRun) {
+		var err error
+		if len(wave) == 1 {
+			err = a.runCall(ctx, wave[0], state)
+		} else {
+			err = a.runWave(ctx, wave, state)
+		}
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// waves partitions calls, in emission order, into waves: a contiguous run of
+// calls that may run in parallel becomes one wave, chunked to at most the
+// configured cap, and every other call is a wave of its own.
+func (a Agent) waves(calls []*history.ToolCall) [][]*history.ToolCall {
+	limit := a.config.parallelCap()
+	var waves [][]*history.ToolCall
+	for i := 0; i < len(calls); {
+		if !a.parallelizable(calls[i]) {
+			waves = append(waves, calls[i:i+1])
+			i++
+			continue
+		}
+		j := i
+		for j < len(calls) && a.parallelizable(calls[j]) && (limit < 0 || j-i < limit) {
+			j++
+		}
+		waves = append(waves, calls[i:j])
+		i = j
+	}
+	return waves
+}
+
+// parallelizable reports whether a call may join a parallel wave: an ordinary
+// tool declared read-only. Task operations never do, whatever the tool the
+// name resolves to says.
+func (a Agent) parallelizable(call *history.ToolCall) bool {
+	if classify(a.tasks, call.ToolName) != opTool {
+		return false
+	}
+	tool, ok := a.tools.Get(call.ToolName)
+	return ok && ReadOnly(tool)
+}
+
+// runWave runs one wave of read-only calls concurrently. Every dispatch is
+// written in one batch, in emission order, before any of them runs — the same
+// trick recordResponse uses — so a worker that dies mid-wave leaves every
+// dispatch recorded. Each call settles itself when its handler returns, and
+// the wave is done when all of them have; one call's failure settles only
+// that call and does not stop its siblings.
+func (a Agent) runWave(ctx context.Context, wave []*history.ToolCall, state *agentState) error {
+	dispatches := make([]*events.Event, 0, len(wave))
+	for _, call := range wave {
+		dispatches = append(dispatches, &events.Event{
+			Typ:           events.ToolDispatchedEventType,
+			CorrelationID: &state.arc.ID,
+			Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
+		})
+	}
+	if _, err := a.persistAndFold(ctx, state, dispatches...); err != nil {
+		return err
+	}
+
+	errs := make([]error, len(wave))
+	var wg sync.WaitGroup
+	for i, call := range wave {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = a.invokeAndSettle(ctx, call, state)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // runCall hands one call to whatever answers calls by that name. The name
@@ -593,7 +704,13 @@ func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *a
 	if err := a.recordDispatch(ctx, call, state); err != nil {
 		return err
 	}
+	return a.invokeAndSettle(ctx, call, state)
+}
 
+// invokeAndSettle runs a call whose dispatch is already recorded and records
+// what came back. A wave calls this directly, after writing its dispatches in
+// one batch.
+func (a Agent) invokeAndSettle(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	// A handler that returned has said what happened, whatever the context is
 	// doing by then, so the outcome is recorded even for a cancelled run.
 	outcome, err := a.tools.Invoke(ctx, call.ToolName, call.Args)
