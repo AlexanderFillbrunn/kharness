@@ -291,18 +291,20 @@ func hasResolvedSuspension(h *history.History, arc *history.Arc) bool {
 	return false
 }
 
-// computeWatermark draws the cut for a compaction over the log as it stands:
+// computeWatermark draws the cut for a compaction over the session as the fold
+// holds it:
 //
-//	ThroughSeq = min( min(bound(arc) for open arcs) - 1, tailCap )
+//	ThroughSeq = min( min(bound(arc) for open arcs) - 1, h.TailCap(keep) )
 //
 // where bound(arc) is the arc's opening when its own log fits the arc
-// threshold, and its live boundary otherwise, and tailCap is the last turn
-// boundary at or below the backward accumulation of per-event estimates that
-// reaches KeepRecentTokens. The cut never separates a tool call from its
+// threshold, and its live boundary otherwise, and the tail cap is the last
+// turn boundary at or below the backward accumulation of per-record estimates
+// that reaches KeepRecentTokens. The cut never separates a tool call from its
 // result, because a turn boundary is where the projection keeps them
-// contiguous.
-func computeWatermark(log []*events.Event, h *history.History, limits CompactionLimits) int {
-	through := tailCap(log, limits.KeepRecentTokens)
+// contiguous. The fold carries every record with its seq, so the history
+// alone is the source — the raw log is not needed.
+func computeWatermark(h *history.History, limits CompactionLimits) int {
+	through := h.TailCap(limits.KeepRecentTokens)
 	minBound := -1
 	for _, arc := range h.Arcs {
 		switch arc.Status() {
@@ -342,51 +344,6 @@ func liveBoundary(arc *history.Arc) int {
 		}
 	}
 	return last
-}
-
-// tailCap walks backwards from the end of the log, accumulating the per-event
-// estimate until KeepRecentTokens is reached, and returns the last turn
-// boundary at or below that point. Where the whole log estimates below the
-// keep, the cap constrains nothing and the end of the log stands.
-func tailCap(log []*events.Event, keep int) int {
-	if len(log) == 0 {
-		return -1
-	}
-	last := log[len(log)-1].Seq
-	if keep <= 0 {
-		return last
-	}
-	accumulated := 0
-	tokenPoint := -1
-	for i := len(log) - 1; i >= 0; i-- {
-		accumulated += history.EstimateEvent(log[i])
-		if accumulated >= keep {
-			tokenPoint = log[i].Seq
-			break
-		}
-	}
-	if tokenPoint < 0 {
-		return last
-	}
-	cap := -1
-	for i := range log {
-		if log[i].Seq > tokenPoint {
-			break
-		}
-		if isTurnBoundary(log[i]) {
-			cap = log[i].Seq
-		}
-	}
-	if cap < 0 {
-		cap = tokenPoint
-	}
-	return cap
-}
-
-// isTurnBoundary reports whether an event is where a turn begins: an arc's
-// opening record, or an assistant message.
-func isTurnBoundary(ev *events.Event) bool {
-	return events.OpensArc(ev) || ev.Typ == events.AssistantMessageEventType
 }
 
 // CompactionResult is what one compactor produced. What lands in the log must
@@ -584,7 +541,7 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 
 	// One read under the lease: the watermark is fixed at this read and the
 	// summary computation afterwards cannot move the line.
-	log, h, err := w.fold(ctx, sessionID)
+	h, err := w.fold(ctx, sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -599,7 +556,7 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 		return false, fmt.Errorf("resolve the compaction of %s under agent %s: %w", sessionID, agentID, err)
 	}
 
-	through := computeWatermark(log, h, plan.Limits)
+	through := computeWatermark(h, plan.Limits)
 
 	transcript, err := h.ProjectThrough(through, w.modes, plan.Limits.projectionOptions())
 	if err != nil {
@@ -618,7 +575,6 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 			ThroughSeq: through,
 			Summary:    result.Summary,
 			Method:     result.Method,
-			Modes:      w.modes.Wire(),
 			ModelID:    result.ModelID,
 			Usage:      wireUsage(result.Usage),
 		},
@@ -648,23 +604,17 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 	return true, nil
 }
 
-// fold reads the session's whole log once and folds it, returning the events
-// as read alongside the history, so the watermark and the fold see the same
-// read.
-func (w *CompactionWorker) fold(ctx context.Context, sessionID string) ([]*events.Event, *history.History, error) {
+// fold reads the session's whole log once and folds it.
+func (w *CompactionWorker) fold(ctx context.Context, sessionID string) (*history.History, error) {
 	stored, err := w.source.GetEventsForSession(ctx, sessionID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	log := make([]events.Event, 0, len(stored))
 	for _, ev := range stored {
 		log = append(log, *ev)
 	}
-	h, err := history.Replay(sessionID, log)
-	if err != nil {
-		return nil, nil, err
-	}
-	return stored, h, nil
+	return history.Replay(sessionID, log)
 }
 
 // wireUsage carries a compactor's reported cost into the record, dropping a

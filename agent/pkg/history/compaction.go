@@ -16,14 +16,15 @@ import (
 // model is told, never what the fold loads, so a reference to a record below
 // the watermark still resolves here.
 
-// Compacted is one COMPACTED record as the fold holds it.
+// Compacted is one COMPACTED record as the fold holds it. The projection modes
+// the summary was made under are not part of it: modes are session-level
+// configuration owned by the session layer, not log content.
 type Compacted struct {
 	ID         string
 	Seq        int
 	ThroughSeq int
 	Summary    string
 	Method     string
-	Modes      events.ProjectionModes
 	ModelID    string
 	Usage      *events.TokenUsage
 }
@@ -125,7 +126,6 @@ func (h *History) applyCompacted(ev *events.Event, state *FoldState) error {
 		ThroughSeq: pl.ThroughSeq,
 		Summary:    pl.Summary,
 		Method:     pl.Method,
-		Modes:      pl.Modes,
 		ModelID:    pl.ModelID,
 		Usage:      pl.Usage,
 	}
@@ -133,62 +133,6 @@ func (h *History) applyCompacted(ev *events.Event, state *FoldState) error {
 		h.LastCompaction = compacted
 	}
 	return nil
-}
-
-// Wire carries the modes as the events package holds them, so a COMPACTED
-// payload can record the settings its summary was made under. The proto
-// package cannot name this package's types, so the conversion lives here,
-// on the side that can see both.
-func (m Modes) Wire() events.ProjectionModes {
-	return events.ProjectionModes{
-		ForeignArc: m.ForeignArc.String(),
-		Pending:    m.Pending.String(),
-		ToolEvents: m.ToolEvents.String(),
-		Error:      m.Error.String(),
-		Interrupt:  m.Interrupt.String(),
-		QuoteLimit: m.QuoteLimit,
-	}
-}
-
-// ModesFromWire reads the projection settings a COMPACTED payload recorded
-// back into modes, so a reader can tell what a summary was made under.
-func ModesFromWire(w events.ProjectionModes) (Modes, error) {
-	modes := Modes{QuoteLimit: w.QuoteLimit}
-	var err error
-	parse := func(name, value string) (Treatment, error) {
-		switch value {
-		case "":
-			return 0, nil
-		case "elide":
-			return TreatmentElide, nil
-		case "note":
-			return TreatmentNote, nil
-		case "stand_in":
-			return TreatmentStandIn, nil
-		case "keep":
-			return TreatmentKeep, nil
-		}
-		return 0, fmt.Errorf("mode %s is %q, not a treatment", name, value)
-	}
-	if modes.ForeignArc, err = parse("foreign_arc", w.ForeignArc); err != nil {
-		return Modes{}, err
-	}
-	if modes.Pending, err = parse("pending", w.Pending); err != nil {
-		return Modes{}, err
-	}
-	if modes.ToolEvents, err = parse("tool_events", w.ToolEvents); err != nil {
-		return Modes{}, err
-	}
-	if modes.Error, err = parse("error", w.Error); err != nil {
-		return Modes{}, err
-	}
-	if modes.Interrupt, err = parse("interrupt", w.Interrupt); err != nil {
-		return Modes{}, err
-	}
-	if err := modes.Validate(); err != nil {
-		return Modes{}, err
-	}
-	return modes, nil
 }
 
 // Watermark returns the watermark of the compaction in force: the greatest

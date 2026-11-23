@@ -19,12 +19,8 @@ func TestCompactionPayloadsRoundTrip(t *testing.T) {
 			ThroughSeq: 100,
 			Summary:    "the session discussed pods",
 			Method:     "llm",
-			Modes: ProjectionModes{
-				ForeignArc: "keep", Pending: "stand_in", ToolEvents: "elide",
-				Error: "elide", Interrupt: "elide", QuoteLimit: 32,
-			},
-			ModelID: "gpt-5",
-			Usage:   &TokenUsage{Input: 40000, CachedInput: 32000, Output: 800},
+			ModelID:    "gpt-5",
+			Usage:      &TokenUsage{Input: 40000, CachedInput: 32000, Output: 800},
 		},
 	}
 

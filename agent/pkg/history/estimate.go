@@ -1,6 +1,7 @@
 package history
 
 import (
+	"slices"
 	"unicode/utf8"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
@@ -110,6 +111,140 @@ func (h *History) EstimateAbove(watermark int) int {
 // threshold tests when the compaction draws its line.
 func (h *History) EstimateArc(arc *Arc) int {
 	return h.estimateArcAbove(arc, -1)
+}
+
+// foldedRecord is one record of the log as the fold holds it: where it sits
+// in the log, what its projected text estimates to, and whether a turn begins
+// there (an arc's opening or an assistant message).
+type foldedRecord struct {
+	seq          int
+	estimate     int
+	turnBoundary bool
+}
+
+// records returns the session's folded records in log order. The fold stores
+// arcs and tasks separately, so the global order — which interleaves parallel
+// arcs — is restored by sorting on seq, which is unique across the log. Each
+// record's estimate mirrors ProjectedText, so a walk over these is the same
+// walk the raw events would give. Records the projection never emits (a
+// dispatch, a close, a request, a suspension) are kept with a zero estimate,
+// since they occupy a position in the log even where they add no tokens.
+func (h *History) records() []foldedRecord {
+	var records []foldedRecord
+	add := func(seq, estimate int, boundary bool) {
+		records = append(records, foldedRecord{seq: seq, estimate: estimate, turnBoundary: boundary})
+	}
+	for _, arc := range h.Arcs {
+		add(arc.Seq, EstimateTokens(h.OpeningContent(arc)), true)
+		for _, response := range arc.Responses {
+			text := response.Content
+			if len(response.Reasoning) > 0 {
+				text += "\n" + string(response.Reasoning)
+			}
+			add(response.Seq, EstimateTokens(text), true)
+			for _, call := range response.ToolCalls {
+				add(call.Seq, EstimateTokens(call.ToolName+" "+formatValue(call.Args)), false)
+				for _, ev := range call.Events {
+					add(ev.Seq, EstimateTokens(formatValue(ev.Payload)), false)
+				}
+				if call.Interrupt != nil {
+					add(call.Interrupt.Seq, EstimateTokens(call.Interrupt.Reason+" "+formatValue(call.Interrupt.Context)), false)
+					if call.Interrupt.ResolvedSeq != nil {
+						add(*call.Interrupt.ResolvedSeq, EstimateTokens(formatValue(call.Interrupt.Response)), false)
+					}
+				}
+				if call.FinishedSeq != nil {
+					add(*call.FinishedSeq, EstimateTokens(resultText(call.Result)), false)
+				}
+			}
+		}
+		for _, failure := range arc.Errors {
+			add(failure.Seq, EstimateTokens(failure.Message), false)
+		}
+		if arc.Cancel != nil {
+			estimate := 0
+			if arc.Cancel.Reason != nil {
+				estimate = EstimateTokens(*arc.Cancel.Reason)
+			}
+			add(arc.Cancel.Seq, estimate, false)
+		}
+		for _, s := range arc.Suspensions {
+			add(s.Seq, 0, false)
+		}
+		if arc.Closed != nil {
+			add(arc.Closed.Seq, 0, false)
+		}
+	}
+	for _, task := range h.Tasks {
+		add(task.Seq, EstimateTokens(task.TaskName+" "+formatValue(task.Args)), false)
+		for i := range task.Events {
+			add(task.Events[i].Seq, estimateTaskEvent(&task.Events[i]), false)
+		}
+		if task.FinishedSeq != nil {
+			add(*task.FinishedSeq, EstimateTokens(resultText(task.Result)), false)
+		}
+	}
+	for _, req := range h.CompactionRequests {
+		add(req.Seq, 0, false)
+	}
+	if h.LastCompaction != nil {
+		add(h.LastCompaction.Seq, EstimateTokens(h.LastCompaction.Summary), false)
+	}
+	slices.SortFunc(records, func(a, b foldedRecord) int { return a.seq - b.seq })
+	return records
+}
+
+// estimateTaskEvent estimates one task transcript entry the way ProjectedText
+// renders it: a notification or a result as its text, an input question or
+// answer as its message.
+func estimateTaskEvent(ev *AsyncTaskEvent) int {
+	switch ev.Type {
+	case AsyncTaskEventInputRequested, AsyncTaskEventInputProvided:
+		if s, ok := ev.Payload.(string); ok {
+			return EstimateTokens(s)
+		}
+	}
+	return EstimateTokens(resultText(ev.Payload))
+}
+
+// TailCap walks the folded records backwards from the end of the log,
+// accumulating the per-record estimate until keep is reached, and returns the
+// last turn boundary at or below that point. Where the whole log estimates
+// below the keep, the cap constrains nothing and the end of the log stands.
+func (h *History) TailCap(keep int) int {
+	records := h.records()
+	if len(records) == 0 && h.LastSeq == 0 {
+		return -1
+	}
+	last := h.LastSeq
+	if keep <= 0 {
+		return last
+	}
+	accumulated := 0
+	tokenPoint := -1
+	for i := len(records) - 1; i >= 0; i-- {
+		accumulated += records[i].estimate
+		if accumulated >= keep {
+			tokenPoint = records[i].seq
+			break
+		}
+	}
+	if tokenPoint < 0 {
+		return last
+	}
+	cap := -1
+	for _, r := range records {
+		if r.seq > tokenPoint {
+			break
+		}
+		if r.turnBoundary {
+			cap = r.seq
+		}
+	}
+	if cap < 0 {
+		cap = tokenPoint
+	}
+	return cap
 }
 
 // estimateArcAbove estimates one arc's projected records above a watermark.

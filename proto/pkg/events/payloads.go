@@ -10,7 +10,7 @@ type UserMessagePayload struct {
 }
 
 func (UserMessagePayload) EventType() EventType {
-    return UserMessageEventType
+	return UserMessageEventType
 }
 func (UserMessagePayload) eventPayload() {}
 
@@ -40,7 +40,7 @@ type TokenUsage struct {
 }
 
 func (AssistantMessagePayload) EventType() EventType {
-    return AssistantMessageEventType
+	return AssistantMessageEventType
 }
 func (AssistantMessagePayload) eventPayload() {}
 
@@ -52,7 +52,7 @@ type ToolCallPayload struct {
 }
 
 func (ToolCallPayload) EventType() EventType {
-    return ToolCallEventType
+	return ToolCallEventType
 }
 func (ToolCallPayload) eventPayload() {}
 
@@ -67,7 +67,7 @@ type ToolDispatchedPayload struct {
 }
 
 func (ToolDispatchedPayload) EventType() EventType {
-    return ToolDispatchedEventType
+	return ToolDispatchedEventType
 }
 func (ToolDispatchedPayload) eventPayload() {}
 
@@ -78,7 +78,7 @@ type ToolResultPayload struct {
 }
 
 func (ToolResultPayload) EventType() EventType {
-    return ToolResultEventType
+	return ToolResultEventType
 }
 func (ToolResultPayload) eventPayload() {}
 
@@ -88,7 +88,7 @@ type ToolEventPayload struct {
 }
 
 func (ToolEventPayload) EventType() EventType {
-    return ToolEventEventType
+	return ToolEventEventType
 }
 func (ToolEventPayload) eventPayload() {}
 
@@ -108,7 +108,7 @@ type InterruptPayload struct {
 }
 
 func (InterruptPayload) EventType() EventType {
-    return InterruptEventType
+	return InterruptEventType
 }
 func (InterruptPayload) eventPayload() {}
 
@@ -120,7 +120,7 @@ type InterruptResponsePayload struct {
 }
 
 func (InterruptResponsePayload) EventType() EventType {
-    return InterruptResponseEventType
+	return InterruptResponseEventType
 }
 func (InterruptResponsePayload) eventPayload() {}
 
@@ -212,7 +212,7 @@ type AsyncTaskInvokePayload struct {
 }
 
 func (AsyncTaskInvokePayload) EventType() EventType {
-    return AsyncTaskInvokeEventType
+	return AsyncTaskInvokeEventType
 }
 func (AsyncTaskInvokePayload) eventPayload() {}
 
@@ -274,7 +274,7 @@ type AsyncTaskResultPayload struct {
 }
 
 func (AsyncTaskResultPayload) EventType() EventType {
-    return AsyncTaskResultEventType
+	return AsyncTaskResultEventType
 }
 func (AsyncTaskResultPayload) eventPayload() {}
 
@@ -289,7 +289,7 @@ type AsyncTaskEventPayload struct {
 }
 
 func (AsyncTaskEventPayload) EventType() EventType {
-    return AsyncTaskEventEventType
+	return AsyncTaskEventEventType
 }
 func (AsyncTaskEventPayload) eventPayload() {}
 
@@ -300,7 +300,7 @@ type AsyncTaskInputRequestedPayload struct {
 }
 
 func (AsyncTaskInputRequestedPayload) EventType() EventType {
-    return AsyncTaskInputRequestedEventType
+	return AsyncTaskInputRequestedEventType
 }
 func (AsyncTaskInputRequestedPayload) eventPayload() {}
 
@@ -310,18 +310,18 @@ type AsyncTaskInputProvidedPayload struct {
 }
 
 func (AsyncTaskInputProvidedPayload) EventType() EventType {
-    return AsyncTaskInputProvidedEventType
+	return AsyncTaskInputProvidedEventType
 }
 func (AsyncTaskInputProvidedPayload) eventPayload() {}
 
 type ErrorPayload struct {
 	Message     string  `json:"message"`
-	IsFatal		bool    `json:"is_fatal"`
+	IsFatal     bool    `json:"is_fatal"`
 	CausationID *string `json:"causation_id,omitempty"`
 }
 
 func (ErrorPayload) EventType() EventType {
-    return ErrorEventType
+	return ErrorEventType
 }
 func (ErrorPayload) eventPayload() {}
 
@@ -331,7 +331,7 @@ type GuardrailBlockedPayload struct {
 }
 
 func (GuardrailBlockedPayload) EventType() EventType {
-    return GuardrailBlockedEventType
+	return GuardrailBlockedEventType
 }
 func (GuardrailBlockedPayload) eventPayload() {}
 
@@ -357,23 +357,9 @@ type CancelPayload struct {
 }
 
 func (CancelPayload) EventType() EventType {
-    return CancelEventType
+	return CancelEventType
 }
 func (CancelPayload) eventPayload() {}
-
-// ProjectionModes is the wire form of the projection settings a summary was
-// made under. The projection itself lives in the agent module
-// (history.Modes), which this package cannot import — the dependency runs the
-// other way — so the record carries the same settings as plain strings and
-// the agent module converts between the two.
-type ProjectionModes struct {
-	ForeignArc string `json:"foreign_arc,omitempty"`
-	Pending    string `json:"pending,omitempty"`
-	ToolEvents string `json:"tool_events,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Interrupt  string `json:"interrupt,omitempty"`
-	QuoteLimit int    `json:"quote_limit,omitempty"`
-}
 
 // CompactionRequestedPayload records that a compaction of the session was
 // asked for. The event correlates to the arc the asking run was working, or
@@ -419,9 +405,9 @@ type CompactedPayload struct {
 	// or a provider's compaction endpoint.
 	Method string `json:"method"`
 
-	// Modes records the projection settings the summarised transcript was
-	// built under.
-	Modes ProjectionModes `json:"modes,omitempty"`
+	// The projection settings the summarised transcript was built under are
+	// not recorded here: modes are session-level configuration, owned by the
+	// session layer, which pins them for the life of the conversation.
 
 	ModelID string      `json:"model_id,omitempty"`
 	Usage   *TokenUsage `json:"usage,omitempty"`

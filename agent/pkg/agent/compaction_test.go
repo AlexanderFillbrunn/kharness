@@ -166,7 +166,7 @@ func compactedEvent(seq int, id string, through int, summary string) events.Even
 // AC-2: with open arcs whose bounds are 40 and 80 and a tail cap above that,
 // ThroughSeq is 39 — the cut sits just below the oldest open arc's bound.
 func TestComputeWatermarkOpenArcBounds(t *testing.T) {
-	log, h := buildLog(t,
+	_, h := buildLog(t,
 		userEvent(0, "a1", "closed arc"),
 		assistantEvent(1, "a1", "r1", "done", nil),
 		events.Event{SessionID: testSessionID, ID: "close", Seq: 2, Timestamp: time.Unix(2, 0),
@@ -176,7 +176,7 @@ func TestComputeWatermarkOpenArcBounds(t *testing.T) {
 	)
 	limits := testLimits()
 	limits.KeepRecentTokens = 1 // the tail cap reaches the end of the log, above 39
-	through := computeWatermark(log, h, limits)
+	through := computeWatermark(h, limits)
 	if through != 39 {
 		t.Errorf("ThroughSeq = %d, want 39 (min(40, 80) - 1)", through)
 	}
@@ -185,7 +185,7 @@ func TestComputeWatermarkOpenArcBounds(t *testing.T) {
 // Two open arcs whose events interleave still bound at their openings: the
 // bound is read off the arc, not off where its latest event sits.
 func TestComputeWatermarkInterleavedOpenArcs(t *testing.T) {
-	log, h := buildLog(t,
+	_, h := buildLog(t,
 		userEvent(0, "a0", strings.Repeat("x", 40)),
 		assistantEvent(1, "a0", "r0", "done", nil),
 		events.Event{SessionID: testSessionID, ID: "close-a0", Seq: 2, Timestamp: time.Unix(2, 0),
@@ -199,7 +199,7 @@ func TestComputeWatermarkInterleavedOpenArcs(t *testing.T) {
 	)
 	limits := testLimits()
 	limits.KeepRecentTokens = 100000 // the tail cap reaches the end of the log
-	through := computeWatermark(log, h, limits)
+	through := computeWatermark(h, limits)
 	// Both arcs are open and fit the threshold, so each bounds at its
 	// opening; the cut is the smallest opening minus one, however the events
 	// interleave above it.
@@ -211,7 +211,7 @@ func TestComputeWatermarkInterleavedOpenArcs(t *testing.T) {
 // An open arc whose own log fits the threshold bounds at its opening; one
 // over the threshold bounds at its live boundary, its last response.
 func TestComputeWatermarkLongOpenArcBoundsAtLiveBoundary(t *testing.T) {
-	log, h := buildLog(t,
+	_, h := buildLog(t,
 		userEvent(0, "a0", "closed"),
 		assistantEvent(1, "a0", "r0", "done", nil),
 		events.Event{SessionID: testSessionID, ID: "close-a0", Seq: 2, Timestamp: time.Unix(2, 0),
@@ -224,12 +224,12 @@ func TestComputeWatermarkLongOpenArcBoundsAtLiveBoundary(t *testing.T) {
 	limits.KeepRecentTokens = 100000 // the tail cap reaches the end of the log
 
 	limits.ArcThresholdTokens = 100000 // a1 fits: the bound is its opening
-	if got := computeWatermark(log, h, limits); got != 2 {
+	if got := computeWatermark(h, limits); got != 2 {
 		t.Errorf("fitting arc: ThroughSeq = %d, want 2 (opening 3 minus 1)", got)
 	}
 
 	limits.ArcThresholdTokens = 100 // a1's log estimates over it: the bound is its live boundary
-	if got := computeWatermark(log, h, limits); got != 4 {
+	if got := computeWatermark(h, limits); got != 4 {
 		t.Errorf("over-threshold arc: ThroughSeq = %d, want 4 (live boundary 5 minus 1)", got)
 	}
 }
@@ -268,17 +268,17 @@ func TestTailCapIsLastTurnBoundaryAtOrBelowTheTokenPoint(t *testing.T) {
 
 	limits := testLimits()
 	limits.KeepRecentTokens = 25
-	if got := tailCap(log, limits.KeepRecentTokens); got != 1 {
+	if got := h2.TailCap(limits.KeepRecentTokens); got != 1 {
 		t.Errorf("tailCap = %d, want 1 (accumulation reaches 25 at seq 1, a turn boundary)", got)
 	}
-	through := computeWatermark(log, h2, limits)
+	through := computeWatermark(h2, limits)
 	if through > 1 {
 		t.Errorf("ThroughSeq = %d, want at most the tail cap 1", through)
 	}
 
 	// When the whole log estimates below K, the cap constrains nothing.
 	limits.KeepRecentTokens = 100000
-	if got := tailCap(log, limits.KeepRecentTokens); got != 5 {
+	if got := h2.TailCap(limits.KeepRecentTokens); got != 5 {
 		t.Errorf("tailCap = %d, want the end of the log 5 when the whole log is below K", got)
 	}
 }
@@ -768,10 +768,9 @@ func TestWatermarkNeverStraddlesCallAndResult(t *testing.T) {
 		assistantEvent(4, "a1", "r2", strings.Repeat("w", 40), nil),
 		userEvent(5, "a2", strings.Repeat("v", 40)),
 	)
-	log, _ := store.GetEventsForSession(context.Background(), testSessionID)
 	limits := testLimits()
 	limits.KeepRecentTokens = 15 // token point lands inside the log; the cap snaps to a turn boundary
-	through := computeWatermark(log, h, limits)
+	through := computeWatermark(h, limits)
 	if through == 2 {
 		t.Error("ThroughSeq = 2 separates the call at seq 2 from its result at seq 3")
 	}

@@ -50,8 +50,10 @@ Records and watermark.
 
 *REQ-1* The store gains `COMPACTION_REQUESTED`, `ARC_SUSPENDED` and
 `COMPACTED`; the `COMPACTED` payload carries `ThroughSeq` (the watermark, in
-the payload and not the record's position), `Summary`, `Method`, `Modes`,
-`ModelID` and `Usage`. See The record.
+the payload and not the record's position), `Summary`, `Method`, `ModelID`
+and `Usage`. The projection modes the summary was made under are not log
+content: they are session-level configuration owned by the session layer,
+which pins them for the life of the conversation. See The record.
 
 *REQ-2* The compaction in force for a turn starting at seq S is the
 `COMPACTED` with the greatest `ThroughSeq` among those written at or before
@@ -68,8 +70,9 @@ The cut.
 where `bound(arc)` is `opening(arc)` when the arc's log fits the arc
 threshold at watermark-computation time and `liveBoundary(arc)` otherwise,
 and `tailCap` is the last turn boundary at or below the backward
-accumulation of per-event estimates that reaches `KeepRecentTokens`. See
-Where the cut goes.
+accumulation of per-record estimates over the folded log (each record's
+projected text, the same material the raw event would give) that reaches
+`KeepRecentTokens`. See Where the cut goes.
 
 *REQ-5* The cut never separates a tool call from its result, never straddles
 a fitting open arc, and keeps every open arc's live material above the line.
@@ -178,7 +181,8 @@ of 200, `ThroughSeq = 39`. For every log: no tool call/result pair
 straddles `ThroughSeq`, and every open arc's opening request and last
 response are above it.
 
-*AC-3* (REQ-4) Given per-event estimates and `KeepRecentTokens` K, `tailCap`
+*AC-3* (REQ-4) Given per-record estimates over the folded log and
+`KeepRecentTokens` K, `tailCap`
 is the last turn boundary T with the estimated tokens above T at least K,
 and `ThroughSeq ≤ T`; when the whole log estimates below K the cap
 constrains nothing.
@@ -322,10 +326,9 @@ payload is along these lines.
         // with a note, or a provider's compaction endpoint.
         Method string
 
-        // Modes records the projection settings the summarised
-        // transcript was built under. A summary made under other
-        // settings describes a conversation this session never had.
-        Modes history.Modes
+        // The projection modes the summary was made under are not
+        // recorded: they are session-level configuration, pinned by
+        // the session layer for the life of the conversation.
 
         ModelID string
         Usage   *TokenUsage
@@ -372,7 +375,8 @@ applies.
 
 *A tail stays above the cut.* The last `KeepRecentTokens` of the log are
 never summarised. Walking backwards from the end of the log as it stands when
-the compaction computes its watermark and accumulating the per-event
+the compaction computes its watermark — over the fold's records in seq order,
+which is the log as the fold holds it — and accumulating the per-record
 estimate (`ceil(chars/4)`, defined under When compaction runs) until
 `KeepRecentTokens` is reached gives a token point; the last turn boundary at
 or below it is `tailCap`. The tail is measured on the projection, the same
@@ -737,10 +741,11 @@ One constraint on every implementation: what lands in the log must be text.
 An opaque handle to server-held state produces a summary only that provider
 can read, and the session stops being portable across models.
 
-The method that ran is named in the `COMPACTED` payload, as `Modes` is: a
-summary is a faithful account of the conversation only under the method and
-settings that made it, and a reader deciding how much to trust it needs to
-know which produced it.
+The method that ran is named in the `COMPACTED` payload: a summary is a
+faithful account of the conversation only under the method that made it, and
+a reader deciding how much to trust it needs to know which produced it. The
+projection modes are not in the payload — they are the session's, pinned by
+the session layer, so every reader of the conversation shares them.
 
 Reasoning does not survive compaction. It belongs to one assistant message,
 and a message that has been summarised away takes it with it.
@@ -1329,7 +1334,8 @@ response; the only part of an open arc the cut may pass through.
 
 *Tail cap (`KeepRecentTokens`, `tailCap`)* — the last tokens of the log that
 are never summarised; `tailCap` is the last turn boundary at or below the
-backward accumulation of per-event estimates that reaches `KeepRecentTokens`.
+backward accumulation of per-record estimates over the folded log that
+reaches `KeepRecentTokens`.
 
 *Skeleton* — how a spanning arc renders against the cut: the opening request
 verbatim, tool calls without their results above the line, the live part
@@ -1393,5 +1399,7 @@ endpoint.
 task; the fold's task table is what lets a reference below the watermark
 resolve.
 
-*`Modes`* — the projection settings a summary was made under; recorded in
-the `COMPACTED` payload.
+*`Modes`* — the session's projection settings: how much of each record kind a
+projection discloses. Fixed for the life of the conversation and owned by the
+session layer, which stores them with the session and enforces that they do
+not change; never log content, so no event records them.

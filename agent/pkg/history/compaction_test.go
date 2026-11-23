@@ -496,29 +496,6 @@ func renderAll(messages []ModelMessage) string {
 
 var _ = users.Actor{}
 
-// The modes a summary was made under cross the wire as plain strings and read
-// back into Modes, so a reader can tell what a COMPACTED was built under.
-func TestModesWireRoundTrip(t *testing.T) {
-	modes := Modes{
-		ForeignArc: TreatmentNote,
-		Pending:    TreatmentStandIn,
-		ToolEvents: TreatmentElide,
-		Error:      TreatmentNote,
-		Interrupt:  TreatmentElide,
-		QuoteLimit: 64,
-	}
-	back, err := ModesFromWire(modes.Wire())
-	if err != nil {
-		t.Fatalf("ModesFromWire: %v", err)
-	}
-	if back != modes {
-		t.Errorf("round trip = %+v, want %+v", back, modes)
-	}
-	if _, err := ModesFromWire(events.ProjectionModes{ForeignArc: "bogus"}); err == nil {
-		t.Error("a wire mode that is not a treatment decoded")
-	}
-}
-
 // A request correlated to an arc the log does not hold is rejected at the
 // fold, like any other reference to a missing record; one written outside any
 // run carries no correlation and folds fine.
@@ -582,21 +559,5 @@ func TestProjectedTextPerPayload(t *testing.T) {
 		if got := ProjectedText(ev); got != c.want {
 			t.Errorf("%s: ProjectedText = %q, want %q", c.name, got, c.want)
 		}
-	}
-}
-
-// ModesFromWire rejects a treatment name outside the vocabulary, and a mode
-// set to a treatment its own vocabulary does not allow.
-func TestModesFromWireRejectsBadValues(t *testing.T) {
-	wire := DefaultModes().Wire()
-	wire.ForeignArc = "everything"
-	if _, err := ModesFromWire(wire); err == nil {
-		t.Error("an unknown treatment name was accepted")
-	}
-
-	wire = DefaultModes().Wire()
-	wire.Error = "keep" // error allows only note or elide
-	if _, err := ModesFromWire(wire); err == nil {
-		t.Error("a keep error mode was accepted")
 	}
 }
