@@ -120,6 +120,14 @@ type Agent struct {
 	tools  ToolProvider
 	llm    LLM
 
+	// systemPrompt is the config's prompt with the skills catalog appended,
+	// built once at NewAgent rather than per run. See WithSkills.
+	systemPrompt string
+
+	// skills is the set the load_skill tool answers from. Nil for an agent
+	// configured with no skills, in which case the tool is not offered.
+	skills SkillSet
+
 	// tasks and controller are the two halves of async work: what may be
 	// started, and how something already running is reached. Both are nil for
 	// an agent that runs no tasks.
@@ -144,6 +152,21 @@ func WithTasks(tasks *TaskRegistry, controller common.TaskController) AgentOptio
 	}
 }
 
+// WithSkills gives an agent the skills its definition names. Both model-facing
+// halves are derived here, once: the catalog appended to the system prompt,
+// and the load_skill tool, which NewAgent folds into the tool set. A nil or
+// empty set means no skills and changes nothing.
+func WithSkills(skills SkillSet) AgentOption {
+	return func(a *Agent) error {
+		if skills == nil || len(skills.All()) == 0 {
+			return nil
+		}
+		a.skills = skills
+		a.systemPrompt = skillsCatalog(a.config.SystemPrompt, skills)
+		return nil
+	}
+}
+
 // NewAgent builds an agent from the parts it runs on. A nil config or tool
 // provider means no system prompt and an empty registry. A model is required.
 func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...AgentOption) (*Agent, error) {
@@ -157,22 +180,32 @@ func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...Agent
 		tools = NewToolRegistry()
 	}
 
-	agent := &Agent{config: config, tools: tools, llm: llm}
+	agent := &Agent{config: config, tools: tools, llm: llm, systemPrompt: config.SystemPrompt}
 	for _, option := range options {
 		if err := option(agent); err != nil {
 			return nil, err
 		}
 	}
 
+	// The skills' load_skill tool is one more tool by name, so a tool
+	// registered under that name collides with it the way two tools with one
+	// name do.
+	if agent.skills != nil {
+		if _, taken := tools.Get(LoadSkillToolName); taken {
+			return nil, fmt.Errorf("%s is registered as a tool and is the tool skills are loaded with", LoadSkillToolName)
+		}
+		agent.tools = combineProviders(tools, loadSkillProvider{skills: agent.skills})
+	}
+
 	// The model picks by name and the agent routes by name, so one name
 	// registered twice is a call that reaches whichever is checked first.
 	for _, name := range agent.tasks.Names() {
-		if _, taken := tools.Get(name); taken {
+		if _, taken := agent.tools.Get(name); taken {
 			return nil, fmt.Errorf("%s is registered as both a tool and a task", name)
 		}
 	}
 	for _, name := range []string{events.CancelTaskToolName, events.ProvideTaskInputToolName} {
-		if _, taken := tools.Get(name); taken && agent.tasks != nil {
+		if _, taken := agent.tools.Get(name); taken && agent.tasks != nil {
 			return nil, fmt.Errorf("%s is registered as a tool and is one of the tools tasks are addressed with", name)
 		}
 	}
@@ -463,7 +496,7 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 		return fmt.Errorf("project arc %s: %w", state.arc.ID, err)
 	}
 	response, err := a.llm.StreamResponse(ctx, transcript, &LLMOptions{
-		SystemPrompt: a.config.SystemPrompt,
+		SystemPrompt: a.systemPrompt,
 		Tools:        CombineTools(a.tools, taskToolSet{a.tasks}),
 	}, state.tokenSink(messageID))
 	// A rejection the provider recognises as over budget is recovered, not

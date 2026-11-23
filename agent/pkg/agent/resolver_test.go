@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func TestFileResolverIgnoresTheAgentIDAndRereadsOnChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settingsJSON("first", "gpt-5")), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, scriptedModels)
 
 	first, err := resolver.ResolveAgent(context.Background(), "anybody")
 	if err != nil {
@@ -164,7 +165,7 @@ func settingsJSON(prompt, model string) string {
 }
 
 func TestFileResolverFailsOnAMissingFile(t *testing.T) {
-	resolver := NewFileResolver(filepath.Join(t.TempDir(), "absent.json"), nil, scriptedModels)
+	resolver := NewFileResolver(filepath.Join(t.TempDir(), "absent.json"), nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("a settings file that is not there resolved")
 	}
@@ -177,7 +178,7 @@ func TestFileResolverRefusesSettingsNamingNoModel(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"system_prompt":"a prompt"}`), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming no model resolved")
 	}
@@ -242,7 +243,7 @@ func TestFileResolverRefusesAnUnknownModelSource(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming a model source nothing holds resolved")
 	}
@@ -283,7 +284,7 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 	}
 
 	path := write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
-	resolver := NewFileResolver(path, nil, roleModels)
+	resolver := NewFileResolver(path, nil, nil, roleModels)
 	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -294,7 +295,7 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 
 	// No task_role: the client keeps its default.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"}}`)
-	resolver = NewFileResolver(path, nil, roleModels)
+	resolver = NewFileResolver(path, nil, nil, roleModels)
 	if agent, err = resolver.ResolveAgent(context.Background(), testAgentID); err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
 	}
@@ -304,14 +305,14 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 
 	// A role the client refuses is a settings error.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"bogus"}`)
-	resolver = NewFileResolver(path, nil, roleModels)
+	resolver = NewFileResolver(path, nil, nil, roleModels)
 	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("an unknown task_role resolved")
 	}
 
 	// A client that cannot carry a task role at all is a settings error too.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
-	resolver = NewFileResolver(path, nil, scriptedModels)
+	resolver = NewFileResolver(path, nil, nil, scriptedModels)
 	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("task_role against a model without a setter resolved")
 	}
@@ -332,7 +333,7 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, scriptedModels)
 	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -375,7 +376,7 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	if err := os.WriteFile(plain, []byte(settingsJSON("p", "unknown-model")), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver = NewFileResolver(plain, nil, scriptedModels)
+	resolver = NewFileResolver(plain, nil, nil, scriptedModels)
 	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -388,5 +389,117 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	}
 	if agent.config.ContextWindow != DefaultContextWindow {
 		t.Errorf("context window = %d, want the catalog default %d for an unknown model", agent.config.ContextWindow, DefaultContextWindow)
+	}
+}
+
+// fakeSkillSource holds canned skills by name.
+type fakeSkillSource map[string]Skill
+
+func (s fakeSkillSource) Get(name string) (Skill, bool) {
+	skill, ok := s[name]
+	return skill, ok
+}
+
+func testSkillSource() fakeSkillSource {
+	return fakeSkillSource{
+		"git-workflow": {Name: "git-workflow", Description: "Commit and push this repo's way"},
+		"deploy":       {Name: "deploy", Description: "Deploy the service"},
+	}
+}
+
+// The skills a definition names are the skills the agent offers, in the order
+// they are named, each held by the source that names it — the tool selection's
+// mirror.
+func TestSelectSkillsOffersTheNamedSkillsFromTheirSources(t *testing.T) {
+	sources := map[string]SkillSource{"local": testSkillSource()}
+	selected, err := SelectSkills([]SkillRef{
+		{Source: "local", Name: "deploy"},
+		{Source: "local", Name: "git-workflow"},
+	}, sources)
+	if err != nil {
+		t.Fatalf("SelectSkills: %v", err)
+	}
+	names := make([]string, 0, 2)
+	for _, skill := range selected.All() {
+		names = append(names, skill.Name)
+	}
+	if !slices.Equal(names, []string{"deploy", "git-workflow"}) {
+		t.Errorf("offered %v, want the named skills in the named order", names)
+	}
+	if _, ok := selected.Get("other"); ok {
+		t.Error("a skill the definition did not name is offered")
+	}
+}
+
+func TestSelectSkillsRefusesWhatItCannotResolve(t *testing.T) {
+	sources := map[string]SkillSource{"local": testSkillSource()}
+	for name, refs := range map[string][]SkillRef{
+		"an unknown source":   {{Source: "nowhere", Name: "deploy"}},
+		"an unknown skill":    {{Source: "local", Name: "other"}},
+		"a skill named twice": {{Source: "local", Name: "deploy"}, {Source: "local", Name: "deploy"}},
+	} {
+		if _, err := SelectSkills(refs, sources); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+// The skills block resolves into the agent: the catalog is appended to the
+// prompt at build, and load_skill is offered. A skill the process does not
+// hold is a settings error, like a tool it does not hold.
+func TestFileResolverResolvesTheSkillsBlock(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "agents.json")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+		return path
+	}
+	skillSources := map[string]SkillSource{"local": testSkillSource()}
+
+	path := write(t, `{
+		"system_prompt": "a prompt",
+		"model": {"source": "test", "name": "gpt-5"},
+		"skills": [{"source": "local", "name": "git-workflow"}]
+	}`)
+	resolver := NewFileResolver(path, nil, skillSources, scriptedModels)
+	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if agent.skills == nil {
+		t.Fatal("the agent holds no skills")
+	}
+	if !strings.Contains(agent.systemPrompt, "<name>git-workflow</name>") {
+		t.Errorf("the prompt has no catalog for the named skill:\n%s", agent.systemPrompt)
+	}
+	if _, ok := agent.tools.Get(LoadSkillToolName); !ok {
+		t.Error("load_skill is not offered")
+	}
+
+	// A skill no source holds refuses the whole definition.
+	path = write(t, `{
+		"system_prompt": "a prompt",
+		"model": {"source": "test", "name": "gpt-5"},
+		"skills": [{"source": "local", "name": "other"}]
+	}`)
+	resolver = NewFileResolver(path, nil, skillSources, scriptedModels)
+	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
+		t.Error("settings naming a skill nothing holds resolved")
+	}
+
+	// No skills block: no catalog, no load_skill.
+	path = write(t, settingsJSON("p", "gpt-5"))
+	resolver = NewFileResolver(path, nil, skillSources, scriptedModels)
+	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if agent.skills != nil || strings.Contains(agent.systemPrompt, "available_skills") {
+		t.Errorf("an agent built without a skills block carries skills: %q", agent.systemPrompt)
+	}
+	if _, ok := agent.tools.Get(LoadSkillToolName); ok {
+		t.Error("load_skill is offered without a skills block")
 	}
 }

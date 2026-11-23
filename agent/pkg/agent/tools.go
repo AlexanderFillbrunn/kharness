@@ -35,6 +35,47 @@ func (c combinedTools) All() []*mcp.Tool {
 	return tools
 }
 
+// combineProviders presents several providers as one: All concatenates in
+// order, and Get and Invoke go to the first provider that holds the name.
+func combineProviders(providers ...ToolProvider) ToolProvider { return combinedProviders(providers) }
+
+type combinedProviders []ToolProvider
+
+func (c combinedProviders) All() []*mcp.Tool {
+	var tools []*mcp.Tool
+	for _, provider := range c {
+		if provider == nil {
+			continue
+		}
+		tools = append(tools, provider.All()...)
+	}
+	return tools
+}
+
+func (c combinedProviders) Get(name string) (*mcp.Tool, bool) {
+	for _, provider := range c {
+		if provider == nil {
+			continue
+		}
+		if tool, ok := provider.Get(name); ok {
+			return tool, true
+		}
+	}
+	return nil, false
+}
+
+func (c combinedProviders) Invoke(ctx context.Context, name string, args any) (ToolOutcome, error) {
+	for _, provider := range c {
+		if provider == nil {
+			continue
+		}
+		if _, ok := provider.Get(name); ok {
+			return provider.Invoke(ctx, name, args)
+		}
+	}
+	return ToolOutcome{}, fmt.Errorf("tool not registered: %s", name)
+}
+
 type ToolRegistry struct {
 	tools map[string]registeredTool
 }

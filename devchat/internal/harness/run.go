@@ -87,7 +87,14 @@ func Run(storePath, settingsPath, userID string) error {
 	// "local" is the one tool source this harness holds: the fake tools
 	// compiled into it. A settings file may name no other.
 	sources := map[string]agent.ToolProvider{"local": registry}
-	resolver := agent.NewFileResolver(settingsPath, sources, modelSources, agent.WithTasks(tasks, runner))
+
+	// Skills live next to the settings file, in the Agent Skills layout:
+	// <settings dir>/skills/<name>/SKILL.md. Like the tools, a settings file
+	// may name no skill source but "local".
+	skillSources := map[string]agent.SkillSource{
+		"local": newFileSkillSource(filepath.Join(filepath.Dir(settingsPath), "skills")),
+	}
+	resolver := agent.NewFileResolver(settingsPath, sources, skillSources, modelSources, agent.WithTasks(tasks, runner))
 
 	// The sinks report into the interface, and the interface cannot exist
 	// until the model is built, so they go through a sender that is pointed at
@@ -249,9 +256,14 @@ func (s *compactionStarter) StartCompaction(_ context.Context, sessionID, reques
 
 // writeDefaultSettings leaves a settings file for the resolver to read, so a
 // first run has an agent and the prompt, the model and the tools are there to
-// be edited. The tools are the fake ones this harness registers, since a
-// definition can only pick what its process holds.
+// be edited. The tools are the fake ones this harness registers, and the skill
+// is the sample one written beside them, since a definition can only pick
+// what its process holds.
 func writeDefaultSettings(path string) error {
+	skillsRoot := filepath.Join(filepath.Dir(path), "skills")
+	if err := writeDefaultSkill(skillsRoot); err != nil {
+		return err
+	}
 	settings := agent.AgentSettings{
 		SystemPrompt: defaultSystemPrompt,
 		Model:        agent.ModelRef{Source: "openai", Name: "gpt-5"},
@@ -261,8 +273,67 @@ func writeDefaultSettings(path string) error {
 			{Source: "local", Name: "wait"},
 			{Source: "local", Name: "restart_deployment"},
 		},
+		Skills: []agent.SkillRef{{Source: "local", Name: defaultSkillName}},
 	}
 	return writeSettings(path, settings)
+}
+
+// defaultSkillName is the one skill a first run ships, so the skills list in
+// the default settings resolves.
+const defaultSkillName = "devchat-workflow"
+
+// defaultSkillFiles are written under <root>/<defaultSkillName>/ on a first
+// run, and left alone after that: a skill is the user's to edit.
+var defaultSkillFiles = map[string]string{
+	"SKILL.md": `---
+name: devchat-workflow
+description: >-
+  How to drive this devchat harness: the canned tools it offers, when to use
+  background tasks, and how to read what they report.
+---
+
+# Devchat workflow
+
+This harness runs one agent over a file-backed log, with canned Kubernetes
+tools and background tasks.
+
+- Read state with list_pods before changing anything. restart_deployment
+  asks for a rollout but this harness touches no cluster, so it only reports
+  what it was asked to do.
+- Long waits go through the wait tool, which caps them at 15 seconds.
+
+See references/tools.md for what each canned tool answers.
+`,
+	"references/tools.md": `# Canned tools
+
+| Tool | Answers |
+| --- | --- |
+| list_pods | The fake pods and their phase, optionally filtered by namespace. |
+| wait | How long it waited, shortened to the 15 second cap where asked for more. |
+| restart_deployment | What it was asked to restart; nothing is actually restarted. |
+
+A call that a stopped run never reported on says so in its result, since
+whether it took effect is not known.
+`,
+}
+
+// writeDefaultSkill leaves the sample skill on disk unless it is already
+// there.
+func writeDefaultSkill(root string) error {
+	dir := filepath.Join(root, defaultSkillName)
+	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err == nil {
+		return nil
+	}
+	for name, content := range defaultSkillFiles {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // readSettings parses the settings file, for the interface as much as the

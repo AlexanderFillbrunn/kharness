@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -88,6 +89,14 @@ type ToolRef struct {
 	Name   string `json:"name"`
 }
 
+// SkillRef names one skill a definition wants: the source that holds it, and
+// the skill's name there. Like a tool ref, it names what the process holds —
+// where the skill's files live is the source's business, not the definition's.
+type SkillRef struct {
+	Source string `json:"source"`
+	Name   string `json:"name"`
+}
+
 // AgentSettings is what a definition says an agent is: what the model is
 // told, which model to ask, and which tools to offer. It holds only what a
 // definition can say, which is why the tools are names and the model is a
@@ -96,6 +105,11 @@ type AgentSettings struct {
 	SystemPrompt string    `json:"system_prompt"`
 	Model        ModelRef  `json:"model"`
 	Tools        []ToolRef `json:"tools"`
+
+	// Skills is the list of skills the agent offers: each named by source and
+	// name, resolved like the tools. The agent derives the available_skills
+	// catalog in the system prompt and the load_skill tool from them.
+	Skills []SkillRef `json:"skills,omitempty"`
 
 	// TaskRole names the provider role the opening message of a task-opened
 	// arc is carried as — "developer" where the model has an operator role,
@@ -177,6 +191,7 @@ type ModelFactory func(ref ModelRef) (LLM, error)
 type FileResolver struct {
 	path         string
 	toolSources  map[string]ToolProvider
+	skillSources map[string]SkillSource
 	modelSources map[string]ModelFactory
 	options      []AgentOption
 
@@ -186,10 +201,10 @@ type FileResolver struct {
 }
 
 // NewFileResolver reads agent settings from the file at path, building its
-// agent from the tool sources, the model sources and the options given, which
-// are the parts a file cannot supply.
-func NewFileResolver(path string, toolSources map[string]ToolProvider, modelSources map[string]ModelFactory, options ...AgentOption) *FileResolver {
-	return &FileResolver{path: path, toolSources: toolSources, modelSources: modelSources, options: options}
+// agent from the tool sources, the skill sources, the model sources and the
+// options given, which are the parts a file cannot supply.
+func NewFileResolver(path string, toolSources map[string]ToolProvider, skillSources map[string]SkillSource, modelSources map[string]ModelFactory, options ...AgentOption) *FileResolver {
+	return &FileResolver{path: path, toolSources: toolSources, skillSources: skillSources, modelSources: modelSources, options: options}
 }
 
 // ResolveAgent returns the agent the settings file describes, reading it
@@ -284,6 +299,14 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	options := f.options
+	if len(settings.Skills) > 0 {
+		skills, err := SelectSkills(settings.Skills, f.skillSources)
+		if err != nil {
+			return nil, err
+		}
+		options = append(slices.Clone(f.options), WithSkills(skills))
+	}
 	factory, ok := f.modelSources[settings.Model.Source]
 	if !ok {
 		return nil, fmt.Errorf("no model source %s is held by this process", settings.Model.Source)
@@ -320,7 +343,7 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 
 	// The compactor the method names is not built here: the agent only checks
 	// budgets and writes records, and ResolveCompaction equips the worker.
-	return NewAgent(config, tools, llm, f.options...)
+	return NewAgent(config, tools, llm, options...)
 }
 
 // contextWindowFor resolves the context window of a model: the settings'
@@ -444,4 +467,54 @@ func (s selectedTools) Invoke(ctx context.Context, name string, args any) (ToolO
 		return ToolOutcome{}, fmt.Errorf("tool not selected: %s", name)
 	}
 	return source.Invoke(ctx, name, args)
+}
+
+// SelectSkills turns the skills a definition names into the set that offers
+// exactly those, in the order they are named, each held by the source that
+// names it. It refuses what it cannot resolve, for the same reasons
+// SelectTools does: a definition that silently offered fewer skills than it
+// asked for would have the model plan around skills that do not exist, and one
+// name must mean one skill.
+func SelectSkills(refs []SkillRef, sources map[string]SkillSource) (SkillSet, error) {
+	selected := selectedSkills{order: []string{}, byName: map[string]SkillSource{}}
+	for _, ref := range refs {
+		source, ok := sources[ref.Source]
+		if !ok {
+			return nil, fmt.Errorf("no skill source %s is held by this process", ref.Source)
+		}
+		if _, ok := source.Get(ref.Name); !ok {
+			return nil, fmt.Errorf("skill source %s holds no skill %s", ref.Source, ref.Name)
+		}
+		if _, taken := selected.byName[ref.Name]; taken {
+			return nil, fmt.Errorf("skill %s is named twice", ref.Name)
+		}
+		selected.byName[ref.Name] = source
+		selected.order = append(selected.order, ref.Name)
+	}
+	return selected, nil
+}
+
+// selectedSkills offers the skills a definition named, each held by the source
+// that names it.
+type selectedSkills struct {
+	order  []string
+	byName map[string]SkillSource
+}
+
+func (s selectedSkills) All() []Skill {
+	skills := make([]Skill, 0, len(s.order))
+	for _, name := range s.order {
+		if skill, ok := s.byName[name].Get(name); ok {
+			skills = append(skills, skill)
+		}
+	}
+	return skills
+}
+
+func (s selectedSkills) Get(name string) (Skill, bool) {
+	source, ok := s.byName[name]
+	if !ok {
+		return Skill{}, false
+	}
+	return source.Get(name)
 }
