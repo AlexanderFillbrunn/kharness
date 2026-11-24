@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -97,6 +98,14 @@ type SkillRef struct {
 	Name   string `json:"name"`
 }
 
+// TaskRef names one kind of task a definition wants: the source that runs it,
+// and the task's name there. Like a tool ref, it names what the process holds —
+// the source holds both the kind's metadata and the controller that starts it.
+type TaskRef struct {
+	Source string `json:"source"`
+	Name   string `json:"name"`
+}
+
 // AgentSettings is what a definition says an agent is: what the model is
 // told, which model to ask, and which tools to offer. It holds only what a
 // definition can say, which is why the tools are names and the model is a
@@ -110,6 +119,12 @@ type AgentSettings struct {
 	// name, resolved like the tools. The agent derives the available_skills
 	// catalog in the system prompt and the load_skill tool from them.
 	Skills []SkillRef `json:"skills,omitempty"`
+
+	// Tasks is the list of task kinds the agent may start: each named by
+	// source and name, resolved like the tools. The agent derives one tool
+	// per kind plus the two that address a running task, and starts each
+	// kind through the source's controller.
+	Tasks []TaskRef `json:"tasks,omitempty"`
 
 	// TaskRole names the provider role the opening message of a task-opened
 	// arc is carried as — "developer" where the model has an operator role,
@@ -192,6 +207,7 @@ type FileResolver struct {
 	path         string
 	toolSources  map[string]ToolProvider
 	skillSources map[string]SkillSource
+	taskSources  map[string]TaskSource
 	modelSources map[string]ModelFactory
 	options      []AgentOption
 
@@ -201,10 +217,10 @@ type FileResolver struct {
 }
 
 // NewFileResolver reads agent settings from the file at path, building its
-// agent from the tool sources, the skill sources, the model sources and the
-// options given, which are the parts a file cannot supply.
-func NewFileResolver(path string, toolSources map[string]ToolProvider, skillSources map[string]SkillSource, modelSources map[string]ModelFactory, options ...AgentOption) *FileResolver {
-	return &FileResolver{path: path, toolSources: toolSources, skillSources: skillSources, modelSources: modelSources, options: options}
+// agent from the tool sources, the skill sources, the task sources, the model
+// sources and the options given, which are the parts a file cannot supply.
+func NewFileResolver(path string, toolSources map[string]ToolProvider, skillSources map[string]SkillSource, taskSources map[string]TaskSource, modelSources map[string]ModelFactory, options ...AgentOption) *FileResolver {
+	return &FileResolver{path: path, toolSources: toolSources, skillSources: skillSources, taskSources: taskSources, modelSources: modelSources, options: options}
 }
 
 // ResolveAgent returns the agent the settings file describes, reading it
@@ -306,6 +322,13 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 			return nil, err
 		}
 		options = append(slices.Clone(f.options), WithSkills(skills))
+	}
+	if len(settings.Tasks) > 0 {
+		tasks, err := SelectTasks(settings.Tasks, f.taskSources)
+		if err != nil {
+			return nil, err
+		}
+		options = append(slices.Clone(options), WithTasks(tasks))
 	}
 	factory, ok := f.modelSources[settings.Model.Source]
 	if !ok {
@@ -517,4 +540,109 @@ func (s selectedSkills) Get(name string) (Skill, bool) {
 		return Skill{}, false
 	}
 	return source.Get(name)
+}
+
+// SelectTasks turns the tasks a definition names into the source that offers
+// exactly those, in the order they are named, each started and reached by the
+// source that holds it. It refuses what it cannot resolve, for the same
+// reasons SelectTools does: a definition that silently offered fewer tasks
+// than it asked for would have the model plan around tasks that do not exist,
+// one name must mean one task, and a kind the source does not hold has no way
+// to be started.
+func SelectTasks(refs []TaskRef, sources map[string]TaskSource) (TaskSource, error) {
+	selected := &selectedTasks{order: []string{}, byName: map[string]TaskSource{}, byTask: map[string]TaskSource{}}
+	for _, ref := range refs {
+		source, ok := sources[ref.Source]
+		if !ok {
+			return nil, fmt.Errorf("no task source %s is held by this process", ref.Source)
+		}
+		if _, ok := source.Get(ref.Name); !ok {
+			return nil, fmt.Errorf("task source %s holds no task %s", ref.Source, ref.Name)
+		}
+		if _, taken := selected.byName[ref.Name]; taken {
+			return nil, fmt.Errorf("task %s is named twice", ref.Name)
+		}
+		selected.byName[ref.Name] = source
+		selected.order = append(selected.order, ref.Name)
+	}
+	return selected, nil
+}
+
+// selectedTasks offers the tasks a definition named, each held by the source
+// that names it. It is itself a TaskSource, so the selected set is handed to
+// WithTasks as it is.
+type selectedTasks struct {
+	order  []string
+	byName map[string]TaskSource
+
+	// mu guards byTask, which remembers which source started which task, so a
+	// cancel or an answer reaches the source that can answer it. A task
+	// started by another process is not remembered; with one source that
+	// source is the only candidate anyway.
+	mu     sync.Mutex
+	byTask map[string]TaskSource
+}
+
+func (s *selectedTasks) All() []common.TaskMetadata {
+	tasks := make([]common.TaskMetadata, 0, len(s.order))
+	for _, name := range s.order {
+		if meta, ok := s.byName[name].Get(name); ok {
+			tasks = append(tasks, meta)
+		}
+	}
+	return tasks
+}
+
+func (s *selectedTasks) Get(name string) (common.TaskMetadata, bool) {
+	source, ok := s.byName[name]
+	if !ok {
+		return common.TaskMetadata{}, false
+	}
+	return source.Get(name)
+}
+
+// Start launches one kind on the source that holds it, and remembers which
+// source that was, so the task's later cancels and answers are routed back.
+func (s *selectedTasks) Start(ctx context.Context, name string, ref common.TaskRef, args any) error {
+	source, ok := s.byName[name]
+	if !ok {
+		return fmt.Errorf("task not selected: %s", name)
+	}
+	s.mu.Lock()
+	s.byTask[ref.ID] = source
+	s.mu.Unlock()
+	return source.Start(ctx, name, ref, args)
+}
+
+func (s *selectedTasks) Cancel(ctx context.Context, ref common.TaskRef, reason string) error {
+	source, err := s.sourceFor(ref)
+	if err != nil {
+		return err
+	}
+	return source.Cancel(ctx, ref, reason)
+}
+
+func (s *selectedTasks) ProvideInput(ctx context.Context, ref common.TaskRef, requestID, input string) error {
+	source, err := s.sourceFor(ref)
+	if err != nil {
+		return err
+	}
+	return source.ProvideInput(ctx, ref, requestID, input)
+}
+
+// sourceFor finds the source that started a task: remembered from the start,
+// or the only source there is where the process holds one.
+func (s *selectedTasks) sourceFor(ref common.TaskRef) (TaskSource, error) {
+	s.mu.Lock()
+	source, ok := s.byTask[ref.ID]
+	s.mu.Unlock()
+	if ok {
+		return source, nil
+	}
+	if len(s.byName) == 1 {
+		for _, source := range s.byName {
+			return source, nil
+		}
+	}
+	return nil, fmt.Errorf("task %s was not started by this process", ref.ID)
 }

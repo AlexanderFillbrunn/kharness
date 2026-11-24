@@ -239,6 +239,10 @@ func (c *recordingController) ProvideInput(context.Context, common.TaskRef, stri
 	return nil
 }
 
+func (c *recordingController) Start(context.Context, string, common.TaskRef, any) error {
+	return nil
+}
+
 // cancelledTaskArc is an arc with a task still running and a cancel recorded
 // against it: what the log holds when somebody withdrew an arc whose task is
 // off doing something.
@@ -258,13 +262,8 @@ func cancelledTaskArc(t *testing.T, reason string) *logStore {
 // workerOver builds a worker whose agent can start and reach tasks.
 func workerOver(t *testing.T, store *logStore, controller common.TaskController, options ...ArcWorkerOption) *ArcWorker {
 	t.Helper()
-	tasks := NewTaskRegistry()
-	if err := tasks.RegisterTask(common.TaskMetadata{Name: "auditor"}, func(context.Context, common.TaskRef, any) error {
-		return nil
-	}); err != nil {
-		t.Fatalf("RegisterTask: %v", err)
-	}
-	agent, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks, controller))
+	tasks := taskSourceWith(t, controller, "auditor")
+	agent, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}

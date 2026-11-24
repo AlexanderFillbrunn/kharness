@@ -51,9 +51,8 @@ func Run(storePath, settingsPath, userID string) error {
 		return err
 	}
 
-	tasks := agent.NewTaskRegistry()
-	runner := newLocalTasks()
-	if err := runner.register(tasks); err != nil {
+	runner, err := newLocalTasks()
+	if err != nil {
 		return err
 	}
 
@@ -94,7 +93,11 @@ func Run(storePath, settingsPath, userID string) error {
 	skillSources := map[string]agent.SkillSource{
 		"local": newFileSkillSource(filepath.Join(filepath.Dir(settingsPath), "skills")),
 	}
-	resolver := agent.NewFileResolver(settingsPath, sources, skillSources, modelSources, agent.WithTasks(tasks, runner))
+
+	// "local" is the one task source this harness holds: the canned tasks
+	// compiled into it. Like the tools, a settings file may name no other.
+	taskSources := map[string]agent.TaskSource{"local": runner}
+	resolver := agent.NewFileResolver(settingsPath, sources, skillSources, taskSources, modelSources)
 
 	// The sinks report into the interface, and the interface cannot exist
 	// until the model is built, so they go through a sender that is pointed at
@@ -161,7 +164,10 @@ func Run(storePath, settingsPath, userID string) error {
 	// The inbound half. A task calls this rather than writing to the log, which
 	// is the path a job somewhere else would have to take, so the harness
 	// exercises it rather than going around it.
-	reports, err := ingress.NewTaskReports(persistor, store, tasks, enqueuer)
+	// The ingress resolves reports against the runner's own held kinds, not
+	// against the agent's resolver: the ingress and the agent are separate
+	// halves, and in a deployed tier each process resolves on its own.
+	reports, err := ingress.NewTaskReports(persistor, store, runner, enqueuer)
 	if err != nil {
 		return err
 	}
@@ -256,9 +262,9 @@ func (s *compactionStarter) StartCompaction(_ context.Context, sessionID, reques
 
 // writeDefaultSettings leaves a settings file for the resolver to read, so a
 // first run has an agent and the prompt, the model and the tools are there to
-// be edited. The tools are the fake ones this harness registers, and the skill
-// is the sample one written beside them, since a definition can only pick
-// what its process holds.
+// be edited. The tools are the fake ones this harness registers, the skill is
+// the sample one written beside them, and the task is the canned one, since a
+// definition can only pick what its process holds.
 func writeDefaultSettings(path string) error {
 	skillsRoot := filepath.Join(filepath.Dir(path), "skills")
 	if err := writeDefaultSkill(skillsRoot); err != nil {
@@ -274,6 +280,7 @@ func writeDefaultSettings(path string) error {
 			{Source: "local", Name: "restart_deployment"},
 		},
 		Skills: []agent.SkillRef{{Source: "local", Name: defaultSkillName}},
+		Tasks:  []agent.TaskRef{{Source: "local", Name: auditTaskName}},
 	}
 	return writeSettings(path, settings)
 }

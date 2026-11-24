@@ -59,14 +59,13 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	tasks := agent.NewTaskRegistry()
-	runner := newLocalTasks()
-	if err := runner.register(tasks); err != nil {
-		t.Fatalf("register task: %v", err)
+	runner, err := newLocalTasks()
+	if err != nil {
+		t.Fatalf("newLocalTasks: %v", err)
 	}
 
 	llm := &scriptLLM{replies: replies}
-	chat, err := agent.NewAgent(nil, agent.NewToolRegistry(), llm, agent.WithTasks(tasks, runner))
+	chat, err := agent.NewAgent(nil, agent.NewToolRegistry(), llm, agent.WithTasks(runner))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
@@ -78,7 +77,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	reports, err := ingress.NewTaskReports(persistor, store, tasks, workEnqueuer{worker})
+	reports, err := ingress.NewTaskReports(persistor, store, runner, workEnqueuer{worker})
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
@@ -450,7 +449,10 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 // produce. Only the runner can tell them apart: each caller decided from a
 // replay taken before it called, and both read that the task was waiting.
 func TestOnlyTheFirstAnswerToAQuestionReachesTheTask(t *testing.T) {
-	tasks := newLocalTasks()
+	tasks, err := newLocalTasks()
+	if err != nil {
+		t.Fatalf("newLocalTasks: %v", err)
+	}
 	ref := common.TaskRef{ID: "task-1"}
 	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
 	tasks.await(ref.ID, "ask-1")
@@ -470,7 +472,10 @@ func TestOnlyTheFirstAnswerToAQuestionReachesTheTask(t *testing.T) {
 // An answer to a question the task has already moved past is refused, rather
 // than taken for the one it is waiting on now.
 func TestAnAnswerToASupersededQuestionIsRefused(t *testing.T) {
-	tasks := newLocalTasks()
+	tasks, err := newLocalTasks()
+	if err != nil {
+		t.Fatalf("newLocalTasks: %v", err)
+	}
 	ref := common.TaskRef{ID: "task-1"}
 	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
 	tasks.await(ref.ID, "ask-2")

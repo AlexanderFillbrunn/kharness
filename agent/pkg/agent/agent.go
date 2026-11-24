@@ -128,26 +128,24 @@ type Agent struct {
 	// configured with no skills, in which case the tool is not offered.
 	skills SkillSet
 
-	// tasks and controller are the two halves of async work: what may be
-	// started, and how something already running is reached. Both are nil for
+	// tasks is the one source of async work: the kinds that may be started and
+	// the controller that starts them and reaches them once running. Nil for
 	// an agent that runs no tasks.
-	tasks      *TaskRegistry
-	controller common.TaskController
+	tasks TaskSource
 }
 
 // AgentOption configures parts of an agent that not every agent has.
 type AgentOption func(*Agent) error
 
-// WithTasks gives an agent work it can start and a way to reach that work once
-// it is running. Both are required: a registry with no controller starts tasks
-// nobody can reach.
-func WithTasks(tasks *TaskRegistry, controller common.TaskController) AgentOption {
+// WithTasks gives an agent the tasks its definition names, as one source: the
+// kinds it may start and the controller that reaches them once running. A nil
+// source is refused: it would start tasks nobody could stop or answer.
+func WithTasks(tasks TaskSource) AgentOption {
 	return func(a *Agent) error {
-		if tasks == nil || controller == nil {
-			return errors.New("tasks need both a registry and a controller")
+		if tasks == nil {
+			return errors.New("tasks need a source that can start them and reach them once running")
 		}
 		a.tasks = tasks
-		a.controller = controller
 		return nil
 	}
 }
@@ -199,14 +197,16 @@ func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...Agent
 
 	// The model picks by name and the agent routes by name, so one name
 	// registered twice is a call that reaches whichever is checked first.
-	for _, name := range agent.tasks.Names() {
-		if _, taken := agent.tools.Get(name); taken {
-			return nil, fmt.Errorf("%s is registered as both a tool and a task", name)
+	if agent.tasks != nil {
+		for _, meta := range agent.tasks.All() {
+			if _, taken := agent.tools.Get(meta.Name); taken {
+				return nil, fmt.Errorf("%s is registered as both a tool and a task", meta.Name)
+			}
 		}
-	}
-	for _, name := range []string{events.CancelTaskToolName, events.ProvideTaskInputToolName} {
-		if _, taken := agent.tools.Get(name); taken && agent.tasks != nil {
-			return nil, fmt.Errorf("%s is registered as a tool and is one of the tools tasks are addressed with", name)
+		for _, name := range []string{events.CancelTaskToolName, events.ProvideTaskInputToolName} {
+			if _, taken := agent.tools.Get(name); taken {
+				return nil, fmt.Errorf("%s is registered as a tool and is one of the tools tasks are addressed with", name)
+			}
 		}
 	}
 	return agent, nil
@@ -342,6 +342,9 @@ func (a Agent) resolveTaskResultTrail(h *history.History, arc *history.Arc) {
 	}
 	task, ok := h.Tasks[arc.OpenedByTask]
 	if !ok || task.ResultArc != arc.ID {
+		return
+	}
+	if a.tasks == nil {
 		return
 	}
 	if meta, ok := a.tasks.Get(task.TaskName); ok {
@@ -823,11 +826,6 @@ func (a Agent) knows(name string) bool {
 // minted here so the task can be started under it, and the invoke records the
 // actor that started the task, which every event the task later emits carries.
 func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
-	start, ok := a.tasks.starter(call.ToolName)
-	if !ok {
-		return fmt.Errorf("task not registered: %s", call.ToolName)
-	}
-
 	invocationID := common.NewEventID()
 	invoke := &events.Event{
 		ID:            invocationID,
@@ -852,7 +850,7 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 	}
 
 	ref := common.TaskRef{SessionID: state.history.SessionID, ID: invocationID}
-	if err := start(ctx, ref, call.Args); err != nil {
+	if err := a.tasks.Start(ctx, call.ToolName, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
 
@@ -937,7 +935,7 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 	}
 
 	ref := common.TaskRef{SessionID: state.history.SessionID, ID: task.ID}
-	if err := a.controller.Cancel(ctx, ref, reason); err != nil {
+	if err := a.tasks.Cancel(ctx, ref, reason); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s could not be reached to stop it: %s", task.TaskName, err), IsError: true}, state)
 	}
@@ -992,7 +990,7 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 	// A task somebody else answered first refuses this answer, and a task that
 	// cannot be reached at all fails the same way. Nothing here tells the two
 	// apart, so the text covers both.
-	if err := a.controller.ProvideInput(ctx, ref, request.ID, input); err != nil {
+	if err := a.tasks.ProvideInput(ctx, ref, request.ID, input); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s did not take the input: %s. It may have been answered already, or have "+
 				"finished, so read what it says next before answering again.",

@@ -165,8 +165,8 @@ func TestLoadSkillNameCollidesWithToolsAndTasks(t *testing.T) {
 		t.Error("an agent was built with load_skill as both a tool and the skills' tool")
 	}
 
-	tasks := taskRegistryWith(t, LoadSkillToolName, func(context.Context, common.TaskRef, any) error { return nil })
-	if _, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks, &fakeController{}), WithSkills(testSkillSet())); err == nil {
+	tasks := taskSourceWith(t, &fakeController{}, LoadSkillToolName)
+	if _, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks), WithSkills(testSkillSet())); err == nil {
 		t.Error("an agent was built with load_skill as both a task and the skills' tool")
 	}
 }

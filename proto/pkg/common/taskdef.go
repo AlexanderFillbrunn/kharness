@@ -22,23 +22,26 @@ import (
 // when it offers the kind to the model — generates it from this metadata on
 // the fly rather than storing it here.
 
-// Starter launches one kind of task and returns as soon as the work is under
-// way. It is handed the reference the task reports back under. A starter is
-// process-bound — it runs in the process that starts the task — so it is
-// registered on the agent's side, not carried in the shared metadata.
+// TaskController starts tasks and reaches the ones already running. It says
+// how to talk to a task, never what a task is doing, which is the log's to
+// answer. A controller is process-bound — it runs in the process that starts
+// the task — so it is registered on the agent's side, not carried in the
+// shared metadata.
 //
-// An error means the launch failed, which is not the same as the task never
-// having started: the work may be running anyway.
-type Starter func(ctx context.Context, ref TaskRef, args any) error
-
-// TaskController reaches a task that is already running. It says how to talk
-// to a task, never what a task is doing, which is the log's to answer. What it
-// returns is the fate of one call and nothing more: a refusal is not a status
-// report, and a caller learns from it only that its own call got nowhere.
+// What Start returns is the fate of the launch: an error means the launch
+// failed, which is not the same as the task never having started — the work
+// may be running anyway. What Cancel and ProvideInput return is the fate of
+// one call and nothing more: a refusal is not a status report, and a caller
+// learns from it only that its own call got nowhere.
 //
-// Both methods may be called for a task that has already finished. An
-// implementation that cannot find the task returns an error.
+// Cancel and ProvideInput may be called for a task that has already finished.
+// An implementation that cannot find the task returns an error.
 type TaskController interface {
+	// Start launches one kind of task, named as the model named it, and
+	// returns as soon as the work is under way. It is handed the reference
+	// the task reports back under.
+	Start(ctx context.Context, name string, ref TaskRef, args any) error
+
 	// Cancel asks a task to stop. It does not settle the task: what became of
 	// work under way is the runner's to report.
 	Cancel(ctx context.Context, ref TaskRef, reason string) error

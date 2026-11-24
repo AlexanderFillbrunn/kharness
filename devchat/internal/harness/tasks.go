@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
@@ -24,15 +23,22 @@ import (
 // variable so a test does not have to wait out a demo.
 var auditDelay = 4 * time.Second
 
-// localTasks runs tasks as goroutines and is the controller that reaches them.
-// The two halves are one object because they share the handle table.
+// localTasks is the one task source this harness holds: it runs tasks as
+// goroutines, and is the controller that starts them and reaches them. The
+// halves are one object because they share the handle table.
 type localTasks struct {
 	mu      sync.Mutex
 	running map[string]*localTask
 
+	// meta holds the kinds this source holds, and starters the launch of
+	// each; the two are registered together in newLocalTasks, so a kind is
+	// never held without a way to start it.
+	meta     *common.TaskRegistry
+	starters map[string]func(ref common.TaskRef, args any) error
+
 	// reports is how a task says what it is doing. It is set after
 	// construction because the ingress is built from an agent, and the agent
-	// is built from the registry these tasks are registered in.
+	// is built from the source these tasks are selected from.
 	reports *ingress.TaskReports
 
 	// defs holds the metadata of each running task's kind, keyed by task
@@ -67,28 +73,23 @@ type localTask struct {
 	awaiting string
 }
 
-func newLocalTasks() *localTasks {
-	return &localTasks{
+// auditTaskName is the one canned task kind this source holds, and the one the
+// default settings name.
+const auditTaskName = "audit_namespaces"
+
+func newLocalTasks() (*localTasks, error) {
+	l := &localTasks{
 		running:   map[string]*localTask{},
 		defs:      map[string]common.TaskMetadata{},
 		coalescer: ingress.NewCoalescer(),
+		meta:      common.NewTaskRegistry(),
+		starters:  map[string]func(common.TaskRef, any) error{},
 	}
-}
-
-// attach gives the tasks somewhere to report to, once there is one, and names
-// the agent their reports are worked under.
-func (l *localTasks) attach(reports *ingress.TaskReports, agentID string, unfiled func(common.TaskRef, error)) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.reports, l.agentID, l.unfiled = reports, agentID, unfiled
-}
-
-// register adds the canned tasks to a registry. The declaration is plain
-// metadata — the agent generates the model-facing tool from it — and the
-// starter is the harness's own, since the task runs in this process.
-func (l *localTasks) register(registry *agent.TaskRegistry) error {
-	return registry.RegisterTask(common.TaskMetadata{
-		Name: "audit_namespaces",
+	// The declaration is plain metadata — the agent generates the model-facing
+	// tool from it — and the launch is the harness's own, since the task runs
+	// in this process.
+	if err := l.meta.RegisterTask(common.TaskMetadata{
+		Name: auditTaskName,
 		Description: "Audit every namespace for problems. This takes a while, runs on its own, " +
 			"and will ask which namespace to look at in detail.",
 		InputSchema: map[string]any{
@@ -101,26 +102,71 @@ func (l *localTasks) register(registry *agent.TaskRegistry) error {
 			},
 		},
 	},
-		func(ctx context.Context, ref common.TaskRef, args any) error {
-			return l.start(ctx, ref, args, registry)
-		},
 		// Progress reports are arc-opening and coalesced in a two-second
 		// window; detail notes are invisible to the model.
 		common.WithNotificationClasses(map[string]common.NotificationClass{
 			"progress": {Visibility: events.LLMVisibilityAsMessage, GroupWindow: 2 * time.Second},
 			"detail":   {Visibility: events.LLMVisibilityNone},
 		}),
-	)
+	); err != nil {
+		return nil, err
+	}
+	l.starters[auditTaskName] = func(ref common.TaskRef, args any) error {
+		return l.start(auditTaskName, ref, args)
+	}
+	return l, nil
+}
+
+// All returns every kind this source holds, in a fixed order.
+func (l *localTasks) All() []common.TaskMetadata {
+	names := l.meta.Names()
+	kinds := make([]common.TaskMetadata, 0, len(names))
+	for _, name := range names {
+		if meta, ok := l.meta.Get(name); ok {
+			kinds = append(kinds, meta)
+		}
+	}
+	return kinds
+}
+
+// Get returns one kind of task by name.
+func (l *localTasks) Get(name string) (common.TaskMetadata, bool) {
+	return l.meta.Get(name)
+}
+
+// Start launches one kind of task and returns as soon as the work is under
+// way, the way a call to a job runner would. In this process the controller
+// runs the task directly and asynchronously.
+func (l *localTasks) Start(_ context.Context, name string, ref common.TaskRef, args any) error {
+	start, ok := l.starters[name]
+	if !ok {
+		return fmt.Errorf("task %s is not held by this source", name)
+	}
+	return start(ref, args)
+}
+
+// attach gives the tasks somewhere to report to, once there is one, and names
+// the agent their reports are worked under.
+func (l *localTasks) attach(reports *ingress.TaskReports, agentID string, unfiled func(common.TaskRef, error)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reports, l.agentID, l.unfiled = reports, agentID, unfiled
 }
 
 // start launches an audit and returns, the way a call to a job runner would.
 // The context is not the run's, since a task outlives the run that started
 // it.
-func (l *localTasks) start(_ context.Context, ref common.TaskRef, args any, registry *agent.TaskRegistry) error {
+func (l *localTasks) start(name string, ref common.TaskRef, _ any) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	task := &localTask{input: make(chan string, 1), cancel: cancel}
 
-	metadata, _ := registry.Get("audit_namespaces")
+	// The handle is registered before the goroutine starts, so a cancel or an
+	// answer arriving the instant after the start always finds the task.
+	metadata, ok := l.meta.Get(name)
+	if !ok {
+		cancel()
+		return fmt.Errorf("task %s is not held by this source", name)
+	}
 	l.mu.Lock()
 	l.running[ref.ID] = task
 	l.defs[ref.ID] = metadata

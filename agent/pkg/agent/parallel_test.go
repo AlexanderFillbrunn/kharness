@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/agent/pkg/history"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -334,7 +333,7 @@ func TestAParallelWaveSurvivesOneCallFailing(t *testing.T) {
 // Task operations are never in a parallel wave, whatever their name resolves
 // to, and a run of reads chunks around them in emission order.
 func TestTaskOperationsAreNeverParallel(t *testing.T) {
-	tasks := taskRegistryWith(t, "auditor", func(context.Context, common.TaskRef, any) error { return nil })
+	tasks := taskSourceWith(t, &fakeController{}, "auditor")
 	registry := parallelRegistry(t, true, map[string]mcp.ToolHandler{
 		"read_a": func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return textResult("a"), nil },
 	})

@@ -15,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // A work item that cannot say who works the arc is refused before anything is
@@ -96,7 +97,7 @@ func TestFileResolverIgnoresTheAgentIDAndRereadsOnChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settingsJSON("first", "gpt-5")), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, nil, scriptedModels)
 
 	first, err := resolver.ResolveAgent(context.Background(), "anybody")
 	if err != nil {
@@ -165,7 +166,7 @@ func settingsJSON(prompt, model string) string {
 }
 
 func TestFileResolverFailsOnAMissingFile(t *testing.T) {
-	resolver := NewFileResolver(filepath.Join(t.TempDir(), "absent.json"), nil, nil, scriptedModels)
+	resolver := NewFileResolver(filepath.Join(t.TempDir(), "absent.json"), nil, nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("a settings file that is not there resolved")
 	}
@@ -178,7 +179,7 @@ func TestFileResolverRefusesSettingsNamingNoModel(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"system_prompt":"a prompt"}`), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming no model resolved")
 	}
@@ -243,7 +244,7 @@ func TestFileResolverRefusesAnUnknownModelSource(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming a model source nothing holds resolved")
 	}
@@ -284,7 +285,7 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 	}
 
 	path := write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
-	resolver := NewFileResolver(path, nil, nil, roleModels)
+	resolver := NewFileResolver(path, nil, nil, nil, roleModels)
 	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -295,7 +296,7 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 
 	// No task_role: the client keeps its default.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"}}`)
-	resolver = NewFileResolver(path, nil, nil, roleModels)
+	resolver = NewFileResolver(path, nil, nil, nil, roleModels)
 	if agent, err = resolver.ResolveAgent(context.Background(), testAgentID); err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
 	}
@@ -305,14 +306,14 @@ func TestFileResolverAppliesTaskRoleToTheModel(t *testing.T) {
 
 	// A role the client refuses is a settings error.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"bogus"}`)
-	resolver = NewFileResolver(path, nil, nil, roleModels)
+	resolver = NewFileResolver(path, nil, nil, nil, roleModels)
 	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("an unknown task_role resolved")
 	}
 
 	// A client that cannot carry a task role at all is a settings error too.
 	path = write(t, `{"system_prompt":"p","model":{"source":"test","name":"gpt-5"},"task_role":"developer"}`)
-	resolver = NewFileResolver(path, nil, nil, scriptedModels)
+	resolver = NewFileResolver(path, nil, nil, nil, scriptedModels)
 	if _, err = resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("task_role against a model without a setter resolved")
 	}
@@ -333,7 +334,7 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver := NewFileResolver(path, nil, nil, scriptedModels)
+	resolver := NewFileResolver(path, nil, nil, nil, scriptedModels)
 	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -376,7 +377,7 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	if err := os.WriteFile(plain, []byte(settingsJSON("p", "unknown-model")), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	resolver = NewFileResolver(plain, nil, nil, scriptedModels)
+	resolver = NewFileResolver(plain, nil, nil, nil, scriptedModels)
 	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -463,7 +464,7 @@ func TestFileResolverResolvesTheSkillsBlock(t *testing.T) {
 		"model": {"source": "test", "name": "gpt-5"},
 		"skills": [{"source": "local", "name": "git-workflow"}]
 	}`)
-	resolver := NewFileResolver(path, nil, skillSources, scriptedModels)
+	resolver := NewFileResolver(path, nil, skillSources, nil, scriptedModels)
 	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -484,14 +485,14 @@ func TestFileResolverResolvesTheSkillsBlock(t *testing.T) {
 		"model": {"source": "test", "name": "gpt-5"},
 		"skills": [{"source": "local", "name": "other"}]
 	}`)
-	resolver = NewFileResolver(path, nil, skillSources, scriptedModels)
+	resolver = NewFileResolver(path, nil, skillSources, nil, scriptedModels)
 	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
 		t.Error("settings naming a skill nothing holds resolved")
 	}
 
 	// No skills block: no catalog, no load_skill.
 	path = write(t, settingsJSON("p", "gpt-5"))
-	resolver = NewFileResolver(path, nil, skillSources, scriptedModels)
+	resolver = NewFileResolver(path, nil, skillSources, nil, scriptedModels)
 	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
 	if err != nil {
 		t.Fatalf("ResolveAgent: %v", err)
@@ -501,5 +502,142 @@ func TestFileResolverResolvesTheSkillsBlock(t *testing.T) {
 	}
 	if _, ok := agent.tools.Get(LoadSkillToolName); ok {
 		t.Error("load_skill is offered without a skills block")
+	}
+}
+
+// testTaskSource returns one task source holding two canned kinds.
+func testTaskSource() TaskSource {
+	return &fakeTaskSource{
+		kinds: map[string]common.TaskMetadata{
+			"auditor":  {Name: "auditor"},
+			"migrator": {Name: "migrator"},
+		},
+		TaskController: &fakeController{},
+	}
+}
+
+// The tasks a definition names are the tasks the agent may start, in the order
+// they are named, each held by the source that names it — the tool selection's
+// mirror.
+func TestSelectTasksOffersTheNamedTasksFromTheirSources(t *testing.T) {
+	sources := map[string]TaskSource{"local": testTaskSource()}
+	selected, err := SelectTasks([]TaskRef{
+		{Source: "local", Name: "migrator"},
+		{Source: "local", Name: "auditor"},
+	}, sources)
+	if err != nil {
+		t.Fatalf("SelectTasks: %v", err)
+	}
+	names := make([]string, 0, 2)
+	for _, meta := range selected.All() {
+		names = append(names, meta.Name)
+	}
+	if !slices.Equal(names, []string{"migrator", "auditor"}) {
+		t.Errorf("offered %v, want the named tasks in the named order", names)
+	}
+	if _, ok := selected.Get("other"); ok {
+		t.Error("a task the definition did not name is offered")
+	}
+}
+
+// A kind the source does not hold has no way to be started, so selecting it is
+// refused rather than offered — the "never declared without a way to start it"
+// rule, at the point a definition picks its tasks.
+func TestSelectTasksRefusesWhatItCannotResolve(t *testing.T) {
+	sources := map[string]TaskSource{"local": testTaskSource()}
+	for name, refs := range map[string][]TaskRef{
+		"an unknown source":  {{Source: "nowhere", Name: "auditor"}},
+		"an unknown task":    {{Source: "local", Name: "other"}},
+		"a task named twice": {{Source: "local", Name: "auditor"}, {Source: "local", Name: "auditor"}},
+	} {
+		if _, err := SelectTasks(refs, sources); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+// A cancel or an answer reaches the source that started the task, not whichever
+// source is asked first.
+func TestSelectedTasksRouteCancelToTheStartingSource(t *testing.T) {
+	a := &fakeController{}
+	b := &fakeController{}
+	sources := map[string]TaskSource{
+		"a": &fakeTaskSource{kinds: map[string]common.TaskMetadata{"ta": {Name: "ta"}}, TaskController: a},
+		"b": &fakeTaskSource{kinds: map[string]common.TaskMetadata{"tb": {Name: "tb"}}, TaskController: b},
+	}
+	selected, err := SelectTasks([]TaskRef{{Source: "a", Name: "ta"}, {Source: "b", Name: "tb"}}, sources)
+	if err != nil {
+		t.Fatalf("SelectTasks: %v", err)
+	}
+
+	ref := common.TaskRef{SessionID: "s", ID: "task-1"}
+	if err := selected.Start(context.Background(), "tb", ref, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := selected.Cancel(context.Background(), ref, "done"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if len(a.cancelled) != 0 || len(b.cancelled) != 1 {
+		t.Errorf("cancelled a=%v b=%v, want only source b's task reached", a.cancelled, b.cancelled)
+	}
+
+	// A task this process never started has no source to route to.
+	if err := selected.Cancel(context.Background(), common.TaskRef{ID: "elsewhere"}, ""); err == nil {
+		t.Error("a cancel for a task started elsewhere was routed")
+	}
+}
+
+// The tasks block resolves into the agent: one tool per kind plus the two that
+// address a running task, and the resolver hands the same set back for the
+// ingress's metadata. A task the process does not hold is a settings error,
+// like a tool it does not hold.
+func TestFileResolverResolvesTheTasksBlock(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "agents.json")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write settings: %v", err)
+		}
+		return path
+	}
+	taskSources := map[string]TaskSource{"local": testTaskSource()}
+
+	path := write(t, `{
+		"system_prompt": "a prompt",
+		"model": {"source": "test", "name": "gpt-5"},
+		"tasks": [{"source": "local", "name": "auditor"}]
+	}`)
+	resolver := NewFileResolver(path, nil, nil, taskSources, scriptedModels)
+	agent, err := resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if agent.tasks == nil {
+		t.Fatal("the agent holds no tasks")
+	}
+	want := []string{"auditor", events.CancelTaskToolName, events.ProvideTaskInputToolName}
+	if got := toolNames(taskToolSet{agent.tasks}.All()); !slices.Equal(got, want) {
+		t.Errorf("tools = %v, want %v", got, want)
+	}
+	// A task no source holds refuses the whole definition.
+	path = write(t, `{
+		"system_prompt": "a prompt",
+		"model": {"source": "test", "name": "gpt-5"},
+		"tasks": [{"source": "local", "name": "other"}]
+	}`)
+	resolver = NewFileResolver(path, nil, nil, taskSources, scriptedModels)
+	if _, err := resolver.ResolveAgent(context.Background(), testAgentID); err == nil {
+		t.Error("settings naming a task nothing holds resolved")
+	}
+
+	// No tasks block: no task tools, and Tasks reports none.
+	path = write(t, settingsJSON("p", "gpt-5"))
+	resolver = NewFileResolver(path, nil, nil, taskSources, scriptedModels)
+	agent, err = resolver.ResolveAgent(context.Background(), testAgentID)
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	if agent.tasks != nil {
+		t.Error("an agent built without a tasks block carries tasks")
 	}
 }
