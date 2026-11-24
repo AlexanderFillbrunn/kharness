@@ -13,12 +13,12 @@ import (
 //
 // Everything the history holds is printed, including records RenderChat leaves
 // out. Use this to inspect a session; use RenderChat to read one.
-func PrintHistory(w io.Writer, history *History) error {
+func PrintHistory(w io.Writer, sessionID string, history *History) error {
 	if history == nil {
 		return fmt.Errorf("history must not be nil")
 	}
 
-	if _, err := fmt.Fprintf(w, "Session: %s\nLast sequence: %d\n\nChat\n", history.SessionID, history.LastSeq); err != nil {
+	if _, err := fmt.Fprintf(w, "Session: %s\nLast sequence: %d\n\nChat\n", sessionID, history.LastSeq); err != nil {
 		return err
 	}
 	for _, arc := range history.Arcs {

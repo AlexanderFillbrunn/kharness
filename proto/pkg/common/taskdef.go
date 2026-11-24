@@ -22,6 +22,39 @@ import (
 // when it offers the kind to the model — generates it from this metadata on
 // the fly rather than storing it here.
 
+// InSession binds a controller to one session: a ref it is handed with no
+// session is filled in with it, the same keep-if-set convention as AsSession
+// and AsAgent on the write path. A run is given one of these rather than its
+// session id — the work item names the session, and nothing between the
+// worker and the controller has to carry it.
+func InSession(sessionID string, c TaskController) TaskController {
+	return &sessionController{sessionID: sessionID, controller: c}
+}
+
+type sessionController struct {
+	sessionID  string
+	controller TaskController
+}
+
+func (s *sessionController) fill(ref TaskRef) TaskRef {
+	if ref.SessionID == "" {
+		ref.SessionID = s.sessionID
+	}
+	return ref
+}
+
+func (s *sessionController) Start(ctx context.Context, name string, ref TaskRef, args any) error {
+	return s.controller.Start(ctx, name, s.fill(ref), args)
+}
+
+func (s *sessionController) Cancel(ctx context.Context, ref TaskRef, reason string) error {
+	return s.controller.Cancel(ctx, s.fill(ref), reason)
+}
+
+func (s *sessionController) ProvideInput(ctx context.Context, ref TaskRef, requestID, input string) error {
+	return s.controller.ProvideInput(ctx, s.fill(ref), requestID, input)
+}
+
 // TaskController starts tasks and reaches the ones already running. It says
 // how to talk to a task, never what a task is doing, which is the log's to
 // answer. A controller is process-bound — it runs in the process that starts

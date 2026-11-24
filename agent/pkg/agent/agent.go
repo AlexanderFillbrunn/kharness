@@ -10,7 +10,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
@@ -242,8 +242,15 @@ type RunOptions struct {
 	// fire-and-forget — the request in the log is the durable trigger, so a
 	// notification that fails or is never made loses nothing — and nil leaves
 	// the request standing in the log for anyone to take. The agent knows
-	// nothing about queues or compactors, only that compaction is due.
-	OnCompactionDue func(ctx context.Context, sessionID, requestID string)
+	// nothing about queues or compactors, only that compaction is due; the
+	// session is the listener's to supply, since the run never sees it.
+	OnCompactionDue func(ctx context.Context, requestID string)
+
+	// Tasks reaches the tasks a run starts and the ones already running. Nil
+	// falls back to the agent's own task source. A worker hands the run the
+	// controller bound to the work item's session (common.InSession), so the
+	// run addresses a task by ID alone and never sees a session id.
+	Tasks common.TaskController
 }
 
 type agentState struct {
@@ -254,6 +261,10 @@ type agentState struct {
 	persistor common.EventPersistor
 	tokens    common.Sink[Token]
 
+	// tasks is the controller this run reaches running tasks through: the
+	// run's own where RunOptions named one, else the agent's source.
+	tasks common.TaskController
+
 	// writeMu serializes persistAndFold. A wave settles its calls from
 	// several goroutines at once, and the fold demands events in seq order,
 	// so the persist and the fold have to be one critical section: two
@@ -263,13 +274,7 @@ type agentState struct {
 
 	// onCompactionDue is who the run tells when a round writes a new
 	// compaction request. Nil means nobody is told.
-	onCompactionDue func(ctx context.Context, sessionID, requestID string)
-}
-
-// ref names the arc the run is working, for anything that has to address it
-// from outside this process.
-func (s *agentState) ref() common.ArcRef {
-	return common.ArcRef{SessionID: s.history.SessionID, ArcID: s.arc.ID}
+	onCompactionDue func(ctx context.Context, requestID string)
 }
 
 // Run invokes the agent to complete an arc, i.e. a user message triggering the
@@ -280,9 +285,6 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 	}
 	if run.History == nil {
 		return errors.New("a run needs a history")
-	}
-	if run.History.SessionID == "" {
-		return errors.New("a run needs a history that names its session")
 	}
 
 	var arc *history.Arc
@@ -300,6 +302,10 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 	if modes == (history.Modes{}) {
 		modes = history.DefaultModes()
 	}
+	tasks := run.Tasks
+	if tasks == nil {
+		tasks = a.tasks
+	}
 	state := &agentState{
 		history:         run.History,
 		arc:             arc,
@@ -307,6 +313,7 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 		foldState:       history.FoldStateFromHistory(run.History),
 		persistor:       run.Persistor,
 		tokens:          run.Tokens,
+		tasks:           tasks,
 		onCompactionDue: run.OnCompactionDue,
 	}
 
@@ -452,12 +459,6 @@ func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*ev
 	// that starts work governs its whole batch, as it does for the guard.
 	if _, starts := common.GuardedArc(evs); !starts {
 		ctx = context.WithoutCancel(ctx)
-	}
-
-	// Every writer names the session it writes for, and the agent's is the
-	// history it was given. Nothing further down the chain invents one.
-	for _, ev := range evs {
-		ev.SessionID = state.history.SessionID
 	}
 
 	state.writeMu.Lock()
@@ -849,8 +850,11 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 		return err
 	}
 
-	ref := common.TaskRef{SessionID: state.history.SessionID, ID: invocationID}
-	if err := a.tasks.Start(ctx, call.ToolName, ref, call.Args); err != nil {
+	// The session is filled in by the task source the run was given, which
+	// the worker binds to the session it is working; the agent addresses the
+	// task by ID alone.
+	ref := common.TaskRef{ID: invocationID}
+	if err := state.tasks.Start(ctx, call.ToolName, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
 
@@ -934,8 +938,8 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 		return err
 	}
 
-	ref := common.TaskRef{SessionID: state.history.SessionID, ID: task.ID}
-	if err := a.tasks.Cancel(ctx, ref, reason); err != nil {
+	ref := common.TaskRef{ID: task.ID}
+	if err := state.tasks.Cancel(ctx, ref, reason); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s could not be reached to stop it: %s", task.TaskName, err), IsError: true}, state)
 	}
@@ -986,11 +990,11 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 			task.TaskName), IsError: true}, state)
 	}
 
-	ref := common.TaskRef{SessionID: state.history.SessionID, ID: task.ID}
+	ref := common.TaskRef{ID: task.ID}
 	// A task somebody else answered first refuses this answer, and a task that
 	// cannot be reached at all fails the same way. Nothing here tells the two
 	// apart, so the text covers both.
-	if err := a.tasks.ProvideInput(ctx, ref, request.ID, input); err != nil {
+	if err := state.tasks.ProvideInput(ctx, ref, request.ID, input); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s did not take the input: %s. It may have been answered already, or have "+
 				"finished, so read what it says next before answering again.",

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -213,7 +213,7 @@ func taskConversation(t *testing.T, waiting bool) *history.History {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: first, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &first, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &first,
@@ -225,13 +225,13 @@ func taskConversation(t *testing.T, waiting bool) *history.History {
 		// An ask is always AsMessage, so it opens an arc of its own, which is
 		// where the answer is later recorded.
 		askArc := "arc-ask"
-		log = append(log, events.Event{ID: "ask-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
+		log = append(log, &events.Event{ID: "ask-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
 			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage}})
 	}
-	log = append(log, events.Event{ID: second, Seq: 4, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &second, Actor: actor,
+	log = append(log, &events.Event{ID: second, Seq: 4, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &second, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "kube-system", Actor: actor}})
 
-	h, err := history.Replay("session", log)
+	h, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -250,7 +250,14 @@ func runCallInArc(t *testing.T, h *history.History, arcID string, tasks TaskSour
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: arcID}); err != nil {
+	// The worker hands the run the controller bound to the work item's
+	// session, so the controller sees full refs even though the agent only
+	// names the task ID.
+	runOpts := RunOptions{
+		Persistor: persistor, History: h, ArcID: arcID,
+		Tasks: common.InSession(testSessionID, tasks),
+	}
+	if err := agent.Run(context.Background(), runOpts); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	return persistor

@@ -34,7 +34,7 @@ func coalesceRegistry(t *testing.T, window time.Duration, options ...common.Task
 // taskEvents returns the notification events in the log.
 func taskEvents(t *testing.T, store *logStore) []*events.Event {
 	t.Helper()
-	all, err := store.GetEventsForSession(context.Background(), testSessionID)
+	_, all, err := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestCoalescingMergesOneClassPerWindow(t *testing.T) {
 		Kind: ingress.TaskReportCompleted, Outcome: events.AsyncTaskOutcomeSuccess, Result: "3 findings"}); err != nil {
 		t.Fatalf("Report(result): %v", err)
 	}
-	all, err := store.GetEventsForSession(context.Background(), testSessionID)
+	_, all, err := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}

@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"strings"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 const (

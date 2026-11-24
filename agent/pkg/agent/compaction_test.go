@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,12 +22,11 @@ type fakeCompactionNotifier struct {
 }
 
 type compactionNotification struct {
-	sessionID string
 	requestID string
 }
 
-func (f *fakeCompactionNotifier) notify(_ context.Context, sessionID, requestID string) {
-	f.notified = append(f.notified, compactionNotification{sessionID, requestID})
+func (f *fakeCompactionNotifier) notify(_ context.Context, requestID string) {
+	f.notified = append(f.notified, compactionNotification{requestID})
 }
 
 // fakeArcEnqueuer records the arc items the completion scan requeues.
@@ -84,11 +83,11 @@ func arcHistoryWith(t *testing.T, store *logStore, evs ...events.Event) *history
 	if _, err := store.Persist(context.Background(), ptrs(evs...)...); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
-	log, err := store.GetEventsForSession(context.Background(), testSessionID)
+	_, log, err := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	h, err := history.Replay(testSessionID, deref(log))
+	h, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -99,25 +98,18 @@ func arcHistoryWith(t *testing.T, store *logStore, evs ...events.Event) *history
 // renumbering, which is what watermark tests need: arcs at exact sequences.
 func buildLog(t *testing.T, evs ...events.Event) ([]*events.Event, *history.History) {
 	t.Helper()
-	h, err := history.Replay(testSessionID, evs)
+	stored := ptrs(evs...)
+	h, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	return ptrs(evs...), h
+	return stored, h
 }
 
 func ptrs(evs ...events.Event) []*events.Event {
 	out := make([]*events.Event, 0, len(evs))
 	for i := range evs {
 		out = append(out, &evs[i])
-	}
-	return out
-}
-
-func deref(evs []*events.Event) []events.Event {
-	out := make([]events.Event, 0, len(evs))
-	for _, ev := range evs {
-		out = append(out, *ev)
 	}
 	return out
 }
@@ -260,8 +252,8 @@ func TestTailCapIsLastTurnBoundaryAtOrBelowTheTokenPoint(t *testing.T) {
 			t.Fatalf("persist close: %v", err)
 		}
 	}
-	log, _ := store.GetEventsForSession(context.Background(), testSessionID)
-	h2, err := history.Replay(testSessionID, deref(log))
+	_, log, _ := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
+	h2, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -318,8 +310,8 @@ func TestLoopWritesOneRequestWhenDue(t *testing.T) {
 	if requests[0].CorrelationID != nil {
 		t.Errorf("the request carries correlation ID %s; it is a session-level record", *requests[0].CorrelationID)
 	}
-	if len(notifier.notified) != 1 || notifier.notified[0].requestID != requests[0].ID || notifier.notified[0].sessionID != testSessionID {
-		t.Errorf("notifications = %+v, want one for request %s in session %s", notifier.notified, requests[0].ID, testSessionID)
+	if len(notifier.notified) != 1 || notifier.notified[0].requestID != requests[0].ID {
+		t.Errorf("notifications = %+v, want one for request %s", notifier.notified, requests[0].ID)
 	}
 }
 
@@ -710,11 +702,11 @@ func TestInFlightRunKeepsItsTranscript(t *testing.T) {
 	}
 
 	// The next run, fetched fresh, reads it.
-	fresh, err := store.GetEventsForArc(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: testArcID})
+	_, fresh, err := store.GetEventsForArc(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: testArcID}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
-	h2, err := history.Replay(testSessionID, deref(fresh))
+	h2, err := history.Replay(fresh)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -733,7 +725,7 @@ func TestCutoffIncludesSessionLevelRecords(t *testing.T) {
 		compactedEvent(1, "c1", 0, "summary"),
 		requestEvent(2, "a1", "req-1", 0),
 	)
-	got, err := store.GetEventsForArc(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: "a1"})
+	_, got, err := store.GetEventsForArc(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: "a1"}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -882,7 +874,7 @@ func TestArcWorkerStartsCompactionOutsideTheRun(t *testing.T) {
 	}
 
 	var requestID string
-	log, err := store.GetEventsForSession(context.Background(), testSessionID)
+	_, log, err := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -1109,7 +1101,7 @@ func TestArcWorkerWithoutStarterLeavesTheRequestStanding(t *testing.T) {
 	if err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}
-	log, err := store.GetEventsForSession(context.Background(), testSessionID)
+	_, log, err := store.GetEventsForSession(context.Background(), testSessionID, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

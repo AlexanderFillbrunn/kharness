@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // This file turns a run into something renderable, and nothing here draws. The

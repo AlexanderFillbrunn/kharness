@@ -8,7 +8,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
@@ -236,7 +236,7 @@ func (a Agent) ensureCompactionRequest(ctx context.Context, state *agentState) (
 	}
 	requestID := stored[0].ID
 	if state.onCompactionDue != nil {
-		state.onCompactionDue(ctx, state.history.SessionID, requestID)
+		state.onCompactionDue(ctx, requestID)
 	}
 	return requestID, nil
 }
@@ -491,26 +491,45 @@ type CompactionWorker struct {
 	lease     SessionLease
 	enqueuer  common.WorkEnqueuer
 	modes     history.Modes
+
+	// snapshots is when the worker reads through a stored fold snapshot and
+	// saves one. The zero value reads the whole log and never saves.
+	snapshots SnapshotPolicy
+}
+
+// CompactionWorkerOption configures parts of a compaction worker that not
+// every deployment sets.
+type CompactionWorkerOption func(*CompactionWorker)
+
+// WithCompactionSnapshotPolicy sets when the worker reads the session through
+// a stored fold snapshot and saves one at the end of a compaction. Without
+// one, snapshots are neither read nor saved.
+func WithCompactionSnapshotPolicy(policy SnapshotPolicy) CompactionWorkerOption {
+	return func(w *CompactionWorker) { w.snapshots = policy }
 }
 
 // NewCompactionWorker builds a compaction worker from the parts a compaction
 // is made of. A nil lease becomes a LocalSessionLease; a nil enqueuer leaves
 // the completion scan with nowhere to send resumed arcs.
-func NewCompactionWorker(persistor common.EventPersistor, source common.EventSource, resolver CompactionResolver, lease SessionLease, enqueuer common.WorkEnqueuer, modes history.Modes) (*CompactionWorker, error) {
+func NewCompactionWorker(persistor common.EventPersistor, source common.EventSource, resolver CompactionResolver, lease SessionLease, enqueuer common.WorkEnqueuer, modes history.Modes, options ...CompactionWorkerOption) (*CompactionWorker, error) {
 	if persistor == nil || source == nil || resolver == nil {
 		return nil, errors.New("a compaction worker needs a persistor, a source and a resolver")
 	}
 	if lease == nil {
 		lease = NewLocalSessionLease()
 	}
-	return &CompactionWorker{
+	worker := &CompactionWorker{
 		persistor: persistor,
 		source:    source,
 		resolver:  resolver,
 		lease:     lease,
 		enqueuer:  enqueuer,
 		modes:     modes,
-	}, nil
+	}
+	for _, option := range options {
+		option(worker)
+	}
+	return worker, nil
 }
 
 // Work computes one compaction for the session named by the request. It
@@ -541,7 +560,7 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 
 	// One read under the lease: the watermark is fixed at this read and the
 	// summary computation afterwards cannot move the line.
-	h, err := w.fold(ctx, sessionID)
+	h, snapInfo, err := w.fold(ctx, sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -567,9 +586,8 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 		return false, err
 	}
 
-	stored, err := common.AsAgent(agentID, w.persistor).Persist(ctx, &events.Event{
-		SessionID: sessionID,
-		Typ:       events.CompactedEventType,
+	stored, err := common.AsSession(sessionID, common.AsAgent(agentID, w.persistor)).Persist(ctx, &events.Event{
+		Typ: events.CompactedEventType,
 		// No correlation ID: the cutoff rule gives the record its scope.
 		Payload: events.CompactedPayload{
 			ThroughSeq: through,
@@ -589,6 +607,10 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 	if err := h.Update(stored[0], state); err != nil {
 		return false, fmt.Errorf("fold the COMPACTED: %w", err)
 	}
+	// The save point of a compaction: the COMPACTED is folded, so h is at the
+	// log's head. Best-effort, like every snapshot save — a failure costs the
+	// next read a full replay, nothing more.
+	saveSnapshot(ctx, w.persistor, sessionID, h, snapInfo, w.snapshots)
 	if w.enqueuer != nil {
 		for _, arc := range h.Arcs {
 			for _, s := range arc.Suspensions {
@@ -604,17 +626,22 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 	return true, nil
 }
 
-// fold reads the session's whole log once and folds it.
-func (w *CompactionWorker) fold(ctx context.Context, sessionID string) (*history.History, error) {
-	stored, err := w.source.GetEventsForSession(ctx, sessionID)
+// fold reads the session once and folds it. Under the worker's snapshot
+// policy the read returns the session's latest snapshot, when there is one,
+// plus the events above it, and the fold resumes from the snapshot; what is
+// returned alongside is only the snapshot's info, so the save point at the
+// end of the compaction can tell how stale it is — the snapshot's fold itself
+// stays here, in the read.
+func (w *CompactionWorker) fold(ctx context.Context, sessionID string) (*history.History, *common.SnapshotInfo, error) {
+	snap, stored, err := w.source.GetEventsForSession(ctx, sessionID, w.snapshots.readOptions())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	log := make([]events.Event, 0, len(stored))
-	for _, ev := range stored {
-		log = append(log, *ev)
+	h, err := common.FoldEvents(snap, stored)
+	if err != nil {
+		return nil, nil, err
 	}
-	return history.Replay(sessionID, log)
+	return h, snap.Info(), nil
 }
 
 // wireUsage carries a compactor's reported cost into the record, dropping a

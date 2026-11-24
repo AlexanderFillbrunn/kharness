@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 

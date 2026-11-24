@@ -12,7 +12,7 @@ import (
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -250,7 +250,7 @@ func TestATaskAsksTheUserAndFinishes(t *testing.T) {
 	h.waitFor(t, "the answer to be recorded", func(folded *history.History) bool {
 		return strings.Contains(logTypes(t, h), string(events.AsyncTaskInputProvidedEventType))
 	})
-	askEvents, err := h.store.GetEventsForArc(ctx, h.session.ref(askArc))
+	_, askEvents, err := h.store.GetEventsForArc(ctx, h.session.ref(askArc), common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("read the ask arc: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	settled, err := ingress.SettleAbandonedTasks(ctx, common.AsAgent(localAgentID, h.session.persistor), folded)
+	settled, err := ingress.SettleAbandonedTasks(ctx, common.AsAgent(localAgentID, h.session.persistor), h.session.id, folded)
 	if err != nil {
 		t.Fatalf("SettleAbandonedTasks: %v", err)
 	}

@@ -14,7 +14,7 @@ import (
 	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -125,7 +125,7 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 
 	// The log has to replay into the same conversation it recorded, since
 	// every later turn is built by replaying it.
-	replayed, err := history.Replay("session", values(stored))
+	replayed, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}

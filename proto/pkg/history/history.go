@@ -457,46 +457,47 @@ type Error struct {
 	CausationID *string `json:"causation_id,omitempty"`
 }
 
-// History is the folded state of one session's event log.
+// History is the folded state of one session's event log. It names no session:
+// the session lives at the edges — the store keys, the work items, the
+// persistor decorators — and every event in the log carries its own
+// SessionID. It is also the snapshot format: EncodeFold serializes it as
+// JSON, so the field tags here are the stored shape.
 type History struct {
-	SessionID string
-
 	// Arcs holds one arc per opening record, in the order they were opened.
-	Arcs []*Arc
+	Arcs []*Arc `json:"arcs"`
 
 	// Tasks is the session-level task table: every task in the session, keyed
 	// by task ID. A task is an object of the session, not of its origin arc;
 	// the invoke event's place in the origin arc is its correlation.
-	Tasks map[string]*AsyncTask
+	Tasks map[string]*AsyncTask `json:"tasks"`
 
 	// TaskResultTrail is how many InResult task events the result message of
 	// a result-opened arc carries, or -1 for the whole trail. It is set by
 	// whoever builds the read model, from the task kind's declaration with the
 	// agent config's override.
-	TaskResultTrail int
+	TaskResultTrail int `json:"task_result_trail"`
 
 	// LastSeq is the sequence number of the last event applied. Events arrive
 	// in increasing sequence order and may skip numbers, since a history holds
 	// one arc's slice of the log.
-	LastSeq int
+	LastSeq int `json:"last_seq"`
 
 	// LastCompaction is the compaction in force: the COMPACTED with the
 	// greatest ThroughSeq, regardless of when it arrived. Coverage, not
 	// recency, decides, so a duplicated or out-of-order compaction is
 	// harmless. Nil where the session has never compacted.
-	LastCompaction *Compacted
+	LastCompaction *Compacted `json:"last_compaction,omitempty"`
 
 	// CompactionRequests holds every COMPACTION_REQUESTED in the log, keyed by
 	// event ID, in the order they were written. A request is satisfied once a
 	// COMPACTED covering its watermark has landed.
-	CompactionRequests []*CompactionRequest
+	CompactionRequests []*CompactionRequest `json:"compaction_requests,omitempty"`
 }
 
-// NewHistory returns an empty history for a session. LastSeq starts at -1 so
-// that the log's first event, numbered 0, is accepted.
-func NewHistory(id string) *History {
+// NewHistory returns an empty history. LastSeq starts at -1 so that the
+// log's first event, numbered 0, is accepted.
+func NewHistory() *History {
 	return &History{
-		SessionID:       id,
 		Tasks:           map[string]*AsyncTask{},
 		TaskResultTrail: -1,
 		LastSeq:         -1,
@@ -579,21 +580,16 @@ func FoldStateFromHistory(h *History) *FoldState {
 	return state
 }
 
-// Replay left-folds the event log into a history. The events must be in
-// increasing sequence order, and may skip numbers.
+// Replay left-folds the event log into a history: a resume on an empty fold,
+// which is all it is. The events must be in increasing sequence order, and
+// may skip numbers. The session is not the fold's business: the events carry
+// their own SessionID, and a store hands out one session's slice, so nothing
+// here checks it.
 //
 // An event the fold rejects stops the replay, so a history cannot disagree
 // with the log it was built from.
-func Replay(sessionID string, events []events.Event) (*History, error) {
-	h := NewHistory(sessionID)
-	state := NewFoldState()
-	for i := range events {
-		ev := &events[i]
-		if err := h.Update(ev, state); err != nil {
-			return nil, fmt.Errorf("replay %s event %q at seq %d: %w", ev.Typ, ev.ID, ev.Seq, err)
-		}
-	}
-	return h, nil
+func Replay(evs []*events.Event) (*History, error) {
+	return Resume(NewHistory(), evs)
 }
 
 // Update folds one event into the history, using state to find the records the

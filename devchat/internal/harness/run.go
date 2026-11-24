@@ -16,7 +16,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
@@ -131,7 +131,8 @@ func Run(storePath, settingsPath, userID string) error {
 	worker, err := agent.NewArcWorker(persistor, store, resolver, agent.NewLocalLease(),
 		agent.WithTokenSink(screenTokens{relay: relay}),
 		agent.WithCancelWatcher(cancels),
-		agent.WithCompactionStarter(compactionStart))
+		agent.WithCompactionStarter(compactionStart),
+		agent.WithSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
 	if err != nil {
 		return err
 	}
@@ -141,7 +142,8 @@ func Run(storePath, settingsPath, userID string) error {
 	// a lease scoped to the session rather than to an arc, since a compaction
 	// names no arc.
 	compactionWorker, err := agent.NewCompactionWorker(persistor, store, resolver,
-		agent.NewLocalSessionLease(), enqueuer, history.DefaultModes())
+		agent.NewLocalSessionLease(), enqueuer, history.DefaultModes(),
+		agent.WithCompactionSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
 	if err != nil {
 		return err
 	}
@@ -185,7 +187,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// The only runner here is this process, so a task in that log is one an
 	// earlier process died on. Left alone it would hold its arc open for
 	// ever.
-	settled, err := ingress.SettleAbandonedTasks(context.Background(), common.AsAgent(localAgentID, persistor), recorded)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), common.AsAgent(localAgentID, persistor), session.id, recorded)
 	if err != nil {
 		return err
 	}

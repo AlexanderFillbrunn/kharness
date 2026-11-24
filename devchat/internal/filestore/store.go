@@ -26,6 +26,7 @@ import (
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // Store is an append-only log of JSON events, one per line.
@@ -167,15 +168,111 @@ func (s *Store) Events(_ context.Context) ([]*events.Event, error) {
 	return pointers(readFile(s.path))
 }
 
+// snapshotPath names the sidecar file the log's latest fold snapshot lives
+// in. A snapshot never enters the log itself: it is a cache of the fold at
+// one seq, kept beside the log file and replaced by the next save.
+func (s *Store) snapshotPath() string {
+	return s.path + ".snapshot"
+}
+
+// SaveSnapshot stores the fold of the session at the fold's LastSeq in the
+// sidecar file. The store keeps the snapshot with the highest seq and refuses
+// one beyond the log, so the snapshot never claims more than the log holds
+// and never regresses; a save that loses that race is a nil error, since the
+// newer snapshot is already on disk.
+func (s *Store) SaveSnapshot(_ context.Context, sessionID string, fold *history.History) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if fold == nil {
+		return fmt.Errorf("cannot save a nil fold")
+	}
+	if fold.LastSeq > s.seq {
+		return fmt.Errorf("snapshot of %s claims seq %d beyond the log, whose last is %d", sessionID, fold.LastSeq, s.seq)
+	}
+	held, err := s.readSnapshot(sessionID)
+	if err != nil {
+		return err
+	}
+	if held != nil && held.Seq() >= fold.LastSeq {
+		return nil
+	}
+
+	record, err := common.EncodeSnapshot(&common.Snapshot{SessionID: sessionID, SavedAt: time.Now().UTC(), Fold: fold})
+	if err != nil {
+		return fmt.Errorf("encode snapshot of %s: %w", sessionID, err)
+	}
+	// The sidecar is written whole and synced before it is visible, so a
+	// crash mid-save leaves the previous snapshot rather than a torn one.
+	tmp := s.snapshotPath() + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", tmp, err)
+	}
+	if _, err := file.Write(record); err != nil {
+		file.Close()
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("sync %s: %w", tmp, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, s.snapshotPath()); err != nil {
+		return fmt.Errorf("move %s into place: %w", tmp, err)
+	}
+	return nil
+}
+
+// readSnapshot returns the latest stored snapshot, or nil where none has been
+// saved. The session ID is the one the read is for, and the one the snapshot
+// is filed under. It is called with the lock held.
+func (s *Store) readSnapshot(sessionID string) (*common.Snapshot, error) {
+	data, err := os.ReadFile(s.snapshotPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.snapshotPath(), err)
+	}
+	return common.DecodeSnapshot(data, sessionID)
+}
+
 // GetEventsForSession returns the session's whole log in the order it was
 // written. A file holds one session, so the session ID only ever rules events
 // out here; a store that held more than one would partition on it.
-func (s *Store) GetEventsForSession(_ context.Context, sessionID string) ([]*events.Event, error) {
+//
+// With UseSnapshots it instead returns the latest stored snapshot, when there
+// is one, plus only the session's events above the snapshot's seq.
+func (s *Store) GetEventsForSession(_ context.Context, sessionID string, opts common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if opts.UseSnapshots {
+		snap, err := s.readSnapshot(sessionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if snap != nil {
+			all, err := readFile(s.path)
+			if err != nil {
+				return nil, nil, err
+			}
+			var tail []*events.Event
+			for i := range all {
+				if all[i].SessionID == sessionID && all[i].Seq > snap.Seq() {
+					tail = append(tail, &all[i])
+				}
+			}
+			return snap, tail, nil
+		}
+	}
+
 	all, err := readFile(s.path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var selected []*events.Event
 	for i := range all {
@@ -183,61 +280,77 @@ func (s *Store) GetEventsForSession(_ context.Context, sessionID string) ([]*eve
 			selected = append(selected, &all[i])
 		}
 	}
-	return selected, nil
+	return nil, selected, nil
 }
 
 // GetEventsForArc returns the events one arc is run from: everything in its
 // session up to and including the event that opened the arc, plus everything
-// correlated to the arc afterwards, plus the session's task-correlated events,
-// so the fold builds the session's task table.
+// correlated to the arc afterwards, plus the session's task-correlated events
+// and the session-level records that carry no correlation ID, so the fold
+// builds the session's task table and a compaction that landed after the arc
+// opened still reaches the run that resumes it.
 //
 // An arc is found by its opening event — the earliest event correlated to the
 // arc ID whose kind is opening: a USER_MESSAGE, or a task event whose payload
-// carries AsMessage visibility. The cutoff rule is otherwise unchanged:
-// everything up to and including the opening event, plus everything
-// correlated to the arc. That query is the projection's cutoff, so a store
-// that returned more or less of the arc's own events would change what the
-// model is told. See PROJECTION.md.
+// carries AsMessage visibility. The cutoff rule is otherwise unchanged. That
+// query is the projection's cutoff, so a store that returned more or less of
+// the arc's own events would change what the model is told. See PROJECTION.md.
+//
+// With UseSnapshots and a stored snapshot, the prefix up to the snapshot's
+// seq is replaced by the snapshot itself: only the session's events above it
+// are read, and the opening and the task IDs the cutoff needs come from the
+// snapshot's fold where they are already in it and from the tail where they
+// are not.
 //
 // A file holds one session, so the session in the ref only ever rules events
 // out here. A store that held more than one would partition on it.
-func (s *Store) GetEventsForArc(_ context.Context, ref common.ArcRef) ([]*events.Event, error) {
+func (s *Store) GetEventsForArc(_ context.Context, ref common.ArcRef, opts common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if opts.UseSnapshots {
+		snap, err := s.readSnapshot(ref.SessionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if snap != nil {
+			all, err := readFile(s.path)
+			if err != nil {
+				return nil, nil, err
+			}
+			var tail []*events.Event
+			for i := range all {
+				if all[i].SessionID == ref.SessionID && all[i].Seq > snap.Seq() {
+					tail = append(tail, &all[i])
+				}
+			}
+			selected, err := common.SelectArcEvents(tail, ref, snap)
+			if err != nil {
+				return nil, nil, err
+			}
+			return snap, selected, nil
+		}
+	}
+
 	all, err := readFile(s.path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	taskIDs := map[string]bool{}
-	opening := -1
+	var mine []events.Event
 	for i := range all {
-		if all[i].SessionID != ref.SessionID {
-			continue
-		}
-		if all[i].Typ == events.AsyncTaskInvokeEventType {
-			taskIDs[all[i].ID] = true
-		}
-		if opening < 0 && correlatesTo(&all[i], ref.ArcID) && events.OpensArc(&all[i]) {
-			opening = all[i].Seq
+		if all[i].SessionID == ref.SessionID {
+			mine = append(mine, all[i])
 		}
 	}
-	if opening < 0 {
-		return nil, fmt.Errorf("no arc %s in %s", ref, s.path)
+	pointers := make([]*events.Event, 0, len(mine))
+	for i := range mine {
+		pointers = append(pointers, &mine[i])
 	}
-
-	var selected []*events.Event
-	for i := range all {
-		if all[i].SessionID != ref.SessionID {
-			continue
-		}
-		if all[i].Seq <= opening || correlatesTo(&all[i], ref.ArcID) ||
-			(all[i].CorrelationID != nil && taskIDs[*all[i].CorrelationID]) {
-			selected = append(selected, &all[i])
-		}
+	selected, err := common.SelectArcEvents(pointers, ref, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	return selected, nil
+	return nil, selected, nil
 }
 
 // Cancelled returns the cancel recorded against an arc, or nil where there is

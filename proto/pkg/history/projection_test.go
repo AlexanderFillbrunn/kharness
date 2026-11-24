@@ -21,7 +21,7 @@ var testActor = users.Actor{UserID: "user-1", TenantID: "tenant-1"}
 type logger struct {
 	seq        int
 	start      time.Time
-	events     []events.Event
+	events     []*events.Event
 	lastAskArc string
 }
 
@@ -31,7 +31,7 @@ func newLogger() *logger {
 
 func (l *logger) add(id, arc string, typ events.EventType, payload events.EventPayload) {
 	correlation := arc
-	l.events = append(l.events, events.Event{
+	l.events = append(l.events, &events.Event{
 		SessionID:     "session-1",
 		ID:            id,
 		Seq:           l.seq,
@@ -161,7 +161,7 @@ func (l *logger) taskResultNone(arc, task string, result any, outcome events.Asy
 
 func (l *logger) history(t *testing.T) *History {
 	t.Helper()
-	return foldEvents(t, "session-1", l.events)
+	return foldEvents(t, l.events)
 }
 
 // eventsFor returns the events a read model hands the projection for one arc:
@@ -169,22 +169,21 @@ func (l *logger) history(t *testing.T) *History {
 // however late it arrived, plus the session's task-correlated events, so the
 // fold builds the task table. This query is the projection's cutoff, so a test
 // projects from the slice rather than from the whole log.
-func (l *logger) eventsFor(arc string) []events.Event {
+func (l *logger) eventsFor(arc string) []*events.Event {
 	taskIDs := map[string]bool{}
-	for i := range l.events {
-		if l.events[i].Typ == events.AsyncTaskInvokeEventType {
-			taskIDs[l.events[i].ID] = true
+	for _, ev := range l.events {
+		if ev.Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[ev.ID] = true
 		}
 	}
 	opened := -1
-	for i := range l.events {
-		ev := &l.events[i]
+	for _, ev := range l.events {
 		if ev.CorrelationID != nil && *ev.CorrelationID == arc && events.OpensArc(ev) {
 			opened = ev.Seq
 			break
 		}
 	}
-	var out []events.Event
+	var out []*events.Event
 	for _, event := range l.events {
 		if event.Seq <= opened || (event.CorrelationID != nil && (*event.CorrelationID == arc || taskIDs[*event.CorrelationID])) {
 			out = append(out, event)
@@ -197,7 +196,7 @@ func (l *logger) eventsFor(arc string) []events.Event {
 // either step errors.
 func project(t *testing.T, log *logger, arc string, modes Modes) *ModelTranscript {
 	t.Helper()
-	transcript, err := foldEvents(t, "session-1", log.eventsFor(arc)).Project(arc, modes)
+	transcript, err := foldEvents(t, log.eventsFor(arc)).Project(arc, modes)
 	if err != nil {
 		t.Fatalf("Project(%s) error = %v", arc, err)
 	}
@@ -300,7 +299,7 @@ func containsText(transcript *ModelTranscript, text string) bool {
 // can check its own setup landed inside the cutoff.
 func dispatchedCall(t *testing.T, log *logger, arc, call string) *ToolCall {
 	t.Helper()
-	history := foldEvents(t, "session-1", log.eventsFor(arc))
+	history := foldEvents(t, log.eventsFor(arc))
 	for _, folded := range history.Arcs {
 		for _, response := range folded.Responses {
 			for _, candidate := range response.ToolCalls {
@@ -1876,7 +1875,7 @@ func TestInResultEventsAreFoldedIntoTheResultMessage(t *testing.T) {
 		"u(thanks)")
 
 	// The last N at N=2.
-	h := foldEvents(t, "session-1", log.eventsFor("u2"))
+	h := foldEvents(t, log.eventsFor("u2"))
 	h.TaskResultTrail = 2
 	limited, err := h.Project("u2", DefaultModes())
 	if err != nil {
@@ -1909,8 +1908,8 @@ func TestRenderChatShowsATaskOpenedArc(t *testing.T) {
 	log.taskResult("u1", "a1.1", "3 findings", events.AsyncTaskOutcomeSuccess)
 	log.user("u2", "thanks")
 
-	h := foldEvents(t, "session-1", log.eventsFor("u2"))
-	out := h.RenderChat()
+	h := foldEvents(t, log.eventsFor("u2"))
+	out := h.RenderChat("session-1")
 	for _, want := range []string{
 		"audit the cluster",
 		"Task auditor with id a1.1 (returned results)\n3 findings",

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/ingress/pkg/ingress"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
@@ -45,9 +45,15 @@ func (s *logStore) Persist(_ context.Context, evs ...*events.Event) ([]*events.E
 	return stored, nil
 }
 
+// SaveSnapshot accepts and drops the fold; these tests do not read through
+// snapshots.
+func (s *logStore) SaveSnapshot(_ context.Context, _ string, _ *history.History) error {
+	return nil
+}
+
 // GetEventsForSession returns the whole log, the way a store that holds many
 // sessions returns one session's slice.
-func (s *logStore) GetEventsForSession(_ context.Context, sessionID string) ([]*events.Event, error) {
+func (s *logStore) GetEventsForSession(_ context.Context, sessionID string, _ common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*events.Event
@@ -56,36 +62,28 @@ func (s *logStore) GetEventsForSession(_ context.Context, sessionID string) ([]*
 			out = append(out, ev)
 		}
 	}
-	return out, nil
+	return nil, out, nil
 }
 
 // GetEventsForArc applies the projection's cutoff the way the real store does:
 // everything up to the arc's own opening event, plus everything correlated to
 // it or to a task afterwards.
-func (s *logStore) GetEventsForArc(_ context.Context, ref common.ArcRef) ([]*events.Event, error) {
+func (s *logStore) GetEventsForArc(_ context.Context, ref common.ArcRef, _ common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	taskIDs := map[string]bool{}
-	opening := -1
+	// A store holds many sessions and partitions on the session in the ref,
+	// the way the Redis key and the filestore's filter do.
+	var mine []*events.Event
 	for _, ev := range s.events {
-		if ev.Typ == events.AsyncTaskInvokeEventType {
-			taskIDs[ev.ID] = true
-		}
-		if opening < 0 && ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID && events.OpensArc(ev) {
-			opening = ev.Seq
+		if ev.SessionID == ref.SessionID {
+			mine = append(mine, ev)
 		}
 	}
-	if opening < 0 {
-		return nil, errors.New("no arc " + ref.ArcID)
+	selected, err := common.SelectArcEvents(mine, ref, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	var selected []*events.Event
-	for _, ev := range s.events {
-		if ev.Seq <= opening || (ev.CorrelationID != nil && (*ev.CorrelationID == ref.ArcID || taskIDs[*ev.CorrelationID])) {
-			selected = append(selected, ev)
-		}
-	}
-	return selected, nil
+	return nil, selected, nil
 }
 
 func (s *logStore) Cancelled(_ context.Context, ref common.ArcRef) (*events.Event, error) {
@@ -544,12 +542,12 @@ func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
 // which is the reaper's exception to results always opening an arc.
 func TestAbandonedTasksAreSettledAsUnknown(t *testing.T) {
 	store := runningTaskStore(t)
-	h, err := history.Replay("session", valuesOf(store.events))
+	h, err := history.Replay(store.events)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 
-	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, h)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, testSessionID, h)
 	if err != nil {
 		t.Fatalf("ingress.SettleAbandonedTasks: %v", err)
 	}
@@ -588,26 +586,18 @@ func TestSettlingAbandonedTasksLeavesFinishedOnesAlone(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
-	h, err := history.Replay("session", valuesOf(store.events))
+	h, err := history.Replay(store.events)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 
-	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, h)
+	settled, err := ingress.SettleAbandonedTasks(context.Background(), store, testSessionID, h)
 	if err != nil {
 		t.Fatalf("ingress.SettleAbandonedTasks: %v", err)
 	}
 	if settled != 0 {
 		t.Errorf("settled %d tasks, want none: it had already reported", settled)
 	}
-}
-
-func valuesOf(stored []*events.Event) []events.Event {
-	out := make([]events.Event, 0, len(stored))
-	for _, ev := range stored {
-		out = append(out, *ev)
-	}
-	return out
 }
 
 // A report that names no agent has nobody to hand the arc it opens to, and it

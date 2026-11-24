@@ -3,12 +3,15 @@ package redisinfra
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // logKey names the list one session's log lives under. The filestore keeps a
@@ -16,6 +19,36 @@ import (
 func logKey(sessionID string) string {
 	return "kube-agent:log:" + sessionID
 }
+
+// snapshotKey names the string one session's latest fold snapshot lives
+// under. A snapshot never enters the log: it is a cache of the fold at one
+// seq, kept beside the log and replaced by the next save.
+func snapshotKey(sessionID string) string {
+	return "kube-agent:snapshot:" + sessionID
+}
+
+// saveSnapshotScript stores a snapshot only when it is newer than the one
+// held and does not reach beyond the log: the seq is compared against the
+// list's length, so a snapshot can never claim events that were never
+// written, and against the stored seq, so a slow writer cannot regress it.
+// It returns 1 when saved, 0 when the held snapshot is at least as new, and
+// -1 when the seq is beyond the log.
+var saveSnapshotScript = redis.NewScript(`
+local key, log = KEYS[1], KEYS[2]
+local seq, record = tonumber(ARGV[1]), ARGV[2]
+if seq > redis.call("LLEN", log) - 1 then
+	return -1
+end
+local cur = redis.call("GET", key)
+if cur then
+	local held = cjson.decode(cur)
+	if held.seq >= seq then
+		return 0
+	end
+end
+redis.call("SET", key, record)
+return 1
+`)
 
 // appendScript appends a batch to a session's log in one call and returns the
 // sequence number the batch starts at, which is the length the list had. Each
@@ -111,55 +144,119 @@ func (s *RedisEventStore) Persist(ctx context.Context, evs ...*events.Event) ([]
 	return stored, nil
 }
 
+// SaveSnapshot stores the fold of a session at the fold's LastSeq. The store
+// keeps the snapshot with the highest seq and refuses one beyond the log, so
+// the snapshot never claims more than the log holds and never regresses; a
+// save that loses that race is a nil error, since the newer snapshot is
+// already there.
+func (s *RedisEventStore) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	if fold == nil {
+		return fmt.Errorf("cannot save a nil fold")
+	}
+	// The session is the key the snapshot is stored under, not a field of the
+	// fold: a History names no session.
+	record, err := common.EncodeSnapshot(&common.Snapshot{SessionID: sessionID, SavedAt: time.Now().UTC(), Fold: fold})
+	if err != nil {
+		return fmt.Errorf("encode snapshot of %s: %w", sessionID, err)
+	}
+	res, err := saveSnapshotScript.Run(ctx, s.client, []string{snapshotKey(sessionID), logKey(sessionID)}, fold.LastSeq, string(record)).Int()
+	if err != nil {
+		return fmt.Errorf("save snapshot of %s: %w", sessionID, err)
+	}
+	if res < 0 {
+		return fmt.Errorf("snapshot of %s claims seq %d beyond the log", sessionID, fold.LastSeq)
+	}
+	return nil
+}
+
+// snapshot returns the session's latest stored snapshot, or nil where none
+// has been saved.
+func (s *RedisEventStore) snapshot(ctx context.Context, sessionID string) (*common.Snapshot, error) {
+	line, err := s.client.Get(ctx, snapshotKey(sessionID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot of %s: %w", sessionID, err)
+	}
+	return common.DecodeSnapshot([]byte(line), sessionID)
+}
+
 // Events returns a session's whole log in the order it was written.
 func (s *RedisEventStore) Events(ctx context.Context, sessionID string) ([]*events.Event, error) {
 	return s.read(ctx, sessionID)
 }
 
 // GetEventsForSession returns a session's whole log in the order it was
-// written.
-func (s *RedisEventStore) GetEventsForSession(ctx context.Context, sessionID string) ([]*events.Event, error) {
-	return s.read(ctx, sessionID)
+// written. With UseSnapshots it instead returns the latest stored snapshot,
+// when there is one, plus only the entries above the snapshot's seq, read
+// from that index rather than from the head of the list.
+func (s *RedisEventStore) GetEventsForSession(ctx context.Context, sessionID string, opts common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
+	if opts.UseSnapshots {
+		snap, err := s.snapshot(ctx, sessionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if snap != nil {
+			tail, err := s.readFrom(ctx, sessionID, snap.Seq())
+			if err != nil {
+				return nil, nil, err
+			}
+			return snap, tail, nil
+		}
+	}
+	all, err := s.read(ctx, sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, all, nil
 }
 
 // GetEventsForArc returns the events one arc is run from: everything in its
 // session up to and including the event that opened the arc, plus everything
-// correlated to the arc afterwards, plus the session's task-correlated events,
-// so the fold builds the session's task table.
+// correlated to the arc afterwards, plus the session's task-correlated events
+// and the session-level records that carry no correlation ID — COMPACTED and
+// a session-level COMPACTION_REQUESTED — so the fold builds the session's
+// task table and a compaction that landed after the arc opened still reaches
+// the run that resumes it.
 //
 // An arc is found by its opening event — the earliest event correlated to the
 // arc ID whose kind is opening: a USER_MESSAGE, or a task event whose payload
 // carries AsMessage visibility. The cutoff rule is otherwise unchanged. That
 // query is the projection's cutoff, so a store that returned more or less of
 // the arc's own events would change what the model is told. See PROJECTION.md.
-func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref common.ArcRef) ([]*events.Event, error) {
+//
+// With UseSnapshots and a stored snapshot, the prefix up to the snapshot's
+// seq is replaced by the snapshot itself: only the entries above it are read,
+// and the opening and the task IDs the cutoff needs come from the snapshot's
+// fold where they are already in it and from the tail where they are not.
+func (s *RedisEventStore) GetEventsForArc(ctx context.Context, ref common.ArcRef, opts common.ReadOptions) (*common.Snapshot, []*events.Event, error) {
+	if opts.UseSnapshots {
+		snap, err := s.snapshot(ctx, ref.SessionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if snap != nil {
+			tail, err := s.readFrom(ctx, ref.SessionID, snap.Seq())
+			if err != nil {
+				return nil, nil, err
+			}
+			selected, err := common.SelectArcEvents(tail, ref, snap)
+			if err != nil {
+				return nil, nil, err
+			}
+			return snap, selected, nil
+		}
+	}
 	all, err := s.read(ctx, ref.SessionID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	taskIDs := map[string]bool{}
-	opening := -1
-	for _, ev := range all {
-		if ev.Typ == events.AsyncTaskInvokeEventType {
-			taskIDs[ev.ID] = true
-		}
-		if opening < 0 && correlatesTo(ev, ref.ArcID) && events.OpensArc(ev) {
-			opening = ev.Seq
-		}
+	selected, err := common.SelectArcEvents(all, ref, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	if opening < 0 {
-		return nil, fmt.Errorf("no arc %s in %s", ref, ref.SessionID)
-	}
-
-	var selected []*events.Event
-	for _, ev := range all {
-		if ev.Seq <= opening || correlatesTo(ev, ref.ArcID) ||
-			(ev.CorrelationID != nil && taskIDs[*ev.CorrelationID]) {
-			selected = append(selected, ev)
-		}
-	}
-	return selected, nil
+	return nil, selected, nil
 }
 
 // Cancelled returns the cancel recorded against an arc, or nil where there is
@@ -211,7 +308,20 @@ func (s *RedisEventStore) read(ctx context.Context, sessionID string) ([]*events
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", sessionID, err)
 	}
+	return decodeLines(sessionID, lines)
+}
 
+// readFrom decodes the entries of a session's log from the given seq on — the
+// tail above a snapshot — in the order they were written.
+func (s *RedisEventStore) readFrom(ctx context.Context, sessionID string, fromSeq int) ([]*events.Event, error) {
+	lines, err := s.client.LRange(ctx, logKey(sessionID), int64(fromSeq+1), -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read %s above seq %d: %w", sessionID, fromSeq, err)
+	}
+	return decodeLines(sessionID, lines)
+}
+
+func decodeLines(sessionID string, lines []string) ([]*events.Event, error) {
 	decoded := make([]*events.Event, 0, len(lines))
 	for i, line := range lines {
 		var ev events.Event

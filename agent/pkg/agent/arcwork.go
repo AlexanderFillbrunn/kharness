@@ -6,8 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // StreamToken is one piece of a reply as the model writes it, addressed well
@@ -65,6 +64,10 @@ type ArcWorker struct {
 	// modes is how much of the log the worker's runs disclose in their
 	// projections.
 	modes history.Modes
+
+	// snapshots is when the worker reads through a stored fold snapshot and
+	// saves one. The zero value reads the whole log and never saves.
+	snapshots SnapshotPolicy
 }
 
 // ArcWorkerOption configures parts of a worker that not every worker has.
@@ -101,6 +104,13 @@ func WithCompactionStarter(starter CompactionStarter) ArcWorkerOption {
 // projections. Without one, DefaultModes.
 func WithModes(modes history.Modes) ArcWorkerOption {
 	return func(w *ArcWorker) { w.modes = modes }
+}
+
+// WithSnapshotPolicy sets when the worker reads the log through a stored fold
+// snapshot and saves one at the end of a work item. Without one, snapshots
+// are neither read nor saved.
+func WithSnapshotPolicy(policy SnapshotPolicy) ArcWorkerOption {
+	return func(w *ArcWorker) { w.snapshots = policy }
 }
 
 // NewArcWorker builds a worker from the parts a run is made of. A nil lease
@@ -147,21 +157,33 @@ func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string)
 	if err != nil {
 		return false, fmt.Errorf("resolve agent %s for arc %s: %w", agentID, ref, err)
 	}
-
-	h, err := w.arcHistory(ctx, ref)
+	h, snapInfo, err := w.arcHistory(ctx, ref)
 	if err != nil {
 		return false, err
 	}
-	return true, agent.Run(ctx, RunOptions{
-		Persistor: common.AsAgent(agentID, w.persistor),
+	// The session the work item names is stamped onto everything the run
+	// writes and every task ref it hands out, here where the session is
+	// known: the run itself never sees it.
+	runOpts := RunOptions{
+		Persistor: common.AsSession(ref.SessionID, common.AsAgent(agentID, w.persistor)),
 		History:   h,
 		ArcID:     ref.ArcID,
 		Modes:     w.modes,
 		Tokens:    w.tokenSink(ctx, ref),
-		OnCompactionDue: func(notifyCtx context.Context, sessionID, requestID string) {
-			w.notifyCompactionDue(notifyCtx, sessionID, requestID, agentID)
+		OnCompactionDue: func(notifyCtx context.Context, requestID string) {
+			w.notifyCompactionDue(notifyCtx, ref.SessionID, requestID, agentID)
 		},
-	})
+	}
+	if agent.tasks != nil {
+		runOpts.Tasks = common.InSession(ref.SessionID, agent.tasks)
+	}
+	runErr := agent.Run(ctx, runOpts)
+	// The save point of a work item: once the run is over, never inside it.
+	// The run folded into h as it went, so h is at the log's head now. A save
+	// that fails or is not due costs the next read a full replay, nothing
+	// more, so it does not touch the run's result.
+	saveSnapshot(ctx, w.persistor, ref.SessionID, h, snapInfo, w.snapshots)
+	return true, runErr
 }
 
 // notifyCompactionDue hands a run's compaction notification to the starter.
@@ -229,22 +251,22 @@ func (w *ArcWorker) tokenSink(ctx context.Context, ref common.ArcRef) common.Sin
 	})
 }
 
-// arcHistory loads and folds the events one arc is run from.
-func (w *ArcWorker) arcHistory(ctx context.Context, ref common.ArcRef) (*history.History, error) {
-	stored, err := w.source.GetEventsForArc(ctx, ref)
+// arcHistory loads and folds the events one arc is run from. Under the
+// worker's snapshot policy the read returns the session's latest snapshot,
+// when there is one, plus the events above it, and the fold resumes from the
+// snapshot; what is returned alongside is only the snapshot's info, so the
+// save point at the end of the work item can tell how stale it is — the
+// snapshot's fold itself stays here, in the read.
+func (w *ArcWorker) arcHistory(ctx context.Context, ref common.ArcRef) (*history.History, *common.SnapshotInfo, error) {
+	// The store partitions by session, so what comes back is this session's;
+	// the fold names no session and does not check.
+	snap, stored, err := w.source.GetEventsForArc(ctx, ref, w.snapshots.readOptions())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	folded := make([]events.Event, 0, len(stored))
-	for _, ev := range stored {
-		// A ref naming the wrong session would replay one session's arc under
-		// another's name, and every event the run went on to write would be
-		// filed there. The events say which session they are in, so the ref
-		// is checked against them rather than trusted.
-		if ev.SessionID != ref.SessionID {
-			return nil, fmt.Errorf("event %s is in session %s, not %s", ev.ID, ev.SessionID, ref.SessionID)
-		}
-		folded = append(folded, *ev)
+	h, err := common.FoldEvents(snap, stored)
+	if err != nil {
+		return nil, nil, err
 	}
-	return history.Replay(ref.SessionID, folded)
+	return h, snap.Info(), nil
 }

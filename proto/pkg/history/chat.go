@@ -11,13 +11,13 @@ import (
 //
 // This is the reading view: interrupts, async tasks, errors and cancels are
 // left out. PrintHistory shows those.
-func (h *History) RenderChat() string {
+func (h *History) RenderChat(sessionID string) string {
 	if h == nil {
 		return ""
 	}
 
 	var sections []string
-	sections = append(sections, fmt.Sprintf("Chat · session %s", h.SessionID))
+	sections = append(sections, fmt.Sprintf("Chat · session %s", sessionID))
 	// A compacted session is a summary block followed by the arcs that
 	// survived the cut.
 	if h.LastCompaction != nil {

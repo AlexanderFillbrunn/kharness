@@ -17,9 +17,8 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 	actor := &users.Actor{UserID: "user-1", TenantID: "tenant-1"}
 
 	history := &History{
-		SessionID: "session-1",
-		LastSeq:   9,
-		Arcs: []*Arc{{
+		LastSeq: 9,
+		Arcs:    []*Arc{{
 			ID: "arc-1", Seq: 1, Timestamp: now, Content: "Hello\nthere", Actor: actor,
 			Responses: []*AssistantMessage{{
 				ID: "message-1", Seq: 2, CorrelationID: "arc-1", Timestamp: now,
@@ -52,7 +51,7 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := PrintHistory(&output, history); err != nil {
+	if err := PrintHistory(&output, "session-1", history); err != nil {
 		t.Fatalf("PrintHistory() error = %v", err)
 	}
 
@@ -70,7 +69,6 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 func TestPrintHistoryOmitsEmptySectionsOfAnArc(t *testing.T) {
 	now := time.Date(2026, time.September, 16, 12, 0, 0, 0, time.UTC)
 	history := &History{
-		SessionID: "session-1",
 		Arcs: []*Arc{{
 			ID: "arc-1", Seq: 0, Timestamp: now, Content: "Hello", Actor: &users.Actor{UserID: "user-1"},
 			Responses: []*AssistantMessage{{ID: "message-1", Seq: 1, CorrelationID: "arc-1", Timestamp: now, Content: "Hi."}},
@@ -78,7 +76,7 @@ func TestPrintHistoryOmitsEmptySectionsOfAnArc(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := PrintHistory(&output, history); err != nil {
+	if err := PrintHistory(&output, "session-1", history); err != nil {
 		t.Fatalf("PrintHistory() error = %v", err)
 	}
 
@@ -92,7 +90,6 @@ func TestPrintHistoryOmitsEmptySectionsOfAnArc(t *testing.T) {
 func TestRenderChatIncludesMessagesAndToolActivity(t *testing.T) {
 	now := time.Date(2026, time.September, 16, 12, 0, 0, 0, time.UTC)
 	history := &History{
-		SessionID: "session-1",
 		Arcs: []*Arc{{
 			ID: "arc-1", Timestamp: now, Content: "Hello", Actor: &users.Actor{UserID: "user-1"},
 			Responses: []*AssistantMessage{{
@@ -105,7 +102,7 @@ func TestRenderChatIncludesMessagesAndToolActivity(t *testing.T) {
 		}},
 	}
 
-	output := history.RenderChat()
+	output := history.RenderChat("session-1")
 	for _, want := range []string{"Chat · session session-1", "user-1", "Hello", "I found it.", "lookup", "SUCCESS", "healthy", "working"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("RenderChat() output does not contain %q:\n%s", want, output)

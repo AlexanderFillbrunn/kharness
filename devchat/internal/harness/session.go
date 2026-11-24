@@ -9,7 +9,7 @@ import (
 	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -155,13 +155,14 @@ func (s *session) cancelArcTasks(ctx context.Context, arcID, reason string) erro
 	return errors.Join(failures...)
 }
 
-// arcHistory loads and folds the events one arc is run from.
+// arcHistory loads and folds the events one arc is run from, reading through
+// the store's latest fold snapshot when there is one and resuming from it.
 func (s *session) arcHistory(ctx context.Context, arcID string) (*history.History, error) {
-	stored, err := s.store.GetEventsForArc(ctx, s.ref(arcID))
+	snap, stored, err := s.store.GetEventsForArc(ctx, s.ref(arcID), common.ReadOptions{UseSnapshots: true})
 	if err != nil {
 		return nil, err
 	}
-	return history.Replay(s.id, values(stored))
+	return common.FoldEvents(snap, stored)
 }
 
 // fullHistory folds the whole log, which is what the conversation already on
@@ -172,15 +173,7 @@ func (s *session) fullHistory(ctx context.Context) (*history.History, error) {
 		return nil, err
 	}
 	if len(stored) == 0 {
-		return history.NewHistory(s.id), nil
+		return history.NewHistory(), nil
 	}
-	return history.Replay(s.id, values(stored))
-}
-
-func values(stored []*events.Event) []events.Event {
-	out := make([]events.Event, 0, len(stored))
-	for _, ev := range stored {
-		out = append(out, *ev)
-	}
-	return out
+	return history.Replay(stored)
 }

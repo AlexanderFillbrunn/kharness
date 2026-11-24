@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // ErrCancelled reports that the arc was cancelled while the agent was working
@@ -88,6 +89,12 @@ func (g *guardedPersistor) Persist(ctx context.Context, evs ...*events.Event) ([
 	}
 
 	return g.persistor.Persist(ctx, evs...)
+}
+
+// SaveSnapshot passes the fold through untouched: the guard watches writes
+// that start work, and a snapshot starts none.
+func (g *guardedPersistor) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	return g.persistor.SaveSnapshot(ctx, sessionID, fold)
 }
 
 // GuardedArc returns the arc a batch would start work on, and whether any

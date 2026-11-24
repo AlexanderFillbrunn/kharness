@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // streamingLLM writes a reply a piece at a time, the way a provider does.

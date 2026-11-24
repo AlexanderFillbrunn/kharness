@@ -607,7 +607,23 @@ compaction: a snapshot persists the folded state, and a worker loads a
 snapshot plus the events written after it instead of folding from the first
 event. A snapshot is valid whatever the watermark has done, because the
 fold reads everything and compaction removes nothing; the two mechanisms do
-not interact. Specifying snapshots is separate work and not done here.
+not interact.
+
+Implemented as follows. `common.EventPersistor` gained `SaveSnapshot`, which
+stores the fold of a session at the fold's `LastSeq` beside the log, never in
+it; `common.EventSource`'s `GetEventsForArc` and `GetEventsForSession` take a
+`ReadOptions` and, when `UseSnapshots` is set, return the latest stored
+`Snapshot` plus only the events above its seq — nil snapshot and the whole
+log when none is stored or none is asked for, so the caller chooses.
+`common.FoldEvents` folds the two into the history `history.Resume` continues
+from the snapshot's fold. The fold moved to `proto/pkg/history` so the
+snapshot is a typed `*history.History`, not opaque bytes, and the arc cutoff
+takes the opening and the task IDs from the snapshot's fold instead of
+scanning the prefix. Stores keep the snapshot with the highest seq and refuse
+one beyond the log. Workers save only at their save points — the end of an
+arc work item and the end of a compaction, never inside a run — under a
+`SnapshotPolicy` whose `MinEvents` and `MinInterval` make saving less often
+than that.
 
 The arc the line passes through
 --------------------

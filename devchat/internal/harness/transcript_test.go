@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
@@ -120,7 +120,7 @@ func TestCompactionEventsReachTheTranscript(t *testing.T) {
 // ahead of its arcs.
 func TestFromHistoryOpensWithTheSummaryBlock(t *testing.T) {
 	arc1, arc2 := "arc-1", "arc-2"
-	log := []events.Event{
+	log := []*events.Event{
 		{SessionID: "session", ID: "u1", Seq: 1, Typ: events.UserMessageEventType,
 			CorrelationID: &arc1, Payload: events.UserMessagePayload{Content: "first question"}},
 		{SessionID: "session", ID: "c1", Seq: 2, Typ: events.CompactedEventType,
@@ -128,7 +128,7 @@ func TestFromHistoryOpensWithTheSummaryBlock(t *testing.T) {
 		{SessionID: "session", ID: "u2", Seq: 3, Typ: events.UserMessageEventType,
 			CorrelationID: &arc2, Payload: events.UserMessagePayload{Content: "second question"}},
 	}
-	h, err := history.Replay("session", log)
+	h, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}

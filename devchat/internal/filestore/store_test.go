@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -166,7 +166,7 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	selected, err := store.GetEventsForArc(ctx, ref("arc-1"))
+	_, selected, err := store.GetEventsForArc(ctx, ref("arc-1"), common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 	// A later arc sees the earlier one whole, because it is conversation
 	// history by then.
-	selected, err = store.GetEventsForArc(ctx, ref("arc-2"))
+	_, selected, err = store.GetEventsForArc(ctx, ref("arc-2"), common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 func TestGetEventsForArcRejectsAnUnknownArc(t *testing.T) {
 	store := openTemp(t)
-	if _, err := store.GetEventsForArc(context.Background(), ref("absent")); err == nil {
+	if _, _, err := store.GetEventsForArc(context.Background(), ref("absent"), common.ReadOptions{}); err == nil {
 		t.Error("an unknown arc was accepted")
 	}
 }
@@ -215,7 +215,7 @@ func TestGetEventsForArcIsScopedToItsSession(t *testing.T) {
 	}
 
 	elsewhere := common.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
-	if _, err := store.GetEventsForArc(ctx, elsewhere); err == nil {
+	if _, _, err := store.GetEventsForArc(ctx, elsewhere, common.ReadOptions{}); err == nil {
 		t.Error("an arc was served to a ref naming a different session")
 	}
 }
@@ -285,7 +285,7 @@ func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 		Payload: events.AsyncTaskInputProvidedPayload{CausationID: taskID, Message: "kube-system"},
 	}
 
-	var stored []events.Event
+	var stored []*events.Event
 	for _, ev := range []*events.Event{
 		userMessage(arc1, "audit the cluster"),       // seq 0
 		assistantMessage(arc1, "starting the audit"), // seq 1
@@ -300,10 +300,10 @@ func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Persist: %v", err)
 		}
-		stored = append(stored, *persisted[0])
+		stored = append(stored, persisted[0])
 	}
 
-	selected, err := store.GetEventsForArc(ctx, ref(taskArc))
+	_, selected, err := store.GetEventsForArc(ctx, ref(taskArc), common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 
 	// The origin arc's read includes the task-correlated event, so a run sees
 	// the task table the session holds.
-	selected, err = store.GetEventsForArc(ctx, ref(arc1))
+	_, selected, err = store.GetEventsForArc(ctx, ref(arc1), common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 	}
 
 	// Replay folds the task-opened arc, and RenderChat shows it.
-	h, err := history.Replay("session", stored)
+	h, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 	if h.Tasks[taskID] == nil {
 		t.Error("the session task table holds no task-1")
 	}
-	if out := h.RenderChat(); !strings.Contains(out, "asks a question") {
+	if out := h.RenderChat("session"); !strings.Contains(out, "asks a question") {
 		t.Errorf("RenderChat does not show the task-opened arc:\n%s", out)
 	}
 }

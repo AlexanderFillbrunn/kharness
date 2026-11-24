@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -34,6 +35,15 @@ type EventPersistor interface {
 	// caller that writes two events to say one thing must not have one of
 	// them survive without the other.
 	Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error)
+
+	// SaveSnapshot stores a fold of the session's log at the fold's LastSeq,
+	// the seq the snapshot covers. A snapshot is not a log entry: it never
+	// enters the log, is never folded, and is replaced by the next one. A
+	// store keeps the snapshot with the highest LastSeq and refuses one
+	// beyond the log, so a snapshot never claims more than the log holds.
+	// Saving is best-effort: one that fails costs the next reader a full
+	// replay, nothing more.
+	SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error
 }
 
 type EventSource interface {
@@ -44,18 +54,88 @@ type EventSource interface {
 	// session-level records that carry no correlation ID, which is COMPACTED
 	// alone, so a compaction that landed after the arc opened still reaches
 	// the run that resumes it.
-	GetEventsForArc(ctx context.Context, ref ArcRef) ([]*events.Event, error)
+	//
+	// With ReadOptions.UseSnapshots the source instead returns the session's
+	// latest stored snapshot, if any, plus only the events above the
+	// snapshot's seq that the same rule selects; a snapshot old enough to
+	// cover the arc's opening replaces the whole prefix. The snapshot is nil
+	// when none is stored or UseSnapshots is false, and then the events are
+	// the whole selection. Fold the two with FoldEvents.
+	GetEventsForArc(ctx context.Context, ref ArcRef, opts ReadOptions) (*Snapshot, []*events.Event, error)
 
 	// GetEventsForSession returns the session's whole log in the order it was
 	// written, which is what the task table and the report validation are
-	// built from.
-	GetEventsForSession(ctx context.Context, sessionID string) ([]*events.Event, error)
+	// built from. With ReadOptions.UseSnapshots it returns the latest stored
+	// snapshot, if any, plus only the events above the snapshot's seq — nil
+	// snapshot and the whole log where none is stored or none is asked for.
+	GetEventsForSession(ctx context.Context, sessionID string, opts ReadOptions) (*Snapshot, []*events.Event, error)
 
 	// TaskState reads what the log says about one task — whether the session
 	// holds it, its kind and actor, and whether it has settled — with a
 	// targeted scan rather than a fold of the whole session. It is the
 	// admission check for task-emitted writes.
 	TaskState(ctx context.Context, sessionID, taskID string) (*TaskState, error)
+}
+
+// SelectArcEvents returns the events one arc is run from, out of the
+// candidates given — the GetEventsForArc cutoff, applied here so every store
+// answers alike. An event is selected when any of these holds:
+//
+//   - its seq is at or below the arc's opening seq: the conversation prefix
+//     up to and including the opening event;
+//   - it is correlated to the arc;
+//   - it is correlated to a task of the session, so the fold builds the
+//     session's task table;
+//   - it carries no correlation ID: the session-level records, COMPACTED and
+//     a session-level COMPACTION_REQUESTED, so a compaction that landed
+//     after the arc opened still reaches the run that resumes it.
+//
+// The arc is found by its opening event: the earliest event correlated to
+// the arc ID whose kind opens an arc (events.OpensArc — a USER_MESSAGE, or a
+// task event written AsMessage). Where the opening seq and the task IDs come
+// from depends on snap: with a snapshot, all is the tail above the
+// snapshot's seq and both are read from the snapshot's fold where they are
+// already folded in it and scanned from the tail where they are not; without
+// one, all is the whole log and both are scanned from it. An arc found in
+// neither place is an error.
+func SelectArcEvents(all []*events.Event, ref ArcRef, snap *Snapshot) ([]*events.Event, error) {
+	taskIDs := map[string]bool{}
+	opening := -1
+	if snap != nil && snap.Fold != nil {
+		for id := range snap.Fold.Tasks {
+			taskIDs[id] = true
+		}
+		for _, arc := range snap.Fold.Arcs {
+			if arc.ID == ref.ArcID {
+				opening = arc.Seq
+				break
+			}
+		}
+	}
+	for _, ev := range all {
+		if ev.Typ == events.AsyncTaskInvokeEventType {
+			taskIDs[ev.ID] = true
+		}
+		if opening < 0 && correlatesTo(ev, ref.ArcID) && events.OpensArc(ev) {
+			opening = ev.Seq
+		}
+	}
+	if opening < 0 {
+		return nil, fmt.Errorf("no arc %s in %s", ref, ref.SessionID)
+	}
+
+	var selected []*events.Event
+	for _, ev := range all {
+		if ev.Seq <= opening || ev.CorrelationID == nil || correlatesTo(ev, ref.ArcID) ||
+			taskIDs[*ev.CorrelationID] {
+			selected = append(selected, ev)
+		}
+	}
+	return selected, nil
+}
+
+func correlatesTo(ev *events.Event, arcID string) bool {
+	return ev.CorrelationID != nil && *ev.CorrelationID == arcID
 }
 
 // TaskState is what the log says about one async task, read without folding
@@ -187,6 +267,12 @@ func (p *publishingPersistor) Persist(ctx context.Context, evs ...*events.Event)
 	return stored, nil
 }
 
+// SaveSnapshot passes the fold through untouched: a snapshot is not an event,
+// so there is nothing to publish on it.
+func (p *publishingPersistor) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	return p.persistor.SaveSnapshot(ctx, sessionID, fold)
+}
+
 // MintIdentity gives an event an ID and a timestamp. Every write goes through
 // one of these, because a store is left to assign the sequence number and
 // nothing else.
@@ -232,6 +318,50 @@ func (m *mintingPersistor) Persist(ctx context.Context, evs ...*events.Event) ([
 	return m.persistor.Persist(ctx, minted...)
 }
 
+// SaveSnapshot passes the fold through untouched: minting gives events IDs
+// and times, and a snapshot already carries its seq in the fold's LastSeq.
+func (m *mintingPersistor) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	return m.persistor.SaveSnapshot(ctx, sessionID, fold)
+}
+
+// AsSession stamps every event written through it with the session it
+// belongs to. An event already naming a session is left alone, so a writer
+// that knows its session keeps its own stamp, the same convention as the ID
+// and the time in MintIdentity.
+//
+// A run is handed one of these rather than its session id, for the same
+// reason AsAgent exists: the work item names the session, the persistor
+// records it, and nothing between the two has to carry it. MintIdentity
+// still refuses an event that reaches it with no session, so the stamp lands
+// before that check.
+func AsSession(sessionID string, persistor EventPersistor) EventPersistor {
+	return &sessionPersistor{sessionID: sessionID, persistor: persistor}
+}
+
+type sessionPersistor struct {
+	sessionID string
+	persistor EventPersistor
+}
+
+func (s *sessionPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	stamped := make([]*events.Event, 0, len(evs))
+	for _, ev := range evs {
+		// The caller's event is left alone, since they may still be holding it.
+		one := *ev
+		if one.SessionID == "" {
+			one.SessionID = s.sessionID
+		}
+		stamped = append(stamped, &one)
+	}
+	return s.persistor.Persist(ctx, stamped...)
+}
+
+// SaveSnapshot passes the fold through untouched: the session is the
+// snapshot's own parameter, so there is nothing to stamp on it.
+func (s *sessionPersistor) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	return s.persistor.SaveSnapshot(ctx, sessionID, fold)
+}
+
 // AsAgent stamps every event written through it with the agent that added
 // it. An event already naming an agent is left alone, so a writer that knows
 // its agent keeps its own stamp, the same convention as the ID and the time in
@@ -260,6 +390,12 @@ func (a *agentPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*
 		stamped = append(stamped, &one)
 	}
 	return a.persistor.Persist(ctx, stamped...)
+}
+
+// SaveSnapshot passes the fold through untouched: a snapshot names no agent,
+// since it is the store's record of the session, not anyone's write.
+func (a *agentPersistor) SaveSnapshot(ctx context.Context, sessionID string, fold *history.History) error {
+	return a.persistor.SaveSnapshot(ctx, sessionID, fold)
 }
 
 // NewEventID mints an identifier for an event.

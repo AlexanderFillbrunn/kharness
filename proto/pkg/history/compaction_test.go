@@ -13,7 +13,7 @@ import (
 // compactionLogger builds a log with explicit sequence numbers, so a test can
 // place records at the sequences the scenario needs.
 type compactionLogger struct {
-	events []events.Event
+	events []*events.Event
 	start  time.Time
 }
 
@@ -26,7 +26,7 @@ func (l *compactionLogger) add(seq int, id, arc string, typ events.EventType, pa
 	if arc != "" {
 		correlation = &arc
 	}
-	l.events = append(l.events, events.Event{
+	l.events = append(l.events, &events.Event{
 		SessionID:     "session-1",
 		ID:            id,
 		Seq:           seq,
@@ -83,7 +83,7 @@ func (l *compactionLogger) invoke(seq int, arc, id, task string, args any) {
 
 func (l *compactionLogger) fold(t *testing.T) *History {
 	t.Helper()
-	h, err := Replay("session-1", l.events)
+	h, err := Replay(l.events)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -237,11 +237,11 @@ func TestEstimateTokensTable(t *testing.T) {
 
 	log := newCompactionLogger()
 	log.user(0, "a1", "abcd")
-	if got := EstimateEvent(&log.events[0]); got != 1 {
+	if got := EstimateEvent(log.events[0]); got != 1 {
 		t.Errorf("EstimateEvent(user message of 4 chars) = %d, want 1", got)
 	}
 	log.toolResult(1, "a1", "call-1", "abcdefgh")
-	if got := EstimateEvent(&log.events[1]); got != 2 {
+	if got := EstimateEvent(log.events[1]); got != 2 {
 		t.Errorf("EstimateEvent(tool result of 8 chars) = %d, want 2", got)
 	}
 }
@@ -503,14 +503,14 @@ func TestCompactionRequestCorrelationIsValidated(t *testing.T) {
 	log := newCompactionLogger()
 	log.user(0, "a1", "q")
 	log.request(1, "no-such-arc", "req-bad", -1)
-	if _, err := Replay("session-1", log.events); err == nil {
+	if _, err := Replay(log.events); err == nil {
 		t.Error("a request correlated to a missing arc folded")
 	}
 
 	log2 := newCompactionLogger()
 	log2.user(0, "a1", "q")
 	log2.request(1, "", "req-free", -1)
-	h, err := Replay("session-1", log2.events)
+	h, err := Replay(log2.events)
 	if err != nil {
 		t.Fatalf("a request with no correlation should fold: %v", err)
 	}

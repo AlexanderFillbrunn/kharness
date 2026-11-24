@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -169,7 +169,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-1"})
+	_, selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-1"}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 	// A later arc sees the earlier one whole, because it is conversation
 	// history by then.
-	selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-2"})
+	_, selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: "arc-2"}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestStoreGetEventsForArcAppliesTheCutoff(t *testing.T) {
 func TestStoreGetEventsForArcRejectsAnUnknownArc(t *testing.T) {
 	store := openStore(t)
 	ref := common.ArcRef{SessionID: "session", ArcID: "absent"}
-	if _, err := store.GetEventsForArc(context.Background(), ref); err == nil {
+	if _, _, err := store.GetEventsForArc(context.Background(), ref, common.ReadOptions{}); err == nil {
 		t.Error("an unknown arc was accepted")
 	}
 }
@@ -218,7 +218,7 @@ func TestStoreGetEventsForArcIsScopedToItsSession(t *testing.T) {
 	}
 
 	elsewhere := common.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
-	if _, err := store.GetEventsForArc(ctx, elsewhere); err == nil {
+	if _, _, err := store.GetEventsForArc(ctx, elsewhere, common.ReadOptions{}); err == nil {
 		t.Error("an arc was served to a ref naming a different session")
 	}
 }
@@ -313,7 +313,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 		Payload: events.AsyncTaskInputProvidedPayload{CausationID: taskID, Message: "kube-system"},
 	}
 
-	var stored []events.Event
+	var stored []*events.Event
 	for _, ev := range []*events.Event{
 		userMessage("session", arc1, "audit the cluster"),      // seq 0
 		assistantMessage("session", arc1, "starting the audit"), // seq 1
@@ -328,10 +328,10 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Persist: %v", err)
 		}
-		stored = append(stored, *persisted[0])
+		stored = append(stored, persisted[0])
 	}
 
-	selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: taskArc})
+	_, selected, err := store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: taskArc}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 
 	// The origin arc's read includes the task-correlated event, so a run sees
 	// the task table the session holds.
-	selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: arc1})
+	_, selected, err = store.GetEventsForArc(ctx, common.ArcRef{SessionID: "session", ArcID: arc1}, common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 	}
 
 	// Replay folds the task-opened arc, and RenderChat shows it.
-	h, err := history.Replay("session", stored)
+	h, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestStoreGetEventsForArcFindsATaskOpenedArc(t *testing.T) {
 	if h.Tasks[taskID] == nil {
 		t.Error("the session task table holds no task-1")
 	}
-	if out := h.RenderChat(); !strings.Contains(out, "asks a question") {
+	if out := h.RenderChat("session"); !strings.Contains(out, "asks a question") {
 		t.Errorf("RenderChat does not show the task-opened arc:\n%s", out)
 	}
 }
@@ -409,7 +409,7 @@ func TestStoreGetEventsForSessionReadsOnlyItsOwnLog(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	got, err := store.GetEventsForSession(ctx, "session-a")
+	_, got, err := store.GetEventsForSession(ctx, "session-a", common.ReadOptions{})
 	if err != nil {
 		t.Fatalf("GetEventsForSession: %v", err)
 	}

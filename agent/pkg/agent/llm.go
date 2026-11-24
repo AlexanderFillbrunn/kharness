@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 )
 

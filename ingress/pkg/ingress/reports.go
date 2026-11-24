@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
@@ -218,7 +218,9 @@ func reportEvent(ref common.TaskRef, state *common.TaskState, metadata common.Ta
 // The settle is written with None visibility, correlated to the task — the
 // reaper's exception to results always opening an arc — so it opens no arc
 // and reaches no model.
-func SettleAbandonedTasks(ctx context.Context, persistor common.EventPersistor, h *history.History) (int, error) {
+func SettleAbandonedTasks(ctx context.Context, persistor common.EventPersistor, sessionID string, h *history.History) (int, error) {
+	// The session is the caller's to name; the fold does not carry it.
+	persistor = common.AsSession(sessionID, persistor)
 	settled := 0
 	for _, task := range h.TasksInOrder() {
 		if task.FinishedSeq != nil {
@@ -226,7 +228,6 @@ func SettleAbandonedTasks(ctx context.Context, persistor common.EventPersistor, 
 		}
 		taskID := task.ID
 		_, err := persistor.Persist(ctx, &events.Event{
-			SessionID:     h.SessionID,
 			Typ:           events.AsyncTaskResultEventType,
 			CorrelationID: &taskID,
 			Payload: events.AsyncTaskResultPayload{

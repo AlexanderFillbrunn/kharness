@@ -14,7 +14,7 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 	user := users.Actor{UserID: "user-1", TenantID: "tenant-1"}
 	vendorID := "vendor-1"
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "Check status", Actor: user}},
 		{ID: "assistant-message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{VendorID: &vendorID, ModelID: "model-1", Content: "Checking.", Reasoning: []byte("opaque-provider-bytes")}},
 		{ID: "tool-call-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", VendorID: "tool-vendor-1", ToolName: "lookup", Args: "status"}},
@@ -38,7 +38,7 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 		{ID: "error-1", Seq: 20, Timestamp: start.Add(20 * time.Second), Typ: events.ErrorEventType, CorrelationID: &arc, Payload: events.ErrorPayload{Message: "recorded failure", CausationID: stringPtr("tool-call-1")}},
 	}
 
-	history := foldEvents(t, "session-1", log)
+	history := foldEvents(t, log)
 	if len(history.Arcs) != 3 {
 		t.Fatalf("arcs = %d, want the origin arc plus the ask and result arcs the task opened", len(history.Arcs))
 	}
@@ -146,7 +146,7 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 	start := time.Date(2026, time.September, 17, 14, 0, 0, 0, time.UTC)
 	arc := "user-message-1"
 	user := users.Actor{UserID: "user-1"}
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "Start", Actor: user}},
 		{ID: "assistant-message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{ModelID: "model-1", Content: "Working."}},
 		{ID: "blocked-tool", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "blocked", VendorID: "vendor"}},
@@ -158,7 +158,7 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 		{ID: "cancel-1", Seq: 8, Timestamp: start.Add(8 * time.Second), Typ: events.CancelEventType, CorrelationID: &arc, Actor: user, Payload: events.CancelPayload{Reason: stringPtr("user stopped")}},
 	}
 
-	history := foldEvents(t, "session-1", log)
+	history := foldEvents(t, log)
 	if len(history.Arcs) != 2 {
 		t.Fatalf("arcs = %#v, want the origin arc and the ask's arc", history.Arcs)
 	}
@@ -198,7 +198,7 @@ func TestHistoryFoldRetainsAsyncTaskNotificationsAndInputInteractions(t *testing
 	taskID := "task-1"
 	user := users.Actor{UserID: "user-1"}
 	notification := map[string]any{"message": "checking status"}
-	eventLog := []events.Event{
+	eventLog := []*events.Event{
 		{
 			ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "Research this", Actor: user},
@@ -225,10 +225,10 @@ func TestHistoryFoldRetainsAsyncTaskNotificationsAndInputInteractions(t *testing
 		},
 	}
 
-	history := NewHistory("session-1")
+	history := NewHistory()
 	state := NewFoldState()
 	for i := range eventLog {
-		if err := history.Update(&eventLog[i], state); err != nil {
+		if err := history.Update(eventLog[i], state); err != nil {
 			t.Fatalf("Update(event %d) error = %v", i, err)
 		}
 		switch i {
@@ -290,7 +290,7 @@ func TestHistoryFoldNestsEachUserMessageInItsOwnArc(t *testing.T) {
 	second := "arc-2"
 	user := users.Actor{UserID: "user-1"}
 
-	history := foldEvents(t, "session-1", []events.Event{
+	history := foldEvents(t, []*events.Event{
 		{ID: first, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &first, Actor: user, Payload: events.UserMessagePayload{Content: "First", Actor: user}},
 		{ID: "assistant-message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &first, Payload: events.AssistantMessagePayload{ModelID: "model-1", Content: "Answering first."}},
 		{ID: second, Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.UserMessageEventType, CorrelationID: &second, Actor: user, Payload: events.UserMessagePayload{Content: "Second", Actor: user}},
@@ -336,7 +336,7 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 		}},
 	}
 	state := FoldStateFromHistory(history)
-	updates := []events.Event{
+	updates := []*events.Event{
 		{ID: "tool-result-1", Seq: 1, Timestamp: now, Typ: events.ToolResultEventType, CorrelationID: &arc, Payload: events.ToolResultPayload{CausationID: "tool-1", Result: "done"}},
 		{ID: "interrupt-response-1", Seq: 2, Timestamp: now, Typ: events.InterruptResponseEventType, CorrelationID: &arc, Actor: user, Payload: events.InterruptResponsePayload{CausationID: "interrupt-1", Response: "approved", Actor: user}},
 		{ID: "task-result-1", Seq: 3, Timestamp: now, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr("task-1"), Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityNone}},
@@ -345,7 +345,7 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 		{ID: "error-1", Seq: 6, Timestamp: now, Typ: events.ErrorEventType, CorrelationID: &arc, Payload: events.ErrorPayload{Message: "recorded failure"}},
 	}
 	for i := range updates {
-		if err := history.Update(&updates[i], state); err != nil {
+		if err := history.Update(updates[i], state); err != nil {
 			t.Fatalf("Update(existing record event %d) error = %v", i, err)
 		}
 	}
@@ -375,7 +375,7 @@ func TestToolDispatchRecordsEveryAttemptAndKeepsTheFirst(t *testing.T) {
 	start := time.Date(2026, time.September, 22, 9, 0, 0, 0, time.UTC)
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "Restart it", Actor: user}},
 		{ID: "assistant-message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{Content: "Restarting."}},
 		{ID: "tool-call-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "restart"}},
@@ -383,7 +383,7 @@ func TestToolDispatchRecordsEveryAttemptAndKeepsTheFirst(t *testing.T) {
 		{ID: "tool-dispatched-2", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.ToolDispatchedEventType, CorrelationID: &arc, Payload: events.ToolDispatchedPayload{CausationID: "tool-call-1"}},
 	}
 
-	call := foldEvents(t, "session-1", log).Arcs[0].Responses[0].ToolCalls[0]
+	call := foldEvents(t, log).Arcs[0].Responses[0].ToolCalls[0]
 	if call.Dispatches != 2 {
 		t.Errorf("dispatches = %d, want both attempts counted", call.Dispatches)
 	}
@@ -408,7 +408,7 @@ func TestToolDispatchIsRecordedAfterTheCallWasSettled(t *testing.T) {
 	start := time.Date(2026, time.September, 22, 10, 0, 0, 0, time.UTC)
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "Restart it", Actor: user}},
 		{ID: "assistant-message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{Content: "Restarting."}},
 		{ID: "tool-call-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "restart"}},
@@ -416,7 +416,7 @@ func TestToolDispatchIsRecordedAfterTheCallWasSettled(t *testing.T) {
 		{ID: "tool-dispatched-1", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.ToolDispatchedEventType, CorrelationID: &arc, Payload: events.ToolDispatchedPayload{CausationID: "tool-call-1"}},
 	}
 
-	call := foldEvents(t, "session-1", log).Arcs[0].Responses[0].ToolCalls[0]
+	call := foldEvents(t, log).Arcs[0].Responses[0].ToolCalls[0]
 	if call.Dispatches != 1 || call.DispatchedSeq == nil {
 		t.Errorf("call = %#v, want the dispatch recorded against a settled call", call)
 	}
@@ -451,14 +451,11 @@ func TestToolCallPhaseSeparatesTheWaysACallCanBeUnsettled(t *testing.T) {
 	}
 }
 
-func foldEvents(t *testing.T, sessionID string, log []events.Event) *History {
+func foldEvents(t *testing.T, log []*events.Event) *History {
 	t.Helper()
-	history := NewHistory(sessionID)
-	state := NewFoldState()
-	for i := range log {
-		if err := history.Update(&log[i], state); err != nil {
-			t.Fatalf("Update(event %d, type %s) error = %v", i, log[i].Typ, err)
-		}
+	history, err := Replay(log)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
 	}
 	return history
 }
@@ -476,7 +473,7 @@ func TestArcClosedRecordsWhatClosedTheArc(t *testing.T) {
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "how many pods are pending?", Actor: user}},
 		{ID: "message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{ModelID: "model-1", Content: "six"}},
 		{ID: "closed-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ArcClosedEventType, CorrelationID: &arc, Payload: events.ArcClosedPayload{CausationID: "message-1"}},
@@ -484,7 +481,7 @@ func TestArcClosedRecordsWhatClosedTheArc(t *testing.T) {
 		{ID: "closed-2", Seq: 3, Timestamp: start.Add(3 * time.Second), Typ: events.ArcClosedEventType, CorrelationID: &arc, Payload: events.ArcClosedPayload{CausationID: "message-1"}},
 	}
 
-	got := foldEvents(t, "session-1", log).Arcs[0]
+	got := foldEvents(t, log).Arcs[0]
 	if got.Closed == nil {
 		t.Fatal("arc closed = nil, want the close the agent recorded")
 	}
@@ -502,7 +499,7 @@ func TestArcClosedNeedsAnArcAndAMessageItCanName(t *testing.T) {
 	other := "arc-2"
 	user := users.Actor{UserID: "user-1"}
 
-	opening := []events.Event{
+	opening := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "how many pods are pending?", Actor: user}},
 		{ID: "message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{ModelID: "model-1", Content: "six"}},
 	}
@@ -511,7 +508,7 @@ func TestArcClosedNeedsAnArcAndAMessageItCanName(t *testing.T) {
 		"unknown message": {ID: "closed-1", Seq: 2, Timestamp: start, Typ: events.ArcClosedEventType, CorrelationID: &arc, Payload: events.ArcClosedPayload{CausationID: "nope"}},
 		"unknown arc":     {ID: "closed-1", Seq: 2, Timestamp: start, Typ: events.ArcClosedEventType, CorrelationID: &other, Payload: events.ArcClosedPayload{CausationID: "message-1"}},
 	} {
-		history := foldEvents(t, "session-1", opening)
+		history := foldEvents(t, opening)
 		state := FoldStateFromHistory(history)
 		if err := history.Update(&closing, state); err == nil {
 			t.Errorf("Update(close naming an %s) error = nil, want an error", name)
@@ -581,17 +578,17 @@ func TestCancelTerminatedWorkFollowsTheClose(t *testing.T) {
 	build := func(t *testing.T, closeIt bool) *Arc {
 		t.Helper()
 		arc := "arc-1"
-		log := []events.Event{
+		log := []*events.Event{
 			{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: user}},
 			{ID: "message-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AssistantMessageEventType, CorrelationID: &arc, Payload: events.AssistantMessagePayload{ModelID: "model-1", Content: "started the audit"}},
 		}
 		next := 2
 		if closeIt {
-			log = append(log, events.Event{ID: "closed-1", Seq: next, Timestamp: start.Add(2 * time.Second), Typ: events.ArcClosedEventType, CorrelationID: &arc, Payload: events.ArcClosedPayload{CausationID: "message-1"}})
+			log = append(log, &events.Event{ID: "closed-1", Seq: next, Timestamp: start.Add(2 * time.Second), Typ: events.ArcClosedEventType, CorrelationID: &arc, Payload: events.ArcClosedPayload{CausationID: "message-1"}})
 			next++
 		}
-		log = append(log, events.Event{ID: "cancel-1", Seq: next, Timestamp: start.Add(time.Duration(next) * time.Second), Typ: events.CancelEventType, CorrelationID: &arc, Actor: user, Payload: events.CancelPayload{}})
-		return foldEvents(t, "session-1", log).Arcs[0]
+		log = append(log, &events.Event{ID: "cancel-1", Seq: next, Timestamp: start.Add(time.Duration(next) * time.Second), Typ: events.CancelEventType, CorrelationID: &arc, Actor: user, Payload: events.CancelPayload{}})
+		return foldEvents(t, log).Arcs[0]
 	}
 
 	if cancel := build(t, true).Cancel; cancel.TerminatedWork {
@@ -609,12 +606,12 @@ func TestCancelForAnUnknownArcIsRejected(t *testing.T) {
 	user := users.Actor{UserID: "user-1"}
 
 	known, unknown := "arc-1", "arc-2"
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: known, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &known, Actor: user, Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: user}},
 		{ID: "cancel-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.CancelEventType, CorrelationID: &unknown, Actor: user, Payload: events.CancelPayload{}},
 	}
 
-	if _, err := Replay("session-1", log); err == nil {
+	if _, err := Replay(log); err == nil {
 		t.Fatal("a cancel against an arc that is not in the log was folded without complaint")
 	}
 }
@@ -627,7 +624,7 @@ func TestAnAsyncTaskResultWithoutAnOutcomeIsRefused(t *testing.T) {
 	arc := "user-message-1"
 	actor := users.Actor{UserID: "user-1", TenantID: "tenant-1"}
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "task-1", Seq: 1, Timestamp: start, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
@@ -636,7 +633,7 @@ func TestAnAsyncTaskResultWithoutAnOutcomeIsRefused(t *testing.T) {
 			Payload: events.AsyncTaskResultPayload{CausationID: "task-1", Result: "healthy"}},
 	}
 
-	if _, err := Replay("session-1", log); err == nil {
+	if _, err := Replay(log); err == nil {
 		t.Fatal("a result carrying no outcome was folded")
 	}
 }
@@ -680,7 +677,7 @@ func TestFoldRefusesAnEventItCannotAttach(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			history := foldEvents(t, "session-1", []events.Event{opening})
+			history := foldEvents(t, []*events.Event{&opening})
 			state := FoldStateFromHistory(history)
 			ev := events.Event{
 				ID: "unattachable-1", Seq: 1, Timestamp: start.Add(time.Second),
@@ -714,7 +711,7 @@ func TestATaskEventCorrelatesToTheTaskNotItsOriginArc(t *testing.T) {
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
 	taskID := "task-1"
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: user}},
 		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
@@ -723,7 +720,7 @@ func TestATaskEventCorrelatesToTheTaskNotItsOriginArc(t *testing.T) {
 			Payload: events.AsyncTaskEventPayload{CausationID: taskID, Class: "progress", Payload: "halfway", LLMVisibility: events.LLMVisibilityNone}},
 	}
 
-	h, err := Replay("session-1", log)
+	h, err := Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -752,13 +749,13 @@ func TestATaskEventForAnUnknownTaskIsRejected(t *testing.T) {
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
 	unknown := "task-nobody-started"
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
 		{ID: "ae-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: &unknown,
 			Payload: events.AsyncTaskEventPayload{CausationID: unknown, Payload: "news", LLMVisibility: events.LLMVisibilityNone}},
 	}
-	if _, err := Replay("session-1", log); err == nil {
+	if _, err := Replay(log); err == nil {
 		t.Fatal("a task event for an unknown task was folded")
 	}
 }
@@ -770,7 +767,7 @@ func TestTheFoldRejectsAVisibilityCorrelationMismatch(t *testing.T) {
 	arc := "arc-1"
 	taskID := "task-1"
 	user := users.Actor{UserID: "user-1"}
-	opening := []events.Event{
+	opening := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
 		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
@@ -792,7 +789,7 @@ func TestTheFoldRejectsAVisibilityCorrelationMismatch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := foldEvents(t, "session-1", opening)
+			h := foldEvents(t, opening)
 			ev := events.Event{ID: "bad-1", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: tc.typ, CorrelationID: tc.corr, Actor: user, Payload: tc.payload}
 			if err := h.Update(&ev, FoldStateFromHistory(h)); err == nil {
 				t.Fatalf("Update(%s) error = nil, want the mismatch refused", tc.name)
@@ -812,7 +809,7 @@ func TestATaskAddressedCancelSettlesTheTask(t *testing.T) {
 	taskID := "task-1"
 	user := users.Actor{UserID: "user-1"}
 	reason := "no longer needed"
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
 		{ID: taskID, Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
@@ -821,7 +818,7 @@ func TestATaskAddressedCancelSettlesTheTask(t *testing.T) {
 			Actor: user, Payload: events.CancelPayload{TaskID: &taskID, Reason: &reason}},
 	}
 
-	h := foldEvents(t, "session-1", log)
+	h := foldEvents(t, log)
 	task := h.Tasks[taskID]
 	if task.Status != AsyncTaskCancelled {
 		t.Errorf("task status = %s, want CANCELLED", task.Status)
@@ -844,11 +841,11 @@ func TestATaskCancelForAnUnknownTaskIsRejected(t *testing.T) {
 	arc := "arc-1"
 	user := users.Actor{UserID: "user-1"}
 	unknown := "task-nobody-started"
-	opening := []events.Event{
+	opening := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user,
 			Payload: events.UserMessagePayload{Content: "audit", Actor: user}},
 	}
-	h := foldEvents(t, "session-1", opening)
+	h := foldEvents(t, opening)
 	bad := events.Event{ID: "c-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.CancelEventType,
 		CorrelationID: &unknown, Actor: user, Payload: events.CancelPayload{TaskID: &unknown}}
 	if err := h.Update(&bad, FoldStateFromHistory(h)); err == nil {

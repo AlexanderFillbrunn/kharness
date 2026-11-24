@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -46,11 +46,21 @@ func (p *fakePersistor) Persist(_ context.Context, evs ...*events.Event) ([]*eve
 	return stored, nil
 }
 
+// SaveSnapshot accepts and drops the fold: these tests do not read through
+// snapshots, and the wrappers that embed fakePersistor forward to this.
+func (p *fakePersistor) SaveSnapshot(_ context.Context, _ string, _ *history.History) error {
+	return nil
+}
+
 // failingPersistor refuses every write.
 type failingPersistor struct{}
 
 func (failingPersistor) Persist(context.Context, ...*events.Event) ([]*events.Event, error) {
 	return nil, errors.New("the log is unreachable")
+}
+
+func (failingPersistor) SaveSnapshot(context.Context, string, *history.History) error {
+	return errors.New("the log is unreachable")
 }
 
 // A tool call names the message that requested it, and that name is the ID the
@@ -594,7 +604,7 @@ func abandonedArc(t *testing.T) *history.History {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
-	h, err := history.Replay("session", []events.Event{
+	h, err := history.Replay([]*events.Event{
 		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "restart the ingress controller", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
@@ -709,7 +719,7 @@ func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
@@ -721,9 +731,9 @@ func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
 	}
-	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
+	slices.SortFunc(log, func(a, b *events.Event) int { return a.Seq - b.Seq })
 
-	h, err := history.Replay(testSessionID, log)
+	h, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -804,7 +814,7 @@ func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
 
-	log := []events.Event{
+	log := []*events.Event{
 		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
 		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
@@ -817,12 +827,12 @@ func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
 	}
 	if answered {
-		log = append(log, events.Event{ID: "ap-1", Seq: 6, Timestamp: at, Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &askArc, Actor: actor,
+		log = append(log, &events.Event{ID: "ap-1", Seq: 6, Timestamp: at, Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &askArc, Actor: actor,
 			Payload: events.AsyncTaskInputProvidedPayload{CausationID: "a-1", Message: "kube-system"}})
 	}
-	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
+	slices.SortFunc(log, func(a, b *events.Event) int { return a.Seq - b.Seq })
 
-	h, err := history.Replay(testSessionID, log)
+	h, err := history.Replay(log)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}

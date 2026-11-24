@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -62,7 +62,7 @@ func userArcHistory(t *testing.T) *history.History {
 	t.Helper()
 	arc := testArcID
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
-	h, err := history.Replay(testSessionID, []events.Event{{
+	h, err := history.Replay([]*events.Event{{
 		SessionID: testSessionID, ID: arc, Seq: 0, Timestamp: time.Unix(0, 0),
 		Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "how many pods are pending?", Actor: actor},
@@ -226,7 +226,7 @@ func TestEncodePairsCallsUnderVendorIDs(t *testing.T) {
 	arc := testArcID
 	at := time.Unix(0, 0)
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
-	h, err := history.Replay("session", []events.Event{
+	h, err := history.Replay([]*events.Event{
 		{
 			SessionID: "session", ID: arc, Seq: 0, Timestamp: at,
 			Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
@@ -287,7 +287,7 @@ func taskAskHistory(t *testing.T) *history.History {
 	askArc := "arc-ask"
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	at := time.Unix(0, 0)
-	h, err := history.Replay(testSessionID, []events.Event{
+	h, err := history.Replay([]*events.Event{
 		{
 			SessionID: testSessionID, ID: arc, Seq: 0, Timestamp: at,
 			Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,

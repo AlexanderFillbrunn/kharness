@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // This file is the OpenAI half of the encoding step ENCODING.md specifies: it

@@ -11,7 +11,7 @@ import (
 	"fillbrunn.ai/kube-agent/devchat/internal/filestore"
 	"fillbrunn.ai/kube-agent/agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
-	"fillbrunn.ai/kube-agent/agent/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 )
 
@@ -70,7 +70,7 @@ func TestCancelRecordsTheWithdrawalAndStopsTheRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
-	h, err := history.Replay("session", values(stored))
+	h, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestCancelWithoutAReasonRecordsNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
-	h, err := history.Replay("session", values(stored))
+	h, err := history.Replay(stored)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
