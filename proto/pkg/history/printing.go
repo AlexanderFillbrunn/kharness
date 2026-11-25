@@ -88,6 +88,11 @@ func printArc(w io.Writer, arc *Arc) error {
 			return err
 		}
 	}
+	for _, interrupt := range arc.Interrupts {
+		if err := printInterrupt(w, interrupt, "    "); err != nil {
+			return err
+		}
+	}
 	if err := printErrors(w, arc.Errors); err != nil {
 		return err
 	}
@@ -140,22 +145,32 @@ func printToolCall(w io.Writer, call *ToolCall) error {
 			return err
 		}
 	}
-	return printInterrupt(w, call.Interrupt)
+	return printInterrupt(w, call.Interrupt, "      ")
 }
 
-// printInterrupt prints the human decision a call was held up for. A call
-// nobody was asked about prints nothing.
-func printInterrupt(w io.Writer, interrupt *Interrupt) error {
+// printInterrupt prints the human decision a record was held up for. A record
+// nobody was asked about prints nothing. The indent places it under a call
+// or directly under the arc for an arc-wide interrupt.
+func printInterrupt(w io.Writer, interrupt *Interrupt, indent string) error {
 	if interrupt == nil {
 		return nil
 	}
-	_, err := fmt.Fprintf(w, "      interrupt %s\n        timestamp: %s\n        status: %s\n        reason: %s\n        context: %s\n        response: %s\n        responder: %s\n",
+	_, err := fmt.Fprintf(w, "%sinterrupt %s\n%s  causation: %s\n%s  timestamp: %s\n%s  status: %s\n%s  reason: %s\n%s  context: %s\n%s  response: %s\n%s  responder: %s\n",
+		indent,
 		interrupt.ID,
+		indent,
+		interrupt.CausationID,
+		indent,
 		formatTime(interrupt.Timestamp),
+		indent,
 		interrupt.Status,
+		indent,
 		interrupt.Reason,
+		indent,
 		formatValue(interrupt.Context),
+		indent,
 		formatValue(interrupt.Response),
+		indent,
 		formatValue(interrupt.Responder),
 	)
 	return err

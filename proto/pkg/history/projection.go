@@ -558,6 +558,14 @@ func arcEndSeq(arc *Arc) int {
 			end = suspension.Seq
 		}
 	}
+	for _, interrupt := range arc.Interrupts {
+		if interrupt.Seq > end {
+			end = interrupt.Seq
+		}
+		if interrupt.ResolvedSeq != nil && *interrupt.ResolvedSeq > end {
+			end = *interrupt.ResolvedSeq
+		}
+	}
 	return end
 }
 
@@ -672,6 +680,12 @@ func (p *projector) keepArc(arc *Arc) {
 		}
 		p.projectResponse(message, stopped)
 	}
+	for _, interrupt := range arc.Interrupts {
+		if p.aboveCeiling(interrupt.Seq) {
+			continue
+		}
+		p.projectArcInterrupt(interrupt)
+	}
 	p.projectErrors(arc)
 	p.projectTasks(arc, stoppedSeq, stopped)
 }
@@ -784,6 +798,25 @@ func (p *projector) projectErrors(arc *Arc) {
 	}
 }
 
+// projectArcInterrupt emits the notes for an arc-wide interrupt: the ask where
+// it was raised, and the answer where it arrived. A cancel is not among them:
+// the arc's own status note covers it.
+func (p *projector) projectArcInterrupt(interrupt *Interrupt) {
+	if p.modes.Interrupt != TreatmentNote {
+		return
+	}
+	p.emit(interrupt.Seq, 0, ModelNoteMessage{Content: askNote(interrupt)})
+	if interrupt.ResolvedSeq == nil || p.aboveCeiling(*interrupt.ResolvedSeq) {
+		return
+	}
+	switch interrupt.Status {
+	case InterruptAnswered:
+		p.emitNote(*interrupt.ResolvedSeq, 0, "[interrupt %s: a human answered: %s]", interrupt.ID, formatValue(interrupt.Response))
+	case InterruptApproved:
+		p.emitNote(*interrupt.ResolvedSeq, 0, "[interrupt %s: a human approved it]", interrupt.ID)
+	}
+}
+
 // projectInterrupt emits the notes for the human decision a call was held up
 // for. A refusal is not among them: it settled the call, so it reaches the
 // model as that call's result.
@@ -816,7 +849,12 @@ func (p *projector) projectInterrupt(call *ToolCall) {
 // fields a raised interrupt already has, so the note cannot change once the
 // decision arrives.
 func askNote(interrupt *Interrupt) string {
-	note := fmt.Sprintf("[interrupt %s: a human was asked to approve this call before it runs", interrupt.ID)
+	var note string
+	if interrupt.CausationID == "" {
+		note = fmt.Sprintf("[interrupt %s: the request was held for a human to answer", interrupt.ID)
+	} else {
+		note = fmt.Sprintf("[interrupt %s: a human was asked to approve this call before it runs", interrupt.ID)
+	}
 	if interrupt.Reason != "" {
 		note += ": " + interrupt.Reason
 	}

@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // A line starting with a slash is an instruction to the harness rather than
@@ -42,6 +45,18 @@ var commands = []slashCommand{
 		name:    "/tasks",
 		summary: "list tasks",
 		run:     listTasks,
+	},
+	{
+		name:       "/answer",
+		arg:        "<interrupt-id> <answer>",
+		summary:    "answer a pending interrupt and resume its arc",
+		duringTurn: true,
+		run:        answerInterruptTurn,
+	},
+	{
+		name:    "/interrupts",
+		summary: "list interrupts and their status",
+		run:     listInterrupts,
 	},
 	{
 		name:    "/model",
@@ -212,6 +227,100 @@ func clearSession(m model, _ string) (model, tea.Cmd) {
 		m.transcript.note("nothing to clear")
 	} else {
 		m.transcript.note("new session. the previous one is at " + archived)
+	}
+	return m.refresh(), nil
+}
+
+// resumeArc hands an arc back to the worker after a write that changed what
+// it has to do: the write owes the arc a run, so it goes to the same retry
+// loop an enqueued arc is served by until the lease is free.
+func resumeArc(m model, arcID string) {
+	if m.session.worker == nil {
+		return
+	}
+	session, sender, ref := m.session, m.sender, m.session.ref(arcID)
+	go func() {
+		for {
+			worked, err := session.worker.Work(context.Background(), ref, localAgentID)
+			if err != nil {
+				sender.send(arcDoneMsg{err: err})
+				return
+			}
+			if worked {
+				return
+			}
+			// The arc is held by a run in flight, which reads the same
+			// log, so it covers this item by the time it ends.
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+}
+
+// answerInterruptTurn records the answer to a pending interrupt and resumes
+// its arc. It is the plain-text fallback for an interrupt the chat does not
+// render as a form.
+func answerInterruptTurn(m model, argument string) (model, tea.Cmd) {
+	id, answer, _ := strings.Cut(argument, " ")
+	if id == "" || strings.TrimSpace(answer) == "" {
+		m.transcript.note("usage: /answer <interrupt-id> <answer>")
+		return m.refresh(), nil
+	}
+	ctx := context.Background()
+
+	h, err := m.session.fullHistory(ctx)
+	if err != nil {
+		m.transcript.fail(err)
+		return m.refresh(), nil
+	}
+	arcID, interrupt := findInterrupt(h, id)
+	if interrupt == nil {
+		m.transcript.note(fmt.Sprintf("no interrupt %s", id))
+		return m.refresh(), nil
+	}
+	if interrupt.Status != history.InterruptPending {
+		m.transcript.note(fmt.Sprintf("interrupt %s is already %s", id, interrupt.Status))
+		return m.refresh(), nil
+	}
+	if err := m.session.answerInterrupt(ctx, arcID, id, answer); err != nil {
+		m.transcript.fail(err)
+		return m.refresh(), nil
+	}
+	m.transcript.markAnswered(id, answer)
+	m.transcript.note(fmt.Sprintf("interrupt %s answered: %s — resuming arc %s", id, answer, arcID))
+	resumeArc(m, arcID)
+	return m.refresh(), nil
+}
+
+// listInterrupts shows every interrupt in the log with the arc it holds and
+// its status, which is what the fold says rather than what the screen remembers.
+func listInterrupts(m model, _ string) (model, tea.Cmd) {
+	h, err := m.session.fullHistory(context.Background())
+	if err != nil {
+		m.transcript.fail(err)
+		return m.refresh(), nil
+	}
+	count := 0
+	for _, arc := range h.Arcs {
+		for _, interrupt := range arc.Interrupts {
+			count++
+			line := fmt.Sprintf("interrupt %s on arc %s: %s [%s]", interrupt.ID, arc.ID, interrupt.Reason, interrupt.Status)
+			if interrupt.Response != nil {
+				line += " — answered: " + compact(interrupt.Response)
+			}
+			m.transcript.note(line)
+		}
+		for _, response := range arc.Responses {
+			for _, call := range response.ToolCalls {
+				if call.Interrupt != nil {
+					count++
+					m.transcript.note(fmt.Sprintf("interrupt %s on call %s (%s) in arc %s: %s [%s]",
+						call.Interrupt.ID, call.ID, call.ToolName, arc.ID, call.Interrupt.Reason, call.Interrupt.Status))
+				}
+			}
+		}
+	}
+	if count == 0 {
+		m.transcript.note("no interrupts")
 	}
 	return m.refresh(), nil
 }

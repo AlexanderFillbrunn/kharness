@@ -28,6 +28,9 @@ const (
 	// blockSummary is a compaction's summary: what the model is told in place
 	// of everything below the watermark.
 	blockSummary
+	// blockQuestions is a pending interrupt whose context carries questions:
+	// a form the user answers in the chat.
+	blockQuestions
 )
 
 // toolState is how a call is doing, which is not its recorded status: a call
@@ -44,8 +47,8 @@ const (
 	// everything stopped. Whether it took effect is not known, and showing it
 	// as still running would claim work nobody is doing.
 	toolUnknown toolState = "unknown"
-	// toolWaiting is a task that has stopped to ask for something. Only a task
-	// reaches it: a tool call that is waiting is waiting on its own tool.
+	// toolWaiting is a call or task that has stopped to ask for something:
+	// a task waiting for input, or a call held by an interrupt.
 	toolWaiting toolState = "waiting"
 	// toolStopped is a task whose runner reported that it was called off.
 	toolStopped toolState = "stopped"
@@ -62,6 +65,47 @@ type block struct {
 	args   string
 	state  toolState
 	result string
+
+	// Questions blocks only: the interrupt being answered, the arc it holds,
+	// the questions, and the response once one arrived.
+	interrupt string
+	arc       string
+	questions []question
+	answered  bool
+	response  any
+}
+
+// question is one question an interrupt asks, in the shape the ask tool's
+// request schema carries: a text answer or a choice among options.
+type question struct {
+	ID       string   `json:"id"`
+	Text     string   `json:"text"`
+	Kind     string   `json:"kind"` // text | single_choice | multi_choice
+	Options  []string `json:"options,omitempty"`
+	Required *bool    `json:"required,omitempty"`
+}
+
+// required reports whether the user must answer; absent means required.
+func (q question) required() bool { return q.Required == nil || *q.Required }
+
+// questionsOf reads the questions out of an interrupt's context where the
+// context carries any. An interrupt is generic and asking questions is one
+// use of it, so anything else reads as no questions.
+func questionsOf(context any) []question {
+	if context == nil {
+		return nil
+	}
+	raw, err := json.Marshal(context)
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		Questions []question `json:"questions"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || len(parsed.Questions) == 0 {
+		return nil
+	}
+	return parsed.Questions
 }
 
 // transcript is the conversation as the screen shows it.
@@ -80,10 +124,20 @@ type transcript struct {
 	// tasks indexes task blocks by task ID, for the same reason: everything a
 	// task says lands on the one line that is already on the screen.
 	tasks map[string]*block
+
+	// interrupts indexes call-holding interrupts by interrupt ID, so the
+	// response that settles one finds the call it held. Arc-wide interrupts
+	// hold no call and are not indexed.
+	interrupts map[string]string
+
+	// active is the questions block being answered, and cursor the question
+	// the answer keys land on. Nil between answers.
+	active *block
+	cursor int
 }
 
 func newTranscript() *transcript {
-	return &transcript{tools: map[string]*block{}, tasks: map[string]*block{}}
+	return &transcript{tools: map[string]*block{}, tasks: map[string]*block{}, interrupts: map[string]string{}}
 }
 
 // fromHistory fills a transcript with a conversation that is already recorded.
@@ -100,6 +154,33 @@ func (t *transcript) fromHistory(h *history.History) {
 		}
 		stopped := arc.Status() == history.ArcStatusCancelled || arc.Status() == history.ArcStatusError
 		t.blocks = append(t.blocks, &block{kind: blockUser, author: author, text: h.OpeningContent(arc)})
+
+		for _, interrupt := range arc.Interrupts {
+			if questions := questionsOf(interrupt.Context); len(questions) > 0 {
+				b := &block{
+					kind:      blockQuestions,
+					interrupt: interrupt.ID,
+					arc:       arc.ID,
+					questions: questions,
+					response:  interrupt.Response,
+				}
+				if interrupt.Status != history.InterruptPending {
+					b.answered = true
+				}
+				t.blocks = append(t.blocks, b)
+				continue
+			}
+			line := fmt.Sprintf("interrupt %s [%s]: %s", interrupt.ID, interrupt.Status, interrupt.Reason)
+			if interrupt.Response != nil {
+				line += " — answered: " + compact(interrupt.Response)
+			}
+			t.blocks = append(t.blocks, &block{
+				kind: blockNote, text: line,
+				interrupt: interrupt.ID, arc: arc.ID,
+				answered: interrupt.Status != history.InterruptPending,
+				response: interrupt.Response,
+			})
+		}
 
 		for _, response := range arc.Responses {
 			if response.Content != "" {
@@ -226,6 +307,46 @@ func (t *transcript) event(ev *events.Event) {
 			called.result = compact(payload.Result)
 		}
 
+	case events.InterruptPayload:
+		if payload.CausationID == "" {
+			// Arc-wide: the block carries the interrupt and its arc, so a
+			// plain typed message can be sent as the response to it.
+			if questions := questionsOf(payload.Context); len(questions) > 0 && ev.CorrelationID != nil {
+				t.blocks = append(t.blocks, &block{
+					kind:      blockQuestions,
+					interrupt: ev.ID,
+					arc:       *ev.CorrelationID,
+					questions: questions,
+				})
+			} else {
+				held := &block{kind: blockNote, text: fmt.Sprintf("interrupt %s: the arc is held for a human — %s", ev.ID, payload.Reason)}
+				if ev.CorrelationID != nil {
+					held.interrupt = ev.ID
+					held.arc = *ev.CorrelationID
+				}
+				t.blocks = append(t.blocks, held)
+			}
+		} else {
+			t.interrupts[ev.ID] = payload.CausationID
+			if called, ok := t.tools[payload.CausationID]; ok {
+				called.state = toolWaiting
+			}
+		}
+
+	case events.InterruptResponsePayload:
+		if callID, ok := t.interrupts[payload.CausationID]; ok {
+			if called, ok := t.tools[callID]; ok {
+				if payload.IsRejected {
+					called.state = toolFailed
+					called.result = compact(payload.Response)
+				} else {
+					called.state = toolQueued
+				}
+			}
+		}
+		t.markAnswered(payload.CausationID, payload.Response)
+		t.note(fmt.Sprintf("interrupt %s answered by %s: %s", payload.CausationID, payload.Actor.UserID, compact(payload.Response)))
+
 	case events.AsyncTaskInvokePayload:
 		started := &block{
 			kind:  blockTask,
@@ -326,6 +447,45 @@ func (t *transcript) note(text string) {
 	t.blocks = append(t.blocks, &block{kind: blockNote, text: text})
 }
 
+// markAnswered records a response on every block the interrupt holds, the way
+// the response event does when it arrives. The write is already durable when
+// this runs, so the screen must not wait for the event to come back around:
+// until it does, the block would still read pending and could be re-entered
+// or answered twice.
+func (t *transcript) markAnswered(interruptID string, response any) {
+	for _, b := range t.blocks {
+		if b.interrupt == interruptID && b.interrupt != "" {
+			b.answered = true
+			b.response = response
+		}
+	}
+	if t.active != nil && t.active.interrupt == interruptID {
+		t.active = nil
+	}
+}
+
+// pendingQuestions returns the first unanswered questions block, or nil.
+func (t *transcript) pendingQuestions() *block {
+	for _, b := range t.blocks {
+		if b.kind == blockQuestions && !b.answered {
+			return b
+		}
+	}
+	return nil
+}
+
+// pendingInterrupt returns the first block held by an unanswered arc-wide
+// interrupt, or nil. A plain typed message is sent as that interrupt's
+// response rather than opening a new arc.
+func (t *transcript) pendingInterrupt() *block {
+	for _, b := range t.blocks {
+		if b.interrupt != "" && !b.answered {
+			return b
+		}
+	}
+	return nil
+}
+
 // fail records something that went wrong. A failed run reaches the screen
 // twice, as the error the agent recorded and as the error it returned, so the
 // repeat is dropped.
@@ -356,6 +516,8 @@ func stateOf(call *history.ToolCall, arcStopped bool) toolState {
 		return toolDone
 	case history.ToolCallStatusPending:
 		switch {
+		case call.Interrupt != nil && call.Interrupt.Status == history.InterruptPending:
+			return toolWaiting
 		case call.Phase() != history.ToolCallPhaseDispatched:
 			return toolQueued
 		case arcStopped:

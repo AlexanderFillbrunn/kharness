@@ -84,12 +84,12 @@ func renderTranscript(t *transcript, width int) string {
 
 	rendered := make([]string, 0, len(t.blocks))
 	for _, b := range t.blocks {
-		rendered = append(rendered, renderBlock(b, width))
+		rendered = append(rendered, renderBlock(t, b, width))
 	}
 	return strings.Join(rendered, "\n\n")
 }
 
-func renderBlock(b *block, width int) string {
+func renderBlock(t *transcript, b *block, width int) string {
 	// Two columns go to the left border and its padding, and one more is left
 	// free so that a full line does not wrap on its own.
 	body := max(width-3, 20)
@@ -116,8 +116,95 @@ func renderBlock(b *block, width int) string {
 
 	case blockTask:
 		return renderTask(b, body)
+
+	case blockQuestions:
+		return renderQuestions(t, b, body)
 	}
 	return ""
+}
+
+// renderQuestions draws an interrupt's questions as a form: one line per
+// question, the choices marked, the cursor on the question being answered.
+func renderQuestions(t *transcript, b *block, width int) string {
+	status := "waiting for an answer"
+	if b.answered {
+		status = "answered"
+	}
+	head := fmt.Sprintf("%s %s",
+		toolNameStyle.Render("interrupt "+b.interrupt),
+		dimStyle.Render(status),
+	)
+
+	var lines []string
+	for i, q := range b.questions {
+		cursor := "  "
+		if t.active == b && t.cursor == i {
+			cursor = "> "
+		}
+		req := ""
+		if !q.required() {
+			req = dimStyle.Render(" (optional)")
+		}
+		lines = append(lines, cursor+fmt.Sprintf("%d. %s%s", i+1, q.Text, req))
+		switch q.Kind {
+		case "single_choice", "multi_choice":
+			for j, option := range q.Options {
+				mark := "[ ]"
+				if choiceSelected(b.response, q, option) {
+					mark = "[x]"
+				}
+				lines = append(lines, cursor+"   "+mark+" "+fmt.Sprintf("%d. %s", j+1, option))
+			}
+		default:
+			if answer := answerOf(b, q.ID); answer != "" {
+				lines = append(lines, cursor+"   "+dimStyle.Render("“"+truncate(answer, max(width-8, 10))+"”"))
+			}
+		}
+	}
+	if b.answered && b.response != nil {
+		lines = append(lines, dimStyle.Render("answers: "+truncate(compact(b.response), max(width-4, 10))))
+	}
+	return head + "\n" + strings.Join(lines, "\n")
+}
+
+// answerOf reads one question's answer out of a response, for the form's own
+// rendering while it is being filled.
+func answerOf(b *block, id string) string {
+	answers, ok := b.response.(map[string]any)
+	if !ok {
+		return ""
+	}
+	inner, ok := answers["answers"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if text, ok := inner[id].(string); ok {
+		return text
+	}
+	return ""
+}
+
+// choiceSelected reports whether an option is marked in the response so far.
+func choiceSelected(response any, q question, option string) bool {
+	answers, ok := response.(map[string]any)
+	if !ok {
+		return false
+	}
+	inner, ok := answers["answers"].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch value := inner[q.ID].(type) {
+	case string:
+		return value == option
+	case []any:
+		for _, item := range value {
+			if s, ok := item.(string); ok && s == option {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // renderTask draws a task as a line that stays put and changes. A task reports

@@ -29,7 +29,9 @@ const localAgentID = "local"
 const defaultSystemPrompt = `You are a Kubernetes operations assistant with read and restart tools.
 Use them rather than guessing, and say plainly when a tool tells you something you did not expect.
 
-Some work runs as background tasks. Each message a task sends arrives as a turn of its own with a "[background task, not the user]" header — the header, not the message role, is what marks it as coming from a task. When a background task asks a question, you may answer it yourself with provide_task_input, or put the question to the user first and then call provide_task_input with their answer. Do not ask the user about a question that has already been answered.`
+Some work runs as background tasks. Each message a task sends arrives as a turn of its own with a "[background task, not the user]" header — the header, not the message role, is what marks it as coming from a task. When a background task asks a question, you may answer it yourself with provide_task_input, or put the question to the user first and then call provide_task_input with their answer. Do not ask the user about a question that has already been answered.
+
+When you need a decision or information from the user, call ask_user with one or more questions rather than guessing. The conversation pauses until they answer, and their answer comes back to you as a note.`
 
 // Run drives one devchat session: it opens the log, wires the agent to the
 // terminal and blocks until the interface leaves. The flags the command
@@ -128,10 +130,16 @@ func Run(storePath, settingsPath, userID string) error {
 	// completion scan re-enqueues the arcs a landed compaction releases.
 	enqueuer := &arcEnqueuer{relay: relay}
 	compactionStart := &compactionStarter{relay: relay}
+	// Interrupts are disclosed as notes: a run resumed after a human answered
+	// has to be told what was asked and what was answered, which the default
+	// elide would hide.
+	modes := history.DefaultModes()
+	modes.Interrupt = history.TreatmentNote
 	worker, err := agent.NewArcWorker(persistor, store, resolver, agent.NewLocalLease(),
 		agent.WithTokenSink(screenTokens{relay: relay}),
 		agent.WithCancelWatcher(cancels),
 		agent.WithCompactionStarter(compactionStart),
+		agent.WithModes(modes),
 		agent.WithSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
 	if err != nil {
 		return err
@@ -283,6 +291,31 @@ func writeDefaultSettings(path string) error {
 		},
 		Skills: []agent.SkillRef{{Source: "local", Name: defaultSkillName}},
 		Tasks:  []agent.TaskRef{{Source: "local", Name: auditTaskName}},
+		Interrupts: []agent.InterruptSpec{{
+			Name:        "ask_user",
+			Description: "Ask the user one or more questions. The conversation is held until they answer.",
+			RequestSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"questions": map[string]any{
+						"type":     "array",
+						"minItems": 1,
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"id":       map[string]any{"type": "string", "description": "Stable id the answer is keyed by."},
+								"text":     map[string]any{"type": "string", "description": "The question as shown to the user."},
+								"kind":     map[string]any{"type": "string", "enum": []any{"text", "single_choice", "multi_choice"}},
+								"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The choices, for the choice kinds."},
+								"required": map[string]any{"type": "boolean", "description": "Whether the user must answer. Default true."},
+							},
+							"required": []any{"id", "text", "kind"},
+						},
+					},
+				},
+				"required": []any{"questions"},
+			},
+		}},
 	}
 	return writeSettings(path, settings)
 }

@@ -89,11 +89,11 @@ func (l *logger) cancel(arc, id string, reason *string) {
 }
 
 func (l *logger) interrupt(arc, id, call, reason string) {
-	l.add(id, arc, events.InterruptEventType, events.InterruptPayload{ToolCallID: call, Reason: reason})
+	l.add(id, arc, events.InterruptEventType, events.InterruptPayload{CausationID: call, Reason: reason})
 }
 
 func (l *logger) interruptWithContext(arc, id, call, reason string, context any) {
-	l.add(id, arc, events.InterruptEventType, events.InterruptPayload{ToolCallID: call, Reason: reason, Context: context})
+	l.add(id, arc, events.InterruptEventType, events.InterruptPayload{CausationID: call, Reason: reason, Context: context})
 }
 
 func (l *logger) interruptResponse(arc, interrupt string, rejected bool) {

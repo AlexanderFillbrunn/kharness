@@ -83,15 +83,22 @@ Interrupt events
 A tool call paused until a human decides on it.
 
 `INTERRUPT` — `InterruptPayload`
-- `ToolCallID string` — the call waiting on the decision,
-  `Reason string` — what the human is being asked to decide, in words,
-  `Context any` — set when the interrupt is raised and never changes.
+- `CausationID string` — the call waiting on the decision, empty for an
+  arc-wide interrupt that holds the whole arc named by the event's
+  `CorrelationID`.
+  `Reason string` — what the human is being asked to decide or answer, in
+  words, `Context any` — set when the interrupt is raised and never changes.
 - A policy that refuses a call without asking anyone writes a
   `GUARDRAIL_BLOCKED` instead.
 
 `INTERRUPT_RESPONSE` — `InterruptResponsePayload`
 - `CausationID string` — the `INTERRUPT` event, `Response any`,
   `IsRejected bool`, `Actor users.Actor`.
+- On a call interrupt the response is a verdict: `IsRejected` settles the call
+  `REFUSED` with `Response` as its result, an approval leaves the call
+  pending. On an arc-wide interrupt the response is information only:
+  `IsRejected` is refused by the fold and the response settles just the
+  interrupt.
 
 Async task events
 --------------------

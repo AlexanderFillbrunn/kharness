@@ -155,6 +155,86 @@ func (s *session) cancelArcTasks(ctx context.Context, arcID, reason string) erro
 	return errors.Join(failures...)
 }
 
+// interrupt raises an arc-wide interrupt on an open arc: the arc is held
+// until a human answers with an INTERRUPT_RESPONSE naming the interrupt. The
+// arc is checked against the log before the write, because a record the fold
+// would refuse must not reach the log at all — a log holding one fails every
+// later replay. It returns the interrupt's ID.
+func (s *session) interrupt(ctx context.Context, arcID, reason string) (string, error) {
+	h, err := s.arcHistory(ctx, arcID)
+	if err != nil {
+		return "", err
+	}
+	var arc *history.Arc
+	for _, candidate := range h.Arcs {
+		if candidate.ID == arcID {
+			arc = candidate
+			break
+		}
+	}
+	if arc == nil {
+		return "", fmt.Errorf("no arc %s in this session", arcID)
+	}
+	switch arc.Status() {
+	case history.ArcStatusPending, history.ArcStatusInterrupted:
+	default:
+		return "", fmt.Errorf("arc %s is %s, so an interrupt on it would never be answered", arcID, arc.Status())
+	}
+	stored, err := s.persistor.Persist(ctx, &events.Event{
+		SessionID:     s.id,
+		AgentID:       localAgentID,
+		Typ:           events.InterruptEventType,
+		CorrelationID: &arcID,
+		Actor:         s.actor,
+		Payload:       events.InterruptPayload{Reason: reason},
+	})
+	if err != nil {
+		return "", err
+	}
+	return stored[0].ID, nil
+}
+
+// answerInterrupt records the human's answer to an interrupt, naming it by
+// ID. The response is whatever the answering side produced — text for a plain
+// answer, structured for a form — and is never validated here. The caller
+// owes the arc a run afterwards, since writing the response without handing
+// the arc back to the worker could strand it.
+func (s *session) answerInterrupt(ctx context.Context, arcID, interruptID string, response any) error {
+	_, err := s.persistor.Persist(ctx, &events.Event{
+		SessionID:     s.id,
+		AgentID:       localAgentID,
+		Typ:           events.InterruptResponseEventType,
+		CorrelationID: &arcID,
+		Actor:         s.actor,
+		Payload: events.InterruptResponsePayload{
+			CausationID: interruptID,
+			Response:    response,
+			Actor:       s.actor,
+		},
+	})
+	return err
+}
+
+// findInterrupt locates an interrupt by ID anywhere in the session — raised
+// on an arc or on one of its calls — and returns the arc it belongs to.
+func findInterrupt(h *history.History, id string) (string, *history.Interrupt) {
+	for _, arc := range h.Arcs {
+		for _, interrupt := range arc.Interrupts {
+			if interrupt.ID == id {
+				return arc.ID, interrupt
+			}
+		}
+		for _, response := range arc.Responses {
+			for _, call := range response.ToolCalls {
+				if call.Interrupt != nil && call.Interrupt.ID == id {
+					return arc.ID, call.Interrupt
+				}
+			}
+		}
+	}
+	return "", nil
+}
+
 // arcHistory loads and folds the events one arc is run from, reading through
 // the store's latest fold snapshot when there is one and resuming from it.
 func (s *session) arcHistory(ctx context.Context, arcID string) (*history.History, error) {

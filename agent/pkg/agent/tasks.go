@@ -132,6 +132,9 @@ const (
 	opCancel
 	// opProvideInput answers a task that is waiting.
 	opProvideInput
+	// opInterrupt raises an arc-wide interrupt: a configured tool that holds
+	// the arc until a human answers.
+	opInterrupt
 )
 
 // classify says what a call by this name is. A name that is neither a task's

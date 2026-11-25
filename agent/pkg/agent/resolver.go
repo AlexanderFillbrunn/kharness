@@ -133,6 +133,12 @@ type AgentSettings struct {
 	// able to carry it; one that cannot is a settings error, not a fallback.
 	TaskRole string `json:"task_role,omitempty"`
 
+	// Interrupts is the list of interrupts the agent may raise: each becomes
+	// a tool the model can call to hold the arc until a human answers. The
+	// request schema is the tool's input schema, and the call's arguments
+	// land in the interrupt's context. Empty means no such tools.
+	Interrupts []InterruptSpec `json:"interrupts,omitempty"`
+
 	// Compaction is the session-past-its-own-history block: which compactor
 	// runs and the budgets and limits the loop checks. Empty disables
 	// compaction.
@@ -329,6 +335,9 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 			return nil, err
 		}
 		options = append(slices.Clone(options), WithTasks(tasks))
+	}
+	if len(settings.Interrupts) > 0 {
+		options = append(slices.Clone(options), WithInterrupts(settings.Interrupts))
 	}
 	factory, ok := f.modelSources[settings.Model.Source]
 	if !ok {

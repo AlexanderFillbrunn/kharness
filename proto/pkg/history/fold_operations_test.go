@@ -22,11 +22,11 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 		{ID: "tool-event-1", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.ToolEventEventType, CorrelationID: &arc, Payload: events.ToolEventPayload{CausationID: "tool-call-1", Payload: "working"}},
 		{ID: "tool-result-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.ToolResultEventType, CorrelationID: &arc, Payload: events.ToolResultPayload{CausationID: "tool-call-1", Result: "healthy"}},
 		{ID: "tool-call-2", Seq: 6, Timestamp: start.Add(6 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "restart", Args: "ingress"}},
-		{ID: "interrupt-1", Seq: 7, Timestamp: start.Add(7 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{ToolCallID: "tool-call-2", Reason: "restart needs approval"}},
+		{ID: "interrupt-1", Seq: 7, Timestamp: start.Add(7 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{CausationID: "tool-call-2", Reason: "restart needs approval"}},
 		{ID: "interrupt-response-1", Seq: 8, Timestamp: start.Add(8 * time.Second), Typ: events.InterruptResponseEventType, CorrelationID: &arc, Payload: events.InterruptResponsePayload{CausationID: "interrupt-1", Response: "approved", Actor: user}},
 		{ID: "tool-result-2", Seq: 9, Timestamp: start.Add(9 * time.Second), Typ: events.ToolResultEventType, CorrelationID: &arc, Payload: events.ToolResultPayload{CausationID: "tool-call-2", Result: "restarted"}},
 		{ID: "tool-call-3", Seq: 10, Timestamp: start.Add(10 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "delete", Args: "namespace"}},
-		{ID: "interrupt-2", Seq: 11, Timestamp: start.Add(11 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{ToolCallID: "tool-call-3", Reason: "deletion needs approval"}},
+		{ID: "interrupt-2", Seq: 11, Timestamp: start.Add(11 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{CausationID: "tool-call-3", Reason: "deletion needs approval"}},
 		{ID: "interrupt-response-2", Seq: 12, Timestamp: start.Add(12 * time.Second), Typ: events.InterruptResponseEventType, CorrelationID: &arc, Payload: events.InterruptResponsePayload{CausationID: "interrupt-2", IsRejected: true, Actor: user}},
 		{ID: "task-1", Seq: 13, Timestamp: start.Add(13 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: user, Payload: events.AsyncTaskInvokePayload{TaskName: "researcher", Args: "status", Actor: user}},
 		{ID: "task-event-1", Seq: 14, Timestamp: start.Add(14 * time.Second), Typ: events.AsyncTaskEventEventType, CorrelationID: ptr("task-1"), Payload: events.AsyncTaskEventPayload{CausationID: "task-1", Class: "progress", Payload: "looking up status", LLMVisibility: events.LLMVisibilityNone}},
@@ -134,8 +134,8 @@ func TestHistoryFoldAppliesEveryNonCancellationEvent(t *testing.T) {
 	if refused.Status != ToolCallStatusRefused || refused.FinishedSeq == nil {
 		t.Errorf("refused call = %#v, want %s", refused, ToolCallStatusRefused)
 	}
-	if refused.Interrupt.ToolCallID != refused.ID {
-		t.Errorf("interrupt names call %s, want %s", refused.Interrupt.ToolCallID, refused.ID)
+	if refused.Interrupt.CausationID != refused.ID {
+		t.Errorf("interrupt names call %s, want %s", refused.Interrupt.CausationID, refused.ID)
 	}
 	if len(got.Errors) != 1 || got.Errors[0].CausationID == nil || *got.Errors[0].CausationID != "tool-call-1" {
 		t.Errorf("errors = %#v, want recorded error caused by tool call", got.Errors)
@@ -152,7 +152,7 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 		{ID: "blocked-tool", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "blocked", VendorID: "vendor"}},
 		{ID: "guardrail-1", Seq: 3, Timestamp: start.Add(3 * time.Second), Typ: events.GuardrailBlockedEventType, CorrelationID: &arc, Payload: events.GuardrailBlockedPayload{CausationID: "blocked-tool", Message: "not allowed"}},
 		{ID: "pending-tool", Seq: 4, Timestamp: start.Add(4 * time.Second), Typ: events.ToolCallEventType, CorrelationID: &arc, Payload: events.ToolCallPayload{MessageID: "assistant-message-1", ToolName: "pending", VendorID: "vendor"}},
-		{ID: "interrupt-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{ToolCallID: "pending-tool", Reason: "approval"}},
+		{ID: "interrupt-1", Seq: 5, Timestamp: start.Add(5 * time.Second), Typ: events.InterruptEventType, CorrelationID: &arc, Payload: events.InterruptPayload{CausationID: "pending-tool", Reason: "approval"}},
 		{ID: "task-1", Seq: 6, Timestamp: start.Add(6 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Payload: events.AsyncTaskInvokePayload{TaskName: "researcher"}},
 		{ID: "input-request-1", Seq: 7, Timestamp: start.Add(7 * time.Second), Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: ptr("ask-arc-1"), Payload: events.AsyncTaskInputRequestedPayload{CausationID: "task-1", Message: "Need input", LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "cancel-1", Seq: 8, Timestamp: start.Add(8 * time.Second), Typ: events.CancelEventType, CorrelationID: &arc, Actor: user, Payload: events.CancelPayload{Reason: stringPtr("user stopped")}},
@@ -330,7 +330,7 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 				ID: "assistant-message-1", Seq: 0, CorrelationID: arc, Timestamp: now,
 				ToolCalls: []*ToolCall{{
 					ID: "tool-1", Status: ToolCallStatusPending,
-					Interrupt: &Interrupt{ID: "interrupt-1", CorrelationID: arc, ToolCallID: "tool-1", Timestamp: now, Status: InterruptPending},
+					Interrupt: &Interrupt{ID: "interrupt-1", CorrelationID: arc, CausationID: "tool-1", Timestamp: now, Status: InterruptPending},
 				}},
 			}},
 		}},
@@ -537,7 +537,7 @@ func TestArcStatusFollowsTheFirstClosingRecord(t *testing.T) {
 				ID: "message-2", Seq: 2, CorrelationID: "arc-1",
 				ToolCalls: []*ToolCall{{
 					ID: "tool-1", Seq: 3, Status: ToolCallStatusPending,
-					Interrupt: &Interrupt{ID: "interrupt-1", Seq: 4, ToolCallID: "tool-1", Status: InterruptPending},
+					Interrupt: &Interrupt{ID: "interrupt-1", Seq: 4, CausationID: "tool-1", Status: InterruptPending},
 				}},
 			}}},
 			want: ArcStatusInterrupted,

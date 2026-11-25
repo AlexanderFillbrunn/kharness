@@ -92,12 +92,18 @@ func (ToolEventPayload) EventType() EventType {
 }
 func (ToolEventPayload) eventPayload() {}
 
-// InterruptPayload pauses a tool call until a human decides on it. It always
-// names the call it holds up. A policy that refuses a call without asking
-// anyone writes a GuardrailBlockedPayload instead.
+// InterruptPayload holds an arc up until a human answers it. With CausationID
+// set it names the one call waiting on the decision, an approval gate: the
+// response is a verdict on that call. Without it the interrupt is arc-wide,
+// a question the agent is asking: the response is information, and no verdict
+// applies to it. A policy that refuses a call without asking anyone writes a
+// GuardrailBlockedPayload instead.
 type InterruptPayload struct {
-	// ToolCallID is the call waiting on the decision.
-	ToolCallID string `json:"tool_call_id"`
+	// CausationID is the call waiting on the decision, following the
+	// convention of the other payloads that act on a prior record. Empty
+	// means the interrupt holds the whole arc named by the event's
+	// correlation ID rather than one call in it.
+	CausationID string `json:"causation_id,omitempty"`
 
 	// Reason is what the human is being asked to decide about, in words.
 	Reason string `json:"reason"`

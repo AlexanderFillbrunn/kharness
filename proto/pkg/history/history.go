@@ -285,6 +285,11 @@ type Arc struct {
 	// each one pauses the arc until the compaction named by its causation
 	// lands. The derived state of each is read off the log, never stored.
 	Suspensions []*ArcSuspension `json:"suspensions,omitempty"`
+
+	// Interrupts are the arc-wide interrupts raised against this arc, in
+	// order: each one holds the whole arc until a human answers it. A call
+	// interrupted individually carries its own interrupt on the call.
+	Interrupts []*Interrupt `json:"interrupts,omitempty"`
 }
 
 // Status computes the status of an arc. It is not a field lookup and should be
@@ -316,13 +321,18 @@ func (a Arc) Status() ArcStatus {
 		return status
 	}
 
-	// An arc waiting on a human is waiting on one of its calls, since that is
-	// the only thing an interrupt can hold up.
+	// An arc waiting on a human is waiting on one of its calls or on an
+	// arc-wide interrupt.
 	for _, response := range a.Responses {
 		for _, call := range response.ToolCalls {
 			if call.Interrupt != nil && call.Interrupt.Status == InterruptPending {
 				return ArcStatusInterrupted
 			}
+		}
+	}
+	for _, interrupt := range a.Interrupts {
+		if interrupt.Status == InterruptPending {
+			return ArcStatusInterrupted
 		}
 	}
 	return ArcStatusPending
@@ -364,12 +374,17 @@ const (
 	InterruptPending   InterruptStatus = "pending"
 	InterruptApproved  InterruptStatus = "approved"
 	InterruptRejected  InterruptStatus = "rejected"
+	// InterruptAnswered is an arc-wide interrupt a human answered with
+	// information rather than a verdict on a call.
+	InterruptAnswered  InterruptStatus = "answered"
 	InterruptCancelled InterruptStatus = "cancelled"
 )
 
-// Interrupt is a tool call held up until a human decides on it: the
-// human-in-the-loop gate. It is not a general pause. A policy that refuses a
-// call on its own blocks it instead, without asking anyone.
+// Interrupt is a record held up until a human answers it: the
+// human-in-the-loop gate. With CausationID set it holds one tool call up for
+// a verdict; without it it holds the whole arc up for an answer. It is not a
+// general pause. A policy that refuses a call on its own blocks it instead,
+// without asking anyone.
 type Interrupt struct {
 	ID string `json:"id"`
 
@@ -386,9 +401,11 @@ type Interrupt struct {
 
 	Timestamp time.Time `json:"timestamp"`
 
-	// ToolCallID is the call this decision holds up. The call is nested under
-	// the assistant message that requested it and carries this interrupt.
-	ToolCallID string `json:"tool_call_id"`
+	// CausationID is the call this decision holds up, empty for an arc-wide
+	// interrupt that holds the arc in CorrelationID rather than one call.
+	// The call is nested under the assistant message that requested it and
+	// carries this interrupt.
+	CausationID string `json:"causation_id,omitempty"`
 
 	// Reason is what the human was asked to decide about, in words.
 	Reason string `json:"reason"`
@@ -569,6 +586,9 @@ func FoldStateFromHistory(h *History) *FoldState {
 					state.interrupts[tc.Interrupt.ID] = tc.Interrupt
 				}
 			}
+		}
+		for _, interrupt := range arc.Interrupts {
+			state.interrupts[interrupt.ID] = interrupt
 		}
 	}
 	for _, task := range h.Tasks {
@@ -797,9 +817,11 @@ func (h *History) applyToolEvent(ev *events.Event, state *FoldState) error {
 	return nil
 }
 
-// applyInterrupt holds a tool call until a human decides on it. A call that
-// already reached a terminal status cannot be put to a human, and a call can
-// only be put to one once.
+// applyInterrupt holds a record up until a human answers it. With a
+// causation ID it holds one tool call, which can only be put to a human once
+// and only while it is still pending. Without one it holds the whole arc the
+// correlation ID names, which has to exist and still be open: an interrupt on
+// a closed, cancelled or failed arc could never be answered usefully.
 func (h *History) applyInterrupt(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.InterruptPayload)
 	if !ok {
@@ -808,9 +830,33 @@ func (h *History) applyInterrupt(ev *events.Event, state *FoldState) error {
 	if ev.CorrelationID == nil {
 		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
 	}
-	call, ok := state.toolCalls[pl.ToolCallID]
+	interrupt := &Interrupt{
+		ID:            ev.ID,
+		Seq:           ev.Seq,
+		CorrelationID: *ev.CorrelationID,
+		CausationID:   pl.CausationID,
+		Timestamp:     ev.Timestamp,
+		Reason:        pl.Reason,
+		Context:       pl.Context,
+		Status:        InterruptPending,
+	}
+
+	if pl.CausationID == "" {
+		arc, ok := state.arcs[*ev.CorrelationID]
+		if !ok {
+			return fmt.Errorf("no arc with ID=%s found for interrupt", *ev.CorrelationID)
+		}
+		if arc.Closed != nil || arc.Cancel != nil || fatalError(arc) != nil {
+			return fmt.Errorf("arc %s is %s and cannot be interrupted", arc.ID, arc.Status())
+		}
+		arc.Interrupts = append(arc.Interrupts, interrupt)
+		state.interrupts[interrupt.ID] = interrupt
+		return nil
+	}
+
+	call, ok := state.toolCalls[pl.CausationID]
 	if !ok {
-		return fmt.Errorf("no tool call with ID=%s found for interrupt", pl.ToolCallID)
+		return fmt.Errorf("no tool call with ID=%s found for interrupt", pl.CausationID)
 	}
 	if call.Status != ToolCallStatusPending {
 		return fmt.Errorf("tool call %s is %s and cannot be put to a human", call.ID, call.Status)
@@ -818,23 +864,16 @@ func (h *History) applyInterrupt(ev *events.Event, state *FoldState) error {
 	if call.Interrupt != nil {
 		return fmt.Errorf("tool call %s already has interrupt %s", call.ID, call.Interrupt.ID)
 	}
-	interrupt := &Interrupt{
-		ID:            ev.ID,
-		Seq:           ev.Seq,
-		CorrelationID: *ev.CorrelationID,
-		ToolCallID:    call.ID,
-		Timestamp:     ev.Timestamp,
-		Reason:        pl.Reason,
-		Context:       pl.Context,
-		Status:        InterruptPending,
-	}
 	call.Interrupt = interrupt
 	state.interrupts[interrupt.ID] = interrupt
 	return nil
 }
 
-// applyInterruptResponse records the human decision. A refusal settles the
-// call, since it is never going to run. An approval leaves it pending.
+// applyInterruptResponse records the human's answer. An arc-wide interrupt
+// carries no verdict, so its response is information and only settles the
+// interrupt; a rejection of it names no call and is refused. A call interrupt
+// is a verdict: a refusal settles the call, since it is never going to run,
+// and an approval leaves it pending.
 //
 // A decision on an interrupt that is no longer pending is dropped.
 func (h *History) applyInterruptResponse(ev *events.Event, state *FoldState) error {
@@ -849,9 +888,20 @@ func (h *History) applyInterruptResponse(ev *events.Event, state *FoldState) err
 	if interrupt.Status != InterruptPending {
 		return nil
 	}
-	call, ok := state.toolCalls[interrupt.ToolCallID]
+	if interrupt.CausationID == "" {
+		if pl.IsRejected {
+			return fmt.Errorf("interrupt %s holds no call, so a rejection would settle nothing", interrupt.ID)
+		}
+		interrupt.Responder = &pl.Actor
+		interrupt.Response = pl.Response
+		interrupt.ResolvedSeq = &ev.Seq
+		interrupt.Status = InterruptAnswered
+		return nil
+	}
+
+	call, ok := state.toolCalls[interrupt.CausationID]
 	if !ok {
-		return fmt.Errorf("no tool call with ID=%s found for interrupt %s", interrupt.ToolCallID, interrupt.ID)
+		return fmt.Errorf("no tool call with ID=%s found for interrupt %s", interrupt.CausationID, interrupt.ID)
 	}
 
 	interrupt.Responder = &pl.Actor
@@ -1248,6 +1298,15 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 			call.FinishedAt = &ev.Timestamp
 			call.FinishedSeq = &ev.Seq
 			stoppedSomething = true
+		}
+	}
+
+	for _, interrupt := range arc.Interrupts {
+		if interrupt.Status == InterruptPending {
+			// Nobody will answer an ask on an arc that is no longer going
+			// anywhere.
+			interrupt.Status = InterruptCancelled
+			interrupt.ResolvedSeq = &ev.Seq
 		}
 	}
 

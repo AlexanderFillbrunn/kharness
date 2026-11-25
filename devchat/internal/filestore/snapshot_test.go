@@ -1,6 +1,7 @@
 package filestore
 
 import (
+	"os"
 	"context"
 	"encoding/json"
 	"reflect"
@@ -229,5 +230,44 @@ func TestStoreReadsAnArcThroughASnapshot(t *testing.T) {
 	}
 	if got, want := seqsOf(tail2), []int{3, 4}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("arc-2 tail seqs %v, want %v", got, want)
+	}
+}
+
+// Rotating the log moves the snapshot aside with it. Left behind, the stale
+// snapshot would claim a seq range the new, empty log never reaches, and a
+// snapshot-backed read of the first arc written after the rotate would report
+// "no arc" — which is what /clear followed by a message looked like.
+func TestRotateMovesTheSnapshotAside(t *testing.T) {
+	store := openTemp(t)
+	ctx := context.Background()
+	log := writeSnapshotLog(t, store)
+	if err := store.SaveSnapshot(ctx, "session", foldThrough(t, log, 4)); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	archived, err := store.Rotate()
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if archived == "" {
+		t.Fatal("Rotate archived nothing, want the old log's path")
+	}
+	if _, err := os.Stat(archived + ".snapshot"); err != nil {
+		t.Errorf("the snapshot did not move with the log: %v", err)
+	}
+
+	// The first arc of the fresh log is found by a snapshot-backed read.
+	if _, err := store.Persist(ctx, userMessage("arc-3", "a fresh question")); err != nil {
+		t.Fatalf("Persist after rotate: %v", err)
+	}
+	snap, tail, err := store.GetEventsForArc(ctx, ref("arc-3"), common.ReadOptions{UseSnapshots: true})
+	if err != nil {
+		t.Fatalf("GetEventsForArc after rotate: %v", err)
+	}
+	if snap != nil {
+		t.Errorf("the fresh log is served through a snapshot of %v, want none", snap.Seq())
+	}
+	if got, want := seqsOf(tail), []int{0}; !reflect.DeepEqual(got, want) {
+		t.Errorf("arc-3 tail seqs %v, want %v (just its opening)", got, want)
 	}
 }

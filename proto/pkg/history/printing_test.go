@@ -28,7 +28,7 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 					Result: "healthy", Status: ToolCallStatusSuccess, FinishedAt: &now,
 					Events: []*ToolEvent{{ID: "tool-event-1", Payload: map[string]any{"progress": 50}}},
 					Interrupt: &Interrupt{
-						ID: "interrupt-1", CorrelationID: "arc-1", ToolCallID: "tool-1", Timestamp: now,
+						ID: "interrupt-1", CorrelationID: "arc-1", CausationID: "tool-1", Timestamp: now,
 						Status: InterruptApproved, Reason: "needs approval", Response: "approved", Responder: actor,
 					},
 				}},

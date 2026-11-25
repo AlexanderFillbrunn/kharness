@@ -132,6 +132,11 @@ type Agent struct {
 	// the controller that starts them and reaches them once running. Nil for
 	// an agent that runs no tasks.
 	tasks TaskSource
+
+	// interruptSpecs are the configured interrupts, in declaration order.
+	// Nil and empty for an agent with no interrupts configured, in which
+	// case no tool raises one.
+	interruptSpecs []InterruptSpec
 }
 
 // AgentOption configures parts of an agent that not every agent has.
@@ -206,6 +211,18 @@ func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...Agent
 		for _, name := range []string{events.CancelTaskToolName, events.ProvideTaskInputToolName} {
 			if _, taken := agent.tools.Get(name); taken {
 				return nil, fmt.Errorf("%s is registered as a tool and is one of the tools tasks are addressed with", name)
+			}
+		}
+	}
+	// A configured interrupt is a tool by name, so it collides with a
+	// registered tool and with a task kind the same way.
+	for _, spec := range agent.interruptSpecs {
+		if _, taken := agent.tools.Get(spec.Name); taken {
+			return nil, fmt.Errorf("%s is registered as a tool and is configured as an interrupt", spec.Name)
+		}
+		if agent.tasks != nil {
+			if _, taken := agent.tasks.Get(spec.Name); taken {
+				return nil, fmt.Errorf("%s is registered as a task and is configured as an interrupt", spec.Name)
 			}
 		}
 	}
@@ -501,7 +518,7 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 	}
 	response, err := a.llm.StreamResponse(ctx, transcript, &LLMOptions{
 		SystemPrompt: a.systemPrompt,
-		Tools:        CombineTools(a.tools, taskToolSet{a.tasks}),
+		Tools:        CombineTools(a.tools, taskToolSet{a.tasks}, interruptToolSet{a.interruptSpecs}),
 	}, state.tokenSink(messageID))
 	// A rejection the provider recognises as over budget is recovered, not
 	// recorded as a failure: the non-fatal Error, the request and the
@@ -593,13 +610,18 @@ func recordedUsage(usage *TokenUsage) *events.TokenUsage {
 	}
 }
 
-// toolStep runs every call the arc is still waiting on, in the order they were
-// requested. Every pending call it finds has to end settled, since the loop
-// reads the arc to decide what to do next.
+// toolStep runs every call the arc is still waiting on. Every pending call it
+// finds has to end settled, since the loop reads the arc to decide what to do
+// next.
 //
 // The calls run in waves, per docs/PARALLEL-TOOLS.md: a contiguous run of
 // read-only calls runs concurrently (chunked to the configured cap), and
-// every other call runs alone. Waves run in emission order.
+// every other call runs alone. Waves run in emission order — except interrupt
+// calls, which run last: no call in one message can depend on the user's
+// answer, since the model emitted the batch before the answer existed, so the
+// ordinary calls run first and their results are in the log already when the
+// arc is held. A call that should wait for the answer belongs in a later
+// message, after the resumed run has seen it.
 func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 	// Collected before any of them runs, because running one writes to the
 	// arc being read.
@@ -626,7 +648,18 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 		toRun = append(toRun, call)
 	}
 
-	for _, wave := range a.waves(toRun) {
+	// Interrupt calls run after every other call of the step, in emission
+	// order among themselves.
+	var ordinary, asks []*history.ToolCall
+	for _, call := range toRun {
+		if a.operation(call.ToolName) == opInterrupt {
+			asks = append(asks, call)
+		} else {
+			ordinary = append(ordinary, call)
+		}
+	}
+
+	for _, wave := range a.waves(ordinary) {
 		var err error
 		if len(wave) == 1 {
 			err = a.runCall(ctx, wave[0], state)
@@ -635,6 +668,21 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 		}
 		if err != nil {
 			return err
+		}
+		// The arc may have been cancelled or otherwise settled mid-step.
+		if state.arc.Status() != history.ArcStatusPending {
+			return nil
+		}
+	}
+	// An ask runs alone and holds the arc once raised, so a second ask in the
+	// same message stays pending for the run after the first is answered, and
+	// the run ends at its next step.
+	for _, call := range asks {
+		if err := a.runCall(ctx, call, state); err != nil {
+			return err
+		}
+		if state.arc.Status() != history.ArcStatusPending {
+			return nil
 		}
 	}
 	return nil
@@ -663,10 +711,10 @@ func (a Agent) waves(calls []*history.ToolCall) [][]*history.ToolCall {
 }
 
 // parallelizable reports whether a call may join a parallel wave: an ordinary
-// tool declared read-only. Task operations never do, whatever the tool the
-// name resolves to says.
+// tool declared read-only. Task operations and interrupts never do, whatever
+// the tool the name resolves to says.
 func (a Agent) parallelizable(call *history.ToolCall) bool {
-	if classify(a.tasks, call.ToolName) != opTool {
+	if a.operation(call.ToolName) != opTool {
 		return false
 	}
 	tool, ok := a.tools.Get(call.ToolName)
@@ -708,13 +756,15 @@ func (a Agent) runWave(ctx context.Context, wave []*history.ToolCall, state *age
 // runCall hands one call to whatever answers calls by that name. The name
 // decides what the call is before anything runs.
 func (a Agent) runCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
-	switch classify(a.tasks, call.ToolName) {
+	switch a.operation(call.ToolName) {
 	case opStart:
 		return a.startTask(ctx, call, state)
 	case opCancel:
 		return a.cancelTask(ctx, call, state)
 	case opProvideInput:
 		return a.provideTaskInput(ctx, call, state)
+	case opInterrupt:
+		return a.raiseInterrupt(ctx, call, state)
 	default:
 		return a.runToolCall(ctx, call, state)
 	}
@@ -811,9 +861,10 @@ func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
 }
 
 // knows reports whether a call by this name has somewhere to go: a registered
-// tool, a kind of task, or one of the two tools tasks are addressed with.
+// tool, a kind of task, a configured interrupt, or one of the two tools tasks
+// are addressed with.
 func (a Agent) knows(name string) bool {
-	if classify(a.tasks, name) != opTool {
+	if a.operation(name) != opTool {
 		return true
 	}
 	_, ok := a.tools.Get(name)

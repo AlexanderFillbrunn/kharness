@@ -18,9 +18,13 @@ task report raises, and it is [RE-ENTRY.md](RE-ENTRY.md).
 
 What is already there
 --------------------
-`INTERRUPT` names one tool call and holds it. `INTERRUPT_RESPONSE` settles it.
-A refusal settles the call `REFUSED` and carries the human's words as the
-call's result. An approval leaves the call pending, so it runs.
+`INTERRUPT` holds a record up for a human. With a causation ID it names one
+tool call and holds it; without one it is arc-wide and holds the whole arc.
+`INTERRUPT_RESPONSE` settles it. On a call, a refusal settles the call
+`REFUSED` and carries the human's words as the call's result, and an approval
+leaves the call pending, so it runs. On an arc-wide interrupt the response
+carries no verdict — a rejection is refused by the fold — and is information
+that settles only the interrupt, the arc's own ask.
 
     proto/pkg/events/payloads.go      InterruptPayload, InterruptResponsePayload
     agent/pkg/history/history.go      applyInterrupt, applyInterruptResponse
@@ -53,6 +57,16 @@ returns nil. Whatever happens next happens in another run, built from the log.
 
 Nothing runs until every ask is answered. That is the arc-wide status doing the
 work, and it needs no code of its own.
+
+Ordering within a step
+--------------------
+An interrupt call runs after the other calls of its step, whatever the
+emission order. No call in one message can depend on the user's answer — the
+model emitted the batch before the answer existed — so the ordinary calls run
+first and their results are in the log when the arc is held; the resumed run
+then sees them together with the answer. A call that should wait for the
+answer belongs in a later message, emitted after the resumed run has seen it.
+A second ask in the same message stays pending until the first is answered.
 
 Asking for several calls at once
 --------------------

@@ -95,6 +95,18 @@ func (s *Store) Rotate() (string, error) {
 	}
 	s.file = file
 	s.seq = -1
+
+	// The snapshot summarizes the log just moved aside. Left behind, it would
+	// still claim a seq range the new, empty log never reaches, and every
+	// snapshot-backed read would find nothing above it — including the
+	// opening of the first arc written after the rotate. It moves with the log.
+	if _, err := os.Stat(s.snapshotPath()); err == nil {
+		if err := os.Rename(s.snapshotPath(), archived+".snapshot"); err != nil {
+			return "", fmt.Errorf("move %s aside: %w", s.snapshotPath(), err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat %s: %w", s.snapshotPath(), err)
+	}
 	return archived, nil
 }
 

@@ -171,6 +171,12 @@ func (h *History) records() []foldedRecord {
 		for _, s := range arc.Suspensions {
 			add(s.Seq, 0, false)
 		}
+		for _, interrupt := range arc.Interrupts {
+			add(interrupt.Seq, EstimateTokens(interrupt.Reason+" "+formatValue(interrupt.Context)), false)
+			if interrupt.ResolvedSeq != nil {
+				add(*interrupt.ResolvedSeq, EstimateTokens(formatValue(interrupt.Response)), false)
+			}
+		}
 		if arc.Closed != nil {
 			add(arc.Closed.Seq, 0, false)
 		}
