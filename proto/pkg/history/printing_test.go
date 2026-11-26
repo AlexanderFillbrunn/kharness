@@ -47,7 +47,6 @@ func TestPrintHistoryIncludesAllHistoryRecords(t *testing.T) {
 				Events: []AsyncTaskEvent{{ID: "task-event-1", Timestamp: now, Type: AsyncTaskEventNotification, Payload: "Need input"}},
 			},
 		},
-		TaskResultTrail: -1,
 	}
 
 	var output bytes.Buffer

@@ -34,7 +34,7 @@ type fakeArcEnqueuer struct {
 	refs []common.ArcRef
 }
 
-func (f *fakeArcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, _ string) error {
+func (f *fakeArcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, _ string, _ int) error {
 	f.refs = append(f.refs, ref)
 	return nil
 }
@@ -47,7 +47,6 @@ func compactionConfig() *AgentConfig {
 		LowerBudget:         100,
 		HigherBudget:        150,
 		MaxToolResultChars:  1000,
-		MaxUserMessageChars: 10000,
 		ArcThresholdTokens:  10000,
 		ContextWindow:       32000,
 	}
@@ -386,37 +385,6 @@ func TestAdmissionSuspendsOverHigherBudget(t *testing.T) {
 	}
 }
 
-// AC-10: a user message over MaxUserMessageChars is rejected without a call —
-// a fatal Error, and the arc never runs.
-func TestAdmissionRefusesOverlongUserMessage(t *testing.T) {
-	store := &logStore{}
-	h := arcHistoryWith(t, store, userEvent(0, testArcID, strings.Repeat("x", 100)))
-
-	persistor := &fakePersistor{next: 1}
-	llm := &scriptedLLM{replies: []*LLMResponse{{ModelID: "model-1", Content: "never called"}}}
-	cfg := compactionConfig()
-	cfg.MaxUserMessageChars = 10
-	agent := compactionAgent(t, llm, cfg)
-
-	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if llm.calls != 0 {
-		t.Errorf("the model was called for a refused arc")
-	}
-	var failure *events.Event
-	for _, ev := range persistor.persisted {
-		if ev.Typ == events.ErrorEventType {
-			failure = ev
-		}
-	}
-	if failure == nil {
-		t.Fatalf("persisted %s, want a fatal ERROR", typesOf(persistor.persisted))
-	}
-	if !failure.Payload.(events.ErrorPayload).IsFatal {
-		t.Error("the refusal must be fatal")
-	}
-}
 
 // AC-7: a run that crosses the higher budget between rounds suspends onto the
 // request its own earlier round triggered and writes no second one.
@@ -868,7 +836,7 @@ func TestArcWorkerStartsCompactionOutsideTheRun(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	worked, err := worker.Work(context.Background(), testRef(), testAgentID)
+	worked, err := worker.Work(context.Background(), testRef(), testAgentID, 0)
 	if err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}
@@ -1097,7 +1065,7 @@ func TestArcWorkerWithoutStarterLeavesTheRequestStanding(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	worked, err := worker.Work(context.Background(), testRef(), testAgentID)
+	worked, err := worker.Work(context.Background(), testRef(), testAgentID, 0)
 	if err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}

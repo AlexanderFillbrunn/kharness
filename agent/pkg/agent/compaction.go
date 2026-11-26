@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"unicode/utf8"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
@@ -39,10 +38,9 @@ const (
 // marker for that: the arc threshold, the tool-result cap and the
 // user-message cap are all off unless the settings ask for them.
 const (
-	DefaultKeepRecentTokens    = 4000
-	DefaultMaxToolResultChars  = -1
-	DefaultMaxUserMessageChars = -1
-	DefaultArcThresholdTokens  = -1
+	DefaultKeepRecentTokens   = 4000
+	DefaultMaxToolResultChars = -1
+	DefaultArcThresholdTokens = -1
 )
 
 // ContextWindowReserve is what the higher budget leaves below the context
@@ -50,14 +48,10 @@ const (
 // transcript is at the budget.
 const ContextWindowReserve = 2000
 
-// errSuspended ends a run whose arc was suspended for compaction, and
-// errRefused one the admission check turned away. Neither is a failure: the
-// records that say what happened are already in the log, so recordFailure
-// writes nothing for them and the run ends its in-flight period.
-var (
-	errSuspended = errors.New("arc suspended for compaction")
-	errRefused   = errors.New("arc refused at admission")
-)
+// errSuspended ends a run whose arc was suspended for compaction. It is not a
+// failure: the records that say what happened are already in the log, so
+// recordFailure writes nothing for it and the run ends its in-flight period.
+var errSuspended = errors.New("arc suspended for compaction")
 
 // compactionEnabled reports whether the agent runs the compaction checks at
 // all: compaction on and a lower budget to check against.
@@ -128,58 +122,6 @@ func ContextWindow(ref ModelRef) int {
 		return v
 	}
 	return DefaultContextWindow
-}
-
-// admissionCheck runs before a run starts. An arc whose opening user message
-// is over MaxUserMessageChars is refused outright — a user message is never
-// thinned, and no compaction can shrink it — with a fatal Error in the log.
-// An arc whose would-be transcript estimates over the higher budget is
-// suspended before it starts: the request is written where none stands, then
-// an ARC_SUSPENDED naming it, and the arc is left unworked for the completion
-// scan. An arc with an unresolved suspension is likewise left to its
-// compaction.
-func (a Agent) admissionCheck(ctx context.Context, state *agentState) error {
-	cfg := a.config
-	if !cfg.compactionEnabled() {
-		return nil
-	}
-	arc := state.arc
-
-	if state.history.ArcSuspended(arc) {
-		// The arc is waiting out a suspension; the completion scan requeues
-		// it once the compaction lands.
-		return errSuspended
-	}
-
-	if arc.OpenedByTask == "" && cfg.MaxUserMessageChars > 0 &&
-		utf8.RuneCountInString(arc.Content) > cfg.MaxUserMessageChars {
-		_, err := a.persistAndFold(ctx, state, &events.Event{
-			Typ:           events.ErrorEventType,
-			CorrelationID: &arc.ID,
-			Payload: events.ErrorPayload{
-				Message: fmt.Sprintf(
-					"the message is %d characters, over the %d-character limit, and a user message is never thinned",
-					utf8.RuneCountInString(arc.Content), cfg.MaxUserMessageChars),
-				IsFatal: true,
-			},
-		})
-		if err != nil {
-			return err
-		}
-		return errRefused
-	}
-
-	if cfg.HigherBudget > 0 && state.history.EstimateAbove(state.history.Watermark()) > cfg.HigherBudget {
-		requestID, err := a.ensureCompactionRequest(ctx, state)
-		if err != nil {
-			return err
-		}
-		if err := a.suspendArc(ctx, state, requestID); err != nil {
-			return err
-		}
-		return errSuspended
-	}
-	return nil
 }
 
 // checkCompaction runs the two budget checks after every round. The lower
@@ -616,7 +558,9 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 			for _, s := range arc.Suspensions {
 				if h.SuspensionStateOf(arc, s) == history.SuspensionReleased {
 					ref := common.ArcRef{SessionID: sessionID, ArcID: arc.ID}
-					if err := w.enqueuer.Enqueue(ctx, ref, agentID); err != nil {
+					// No single event caused this run — the compaction that
+					// landed did — so the item carries no trigger.
+					if err := w.enqueuer.Enqueue(ctx, ref, agentID, 0); err != nil {
 						return true, fmt.Errorf("completion scan could not requeue arc %s: %w", ref, err)
 					}
 				}

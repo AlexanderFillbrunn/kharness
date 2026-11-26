@@ -215,6 +215,21 @@ type AsyncTaskInvokePayload struct {
 	TaskName string      `json:"task_name"`
 	Args     any         `json:"args"`
 	Actor    users.Actor `json:"actor"`
+
+	// InResultTrail is how many InResult events the task's result message
+	// carries, or -1 for the whole trail, copied from the task kind's
+	// declaration by whoever starts the task. Zero is unset and folds as -1.
+	InResultTrail int `json:"in_result_trail,omitempty"`
+
+	// InResultTrailChars caps how many characters the task's InResult trail
+	// carries in its result message; zero or negative means no cap.
+	InResultTrailChars int `json:"in_result_trail_chars,omitempty"`
+
+	// InResultTrailHeader says whether each InResult trail entry in the
+	// task's result message carries a header line with its index in the
+	// trail and its timestamp, copied from the task kind's declaration by
+	// whoever starts the task.
+	InResultTrailHeader bool `json:"in_result_trail_header,omitempty"`
 }
 
 func (AsyncTaskInvokePayload) EventType() EventType {

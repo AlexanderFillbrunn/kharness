@@ -126,16 +126,18 @@ func (s *logStore) types() string {
 type recordingEnqueuer struct {
 	mu       sync.Mutex
 	enqueued []common.ArcRef
-	work     func(ctx context.Context, ref common.ArcRef, agentID string)
+	seqs     []int
+	work     func(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int)
 }
 
-func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
+func (e *recordingEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) error {
 	e.mu.Lock()
 	e.enqueued = append(e.enqueued, ref)
+	e.seqs = append(e.seqs, triggerSeq)
 	work := e.work
 	e.mu.Unlock()
 	if work != nil {
-		work(ctx, ref, agentID)
+		work(ctx, ref, agentID, triggerSeq)
 	}
 	return nil
 }
@@ -203,8 +205,8 @@ func reportsFor(t *testing.T, store *logStore, enqueuer *recordingEnqueuer, repl
 	if err != nil {
 		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
-	enqueuer.work = func(ctx context.Context, ref common.ArcRef, agentID string) {
-		_, _ = worker.Work(ctx, ref, agentID)
+	enqueuer.work = func(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) {
+		_, _ = worker.Work(ctx, ref, agentID, triggerSeq)
 	}
 	reports, err := ingress.NewTaskReports(store, store, taskRegistry(t), enqueuer)
 	if err != nil {
@@ -255,10 +257,17 @@ func TestACompletionIsRecordedAndOpensANewArc(t *testing.T) {
 	if result.Actor.UserID != "alice" {
 		t.Errorf("the result's actor = %q, want the invoke's actor", result.Actor.UserID)
 	}
-	// The new arc went to the queue as a work item.
+	// The new arc went to the queue as a work item, carrying the result
+	// event's seq as its trigger.
 	refs := enqueuer.refs()
 	if len(refs) != 1 || refs[0].ArcID != *result.CorrelationID || refs[0].SessionID != testSessionID {
 		t.Errorf("enqueued = %v, want the one new arc", refs)
+	}
+	enqueuer.mu.Lock()
+	seqs := append([]int(nil), enqueuer.seqs...)
+	enqueuer.mu.Unlock()
+	if len(seqs) != 1 || seqs[0] != result.Seq {
+		t.Errorf("trigger seqs = %v, want [%d] (the result event's seq)", seqs, result.Seq)
 	}
 }
 
@@ -510,7 +519,7 @@ func TestAWorkerReportsALeaseItCouldNotReach(t *testing.T) {
 		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
 
-	worked, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: testArcID}, testAgentID)
+	worked, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: testArcID}, testAgentID, 0)
 	if err == nil {
 		t.Fatal("an unreachable lease was reported as an arc somebody else held")
 	}
@@ -532,7 +541,7 @@ func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
 		t.Fatalf("agent.NewArcWorker: %v", err)
 	}
 
-	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: "somebody-else", ArcID: testArcID}, testAgentID); err == nil {
+	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: "somebody-else", ArcID: testArcID}, testAgentID, 0); err == nil {
 		t.Error("an arc was worked under a session it is not in")
 	}
 }

@@ -121,11 +121,14 @@ func (r *TaskReports) Report(ctx context.Context, ref common.TaskRef, agentID st
 	if err != nil {
 		return err
 	}
-	if _, err := common.AsAgent(agentID, r.persistor).Persist(ctx, ev); err != nil {
+	stored, err := common.AsAgent(agentID, r.persistor).Persist(ctx, ev)
+	if err != nil {
 		return err
 	}
 	if opensArc {
-		if err := r.enqueue.Enqueue(ctx, common.ArcRef{SessionID: ref.SessionID, ArcID: *ev.CorrelationID}, agentID); err != nil {
+		// The item carries the event's seq as its trigger, so the worker
+		// fires the continuation hook for exactly this report.
+		if err := r.enqueue.Enqueue(ctx, common.ArcRef{SessionID: ref.SessionID, ArcID: *ev.CorrelationID}, agentID, stored[0].Seq); err != nil {
 			return fmt.Errorf("enqueue the arc the report opened: %w", err)
 		}
 	}

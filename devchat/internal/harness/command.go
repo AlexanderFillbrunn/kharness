@@ -234,14 +234,14 @@ func clearSession(m model, _ string) (model, tea.Cmd) {
 // resumeArc hands an arc back to the worker after a write that changed what
 // it has to do: the write owes the arc a run, so it goes to the same retry
 // loop an enqueued arc is served by until the lease is free.
-func resumeArc(m model, arcID string) {
+func resumeArc(m model, arcID string, triggerSeq int) {
 	if m.session.worker == nil {
 		return
 	}
 	session, sender, ref := m.session, m.sender, m.session.ref(arcID)
 	go func() {
 		for {
-			worked, err := session.worker.Work(context.Background(), ref, localAgentID)
+			worked, err := session.worker.Work(context.Background(), ref, localAgentID, triggerSeq)
 			if err != nil {
 				sender.send(arcDoneMsg{err: err})
 				return
@@ -281,13 +281,14 @@ func answerInterruptTurn(m model, argument string) (model, tea.Cmd) {
 		m.transcript.note(fmt.Sprintf("interrupt %s is already %s", id, interrupt.Status))
 		return m.refresh(), nil
 	}
-	if err := m.session.answerInterrupt(ctx, arcID, id, answer); err != nil {
+	triggerSeq, err := m.session.answerInterrupt(ctx, arcID, id, answer)
+	if err != nil {
 		m.transcript.fail(err)
 		return m.refresh(), nil
 	}
 	m.transcript.markAnswered(id, answer)
 	m.transcript.note(fmt.Sprintf("interrupt %s answered: %s — resuming arc %s", id, answer, arcID))
-	resumeArc(m, arcID)
+	resumeArc(m, arcID, triggerSeq)
 	return m.refresh(), nil
 }
 

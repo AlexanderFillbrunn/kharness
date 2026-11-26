@@ -321,9 +321,8 @@ func TestFoldStateFromHistoryIndexesExistingRecords(t *testing.T) {
 	now := time.Date(2026, time.September, 17, 15, 0, 0, 0, time.UTC)
 	user := users.Actor{UserID: "user-1"}
 	history := &History{
-		LastSeq:         0,
-		Tasks:           map[string]*AsyncTask{"task-1": {ID: "task-1", CorrelationID: arc, Status: AsyncTaskPending}},
-		TaskResultTrail: -1,
+		LastSeq: 0,
+		Tasks:   map[string]*AsyncTask{"task-1": {ID: "task-1", CorrelationID: arc, Status: AsyncTaskPending}},
 		Arcs: []*Arc{{
 			ID: "arc-1", Seq: 0, Content: "Check status", Timestamp: now, Actor: &user,
 			Responses: []*AssistantMessage{{
@@ -850,5 +849,30 @@ func TestATaskCancelForAnUnknownTaskIsRejected(t *testing.T) {
 		CorrelationID: &unknown, Actor: user, Payload: events.CancelPayload{TaskID: &unknown}}
 	if err := h.Update(&bad, FoldStateFromHistory(h)); err == nil {
 		t.Fatal("a task-addressed cancel for an unknown task was folded")
+	}
+}
+
+// The invoke stamps the task's trail caps onto the task record: a set count
+// and character cap are carried as written, an unset count folds as the whole
+// trail and an unset character cap as no cap.
+func TestFoldCarriesTheInvokeTrailCapsOnTheTask(t *testing.T) {
+	start := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
+	arc := "user-message-1"
+	user := users.Actor{UserID: "user-1"}
+
+	log := []*events.Event{
+		{ID: arc, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: user, Payload: events.UserMessagePayload{Content: "go", Actor: user}},
+		{ID: "task-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: user, InResultTrail: 2, InResultTrailChars: 200, InResultTrailHeader: true}},
+		{ID: "task-2", Seq: 2, Timestamp: start.Add(2 * time.Second), Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: user,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "researcher", Actor: user}},
+	}
+
+	h := foldEvents(t, log)
+	if capped := h.Tasks["task-1"]; capped.InResultTrail != 2 || capped.InResultTrailChars != 200 || !capped.InResultTrailHeader {
+		t.Errorf("task-1 trail settings = %d/%d/%v, want 2/200/true carried from the invoke", capped.InResultTrail, capped.InResultTrailChars, capped.InResultTrailHeader)
+	}
+	if unset := h.Tasks["task-2"]; unset.InResultTrail != -1 || unset.InResultTrailChars != 0 || unset.InResultTrailHeader {
+		t.Errorf("task-2 trail settings = %d/%d/%v, want -1/0/false: unset count folds as the whole trail, unset chars as no cap, unset header as none", unset.InResultTrail, unset.InResultTrailChars, unset.InResultTrailHeader)
 	}
 }

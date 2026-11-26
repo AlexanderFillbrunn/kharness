@@ -73,7 +73,8 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	persistor := common.MintIdentity(common.GuardCancellation(store, store))
 	cancels := agent.NewLocalCancels()
 	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), agent.NewLocalLease(),
-		agent.WithCancelWatcher(cancels))
+		agent.WithCancelWatcher(cancels),
+		agent.WithTaskController(runner))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -104,8 +105,8 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 // straight away, the way the queue serves it.
 type workEnqueuer struct{ worker *agent.ArcWorker }
 
-func (e workEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
-	_, _ = e.worker.Work(ctx, ref, agentID)
+func (e workEnqueuer) Enqueue(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) error {
+	_, _ = e.worker.Work(ctx, ref, agentID, triggerSeq)
 	return nil
 }
 

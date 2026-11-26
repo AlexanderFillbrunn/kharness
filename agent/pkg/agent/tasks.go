@@ -1,9 +1,14 @@
 package agent
 
 import (
+	"context"
+	"fmt"
+
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
+	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -18,42 +23,35 @@ import (
 // business. Nothing here records what is running. That is the log, which only
 // the agent reads and writes.
 
-// TaskSource is one source of task kinds: what the process holds, resolved by
-// name the way a ToolProvider is, plus the controller that starts the source's
-// kinds and reaches them once they are running. A definition can pick its
-// tasks from the sources but never invent them, and a kind is never offered
-// without the source that can start it. The set a definition selects — see
-// SelectTasks — is itself a TaskSource, handed to the agent as it is.
+// TaskSource is one source of task kinds: the task-side ToolProvider. The
+// metadata half (common.TaskSet, what a definition offers from it) is
+// resolved by name; the controller half starts the source's kinds and
+// reaches them once running. A definition can pick its tasks from the
+// sources but never invent them, and a kind is never offered without the
+// source that can start it. The set a definition selects — see SelectTasks —
+// is itself a TaskSource.
 type TaskSource interface {
-	// All returns every kind the source holds, in a fixed order, so that two
-	// agents built from the same sources carry the same tools.
-	All() []common.TaskMetadata
-
-	// Get returns one kind by name. It is also what makes a source a
-	// common.MetadataSource, which is the sliver of it the ingress reads.
-	Get(name string) (common.TaskMetadata, bool)
+	common.TaskSet
 
 	// The controller starts a kind by name and reaches a running task by ref.
 	common.TaskController
 }
 
-
-
-// taskToolSet offers a task source's kinds to the model, plus the two tools
-// that address a task already running. The two are synthesized, since they are
-// the same tools whatever tasks exist.
+// taskToolSet offers a task metadata set's kinds to the model, plus the two
+// tools that address a task already running. The two are synthesized, since
+// they are the same tools whatever tasks exist.
 type taskToolSet struct {
-	tasks TaskSource
+	meta common.TaskSet
 }
 
 // All returns one tool per kind of task, plus the two that address a task
 // already running.
 func (s taskToolSet) All() []*mcp.Tool {
-	if s.tasks == nil || len(s.tasks.All()) == 0 {
+	if s.meta == nil || len(s.meta.All()) == 0 {
 		// With no tasks to start there is nothing to cancel or answer.
 		return nil
 	}
-	kinds := s.tasks.All()
+	kinds := s.meta.All()
 	tools := make([]*mcp.Tool, 0, len(kinds)+2)
 	for _, meta := range kinds {
 		tools = append(tools, toolFor(meta))
@@ -139,7 +137,7 @@ const (
 
 // classify says what a call by this name is. A name that is neither a task's
 // nor one of the two operations is an ordinary tool.
-func classify(tasks TaskSource, name string) taskOperation {
+func classify(tasks common.TaskSet, name string) taskOperation {
 	if tasks == nil || len(tasks.All()) == 0 {
 		return opTool
 	}
@@ -153,4 +151,314 @@ func classify(tasks TaskSource, name string) taskOperation {
 		return opStart
 	}
 	return opTool
+}
+
+// TaskArgs is what a task start is given: a JSON object shaped by the task
+// kind's declared input schema. The agent passes it through opaquely — to the
+// log and to the controller — so it stays a map; the hooks see it typed.
+type TaskArgs map[string]any
+
+// TaskCancelArgs are the arguments of a cancel call.
+type TaskCancelArgs struct {
+	TaskID string
+	Reason string
+}
+
+// TaskInputArgs are the arguments of a call that answers a waiting task.
+type TaskInputArgs struct {
+	TaskID string
+	Input  string
+}
+
+// taskArgsOf reads a start's args as the JSON object the task kind's input
+// schema shapes. Args that are no object read as nil.
+func taskArgsOf(args any) TaskArgs {
+	if fields, ok := args.(map[string]any); ok {
+		return TaskArgs(fields)
+	}
+	return nil
+}
+
+// taskCancelArgsOf reads a cancel's args. Fields the model left out read as
+// empty; the call's own checks report them.
+func taskCancelArgsOf(args any) TaskCancelArgs {
+	id, _ := stringArg(args, "task_id")
+	reason, _ := stringArg(args, "reason")
+	return TaskCancelArgs{TaskID: id, Reason: reason}
+}
+
+// taskInputArgsOf reads an input call's args, likewise.
+func taskInputArgsOf(args any) TaskInputArgs {
+	id, _ := stringArg(args, "task_id")
+	input, _ := stringArg(args, "input")
+	return TaskInputArgs{TaskID: id, Input: input}
+}
+
+// lastInputRequest is the question the task last stopped at, or nil for a task
+// that never has. A waiting task always has one, since asking is what put it
+// in that state.
+func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
+	var last *history.AsyncTaskEvent
+	for i := range task.Events {
+		if task.Events[i].Type == history.AsyncTaskEventInputRequested {
+			last = &task.Events[i]
+		}
+	}
+	return last
+}
+
+// startTask records a task, starts it, and answers the call that asked for it.
+//
+// The dispatch and the invocation are written before the task starts, in one
+// write, because the record is what names the task. The invocation ID is
+// minted here so the task can be started under it, and the invoke records the
+// actor that started the task, which every event the task later emits carries.
+func (a Agent) startTask(ctx context.Context, call *history.ToolCall, args any, state *agentState) error {
+	if state.tasks == nil {
+		return a.noController(ctx, call, state)
+	}
+	invocationID := common.NewEventID()
+	// The task kind's InResult trail settings ride on the invoke, so the fold
+	// carries them on the task record and every reader of the history sees
+	// them without the agent. Zero trail is unset and folds as the whole
+	// trail; zero chars means no character cap.
+	inResultTrail := 0
+	inResultTrailChars := 0
+	inResultTrailHeader := false
+	if meta, ok := a.tasks.Get(call.ToolName); ok {
+		inResultTrail = meta.InResultTrail
+		inResultTrailChars = meta.InResultTrailChars
+		inResultTrailHeader = meta.InResultTrailHeader
+	}
+	invoke := &events.Event{
+		ID:            invocationID,
+		Typ:           events.AsyncTaskInvokeEventType,
+		CorrelationID: &state.arc.ID,
+		Payload: events.AsyncTaskInvokePayload{
+			TaskName:            call.ToolName,
+			Args:                args,
+			Actor:               taskActor(state.arc),
+			InResultTrail:       inResultTrail,
+			InResultTrailChars:  inResultTrailChars,
+			InResultTrailHeader: inResultTrailHeader,
+		},
+	}
+	invoke.Actor = taskActor(state.arc)
+	if _, err := a.persistAndFold(ctx, state,
+		&events.Event{
+			Typ:           events.ToolDispatchedEventType,
+			CorrelationID: &state.arc.ID,
+			Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
+		},
+		invoke,
+	); err != nil {
+		return err
+	}
+
+	// The session is filled in by the task source the run was given, which
+	// the worker binds to the session it is working; the agent addresses the
+	// task by ID alone.
+	ref := common.TaskRef{ID: invocationID}
+	if err := state.tasks.Start(ctx, call.ToolName, ref, args); err != nil {
+		return a.settleUnstartedTask(ctx, call, ref, err, state)
+	}
+
+	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+		"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
+			"Anything it says reaches you as a turn of its own, a question included, so there is "+
+			"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
+			"it yourself with %s, or put the question to the user first and then answer with %s "+
+			"once you have their reply; stop it with %s. All take that id.",
+		call.ToolName, ref.ID, events.ProvideTaskInputToolName, events.ProvideTaskInputToolName, events.CancelTaskToolName)}, state)
+}
+
+// taskActor is the actor a task's events carry: the one whose message opened
+// the arc the task started in.
+func taskActor(arc *history.Arc) users.Actor {
+	if arc.Actor != nil {
+		return *arc.Actor
+	}
+	return users.Actor{}
+}
+
+// settleUnstartedTask closes off a task whose launch failed. The task and its
+// call are settled as failed, since nothing will report on them, and the text
+// says the work may be running anyway.
+//
+// The settle is written with None visibility, correlated to the task: the run
+// that is still in flight reports the failure to the model through the call's
+// own result, so the settle opens no arc.
+func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, ref common.TaskRef, cause error, state *agentState) error {
+	reason := fmt.Sprintf(
+		"task %s could not be started: %s. Whether it took hold before the failure is not known, "+
+			"so check before starting it again.", call.ToolName, cause)
+
+	if _, err := a.persistAndFold(ctx, state, &events.Event{
+		Typ:           events.AsyncTaskResultEventType,
+		CorrelationID: &ref.ID,
+		Payload: events.AsyncTaskResultPayload{
+			CausationID:   ref.ID,
+			Result:        reason,
+			Outcome:       events.AsyncTaskOutcomeFailed,
+			LLMVisibility: events.LLMVisibilityNone,
+		},
+	}); err != nil {
+		return err
+	}
+	return a.settleCall(ctx, call, ToolOutcome{Result: reason, IsError: true}, state)
+}
+
+// cancelTask asks a running task to stop. The cancel is written as a CANCEL
+// event whose correlation ID is the task ID, which is what settles the task in
+// the log, with who cancelled it and when; the runner is then reached through
+// the controller. What became of work already under way is the runner's to
+// report.
+func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
+	if state.tasks == nil {
+		return a.noController(ctx, call, state)
+	}
+	if err := a.recordDispatch(ctx, call, state); err != nil {
+		return err
+	}
+
+	cargs := taskCancelArgsOf(call.Args)
+	task, failure := a.addressedTask(cargs.TaskID, state)
+	if failure != "" {
+		return a.settleCall(ctx, call, ToolOutcome{Result: failure, IsError: true}, state)
+	}
+	if task.FinishedSeq != nil {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s had already finished (%s), so there was nothing to stop.",
+			task.TaskName, task.Status), IsError: true}, state)
+	}
+
+	reason := cargs.Reason
+	taskID := task.ID
+	cancel := &events.Event{
+		Typ:           events.CancelEventType,
+		CorrelationID: &taskID,
+		Actor:         taskActor(state.arc),
+		Payload:       events.CancelPayload{TaskID: &taskID},
+	}
+	if reason != "" {
+		cancel.Payload = events.CancelPayload{TaskID: &taskID, Reason: &reason}
+	}
+	if _, err := a.persistAndFold(ctx, state, cancel); err != nil {
+		return err
+	}
+
+	ref := common.TaskRef{ID: task.ID}
+	if err := state.tasks.Cancel(ctx, ref, reason); err != nil {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s could not be reached to stop it: %s", task.TaskName, err), IsError: true}, state)
+	}
+
+	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+		"task %s was asked to stop. It reports what became of it, so it may have done some of "+
+			"its work already.", task.TaskName)}, state)
+}
+
+// provideTaskInput hands a waiting task the answer it asked for. The task is
+// given the input before the log is told, so the log cannot claim input the
+// task never received.
+//
+// The INPUT_PROVIDED record is written correlated to the arc the ask opened, so
+// the answer is in that arc's own transcript at any cutoff; the fold attaches it
+// there and it opens no other arc. The event carries the actor the invoke
+// recorded, since the answer is given under that actor.
+func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, args any, state *agentState) error {
+	if state.tasks == nil {
+		return a.noController(ctx, call, state)
+	}
+	if err := a.recordDispatch(ctx, call, state); err != nil {
+		return err
+	}
+
+	iargs := taskInputArgsOf(args)
+	task, failure := a.addressedTask(iargs.TaskID, state)
+	if failure != "" {
+		return a.settleCall(ctx, call, ToolOutcome{Result: failure, IsError: true}, state)
+	}
+	input := iargs.Input
+	if input == "" {
+		return a.settleCall(ctx, call, ToolOutcome{
+			Result: "no input was given to hand to the task", IsError: true}, state)
+	}
+	// A run reads the log as it stood when the run began, so a question asked
+	// since is not here yet and this says so rather than claiming the task is
+	// not asking. Answering ahead of the question is the other way in.
+	if task.Status != history.AsyncTaskWaiting {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s has asked nothing you have been given to answer, and reads as %s here. Wait "+
+				"to be handed its question rather than answering one you expect it to ask.",
+			task.TaskName, task.Status), IsError: true}, state)
+	}
+
+	// The answer names the question it answers, so a task that has moved on
+	// refuses it rather than taking it for whatever it is waiting on now.
+	request := lastInputRequest(task)
+	if request == nil {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s is waiting, but the log holds no question of its to answer.",
+			task.TaskName), IsError: true}, state)
+	}
+
+	ref := common.TaskRef{ID: task.ID}
+	// A task somebody else answered first refuses this answer, and a task that
+	// cannot be reached at all fails the same way. Nothing here tells the two
+	// apart, so the text covers both.
+	if err := state.tasks.ProvideInput(ctx, ref, request.ID, input); err != nil {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s did not take the input: %s. It may have been answered already, or have "+
+				"finished, so read what it says next before answering again.",
+			task.TaskName, err), IsError: true}, state)
+	}
+
+	// The record lands on the arc the ask opened, which is where the answer
+	// belongs: that arc exists, so the event attaches to it and opens no
+	// other.
+	answerArc := task.CorrelationID
+	if task.WaitingArc != nil {
+		answerArc = *task.WaitingArc
+	}
+	provided := &events.Event{
+		Typ:           events.AsyncTaskInputProvidedEventType,
+		CorrelationID: &answerArc,
+		Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
+	}
+	if task.Actor != nil {
+		provided.Actor = *task.Actor
+	}
+
+	// Both events say the same already-settled thing, that the input reached
+	// the task, so neither may survive without the other.
+	_, err := a.persistAndFold(ctx, state,
+		provided,
+		callResult(call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s was given the input and is running again.", task.TaskName)}, state.arc.ID),
+	)
+	return err
+}
+
+// addressedTask finds the task a call names in the session's task table, or
+// says why it could not. The reason is written for the model to act on.
+func (a Agent) addressedTask(id string, state *agentState) (*history.AsyncTask, string) {
+	if id == "" {
+		return nil, "no task id was given"
+	}
+	if task, ok := state.history.Tasks[id]; ok {
+		return task, ""
+	}
+	// A task outside this session is as absent as one never started.
+	return nil, fmt.Sprintf("no task with id %s is part of this conversation", id)
+}
+
+// noController settles a task tool call on a run that has no controller
+// bound: the tools are offered from the agent's metadata, but only a
+// controller can start or reach a task.
+func (a Agent) noController(ctx context.Context, call *history.ToolCall, state *agentState) error {
+	return a.settleCall(ctx, call, ToolOutcome{
+		Result:  "this run has no task controller bound to it, so the task could not be reached",
+		IsError: true,
+	}, state)
 }

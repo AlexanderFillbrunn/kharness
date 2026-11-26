@@ -8,7 +8,6 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
@@ -87,22 +86,38 @@ func (a Agent) operation(name string) taskOperation {
 // the arc.
 func (a Agent) raiseInterrupt(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	spec := a.interruptSpec(call.ToolName)
-	interruptID := common.NewEventID()
-	interrupt := &events.Event{
-		ID:            interruptID,
-		Typ:           events.InterruptEventType,
-		CorrelationID: &state.arc.ID,
-		Payload: events.InterruptPayload{
-			Reason:  spec.Description,
-			Context: call.Args,
-		},
+	req := InterruptRequest{
+		ToolName: call.ToolName,
+		ArcID:    state.arc.ID,
+		Reason:   spec.Description,
+		Context:  call.Args,
 	}
+	// BeforeInterrupt governs the raise: it may change the ask, block it —
+	// which settles the call as a tool error instead — or answer it at once.
+	evs, settle, err := a.prepareInterrupt(ctx, req, call, state)
+	if err != nil {
+		// Fail closed: no interrupt, the call settles as an error.
+		settle = callResult(call, ToolOutcome{
+			IsError: true,
+			Result:  fmt.Sprintf("the interrupt policy failed, so the interrupt was not raised: %v", err),
+		}, state.arc.ID)
+		evs = nil
+	}
+	if settle != nil {
+		_, err := a.persistAndFold(ctx, state, settle)
+		return err
+	}
+	reason := evs[0].Payload.(events.InterruptPayload).Reason
 	result := callResult(call, ToolOutcome{Result: fmt.Sprintf(
 		"interrupt %s raised: %s. The arc is held until a human answers, and the answer "+
 			"reaches you as a note when the arc resumes.",
-		interruptID, spec.Description)}, state)
-	_, err := a.persistAndFold(ctx, state, interrupt, result)
-	return err
+		evs[0].ID, reason)}, state.arc.ID)
+	stored, err := a.persistAndFold(ctx, state, append(evs, result)...)
+	if err != nil {
+		return err
+	}
+	notifyInterruptRaised(ctx, state, stored)
+	return nil
 }
 
 // interruptSpec returns the spec a call's name was configured with.

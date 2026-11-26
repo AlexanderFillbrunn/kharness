@@ -344,7 +344,7 @@ func TestTaskOperationsAreNeverParallel(t *testing.T) {
 		{ToolName: "auditor"},
 		{ToolName: "read_a"},
 	}
-	waves := agent.waves(calls)
+	waves := agent.waves(calls, nil)
 	if len(waves) != 3 {
 		t.Fatalf("waves = %d, want 3 (read, task, read)", len(waves))
 	}
@@ -378,7 +378,7 @@ func TestWavesChunkReadRunsInOrder(t *testing.T) {
 	for _, name := range []string{"read", "read", "read", "write", "read", "read", "read"} {
 		calls = append(calls, &history.ToolCall{ToolName: name})
 	}
-	waves := agent.waves(calls)
+	waves := agent.waves(calls, nil)
 	want := [][]string{{"read", "read"}, {"read"}, {"write"}, {"read", "read"}, {"read"}}
 	if len(waves) != len(want) {
 		t.Fatalf("waves = %d, want %d", len(waves), len(want))

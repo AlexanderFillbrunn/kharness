@@ -22,6 +22,11 @@ type ToolSet interface {
 // nothing.
 func CombineTools(sets ...ToolSet) ToolSet { return combinedTools(sets) }
 
+// toolList presents a plain slice as a ToolSet, for a tool list a hook built.
+type toolList []*mcp.Tool
+
+func (t toolList) All() []*mcp.Tool { return t }
+
 type combinedTools []ToolSet
 
 func (c combinedTools) All() []*mcp.Tool {

@@ -171,7 +171,7 @@ func TestAWorkerAddressesTheTokensItStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: resultArc}, testAgentID); err != nil {
+	if _, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: resultArc}, testAgentID, 0); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 

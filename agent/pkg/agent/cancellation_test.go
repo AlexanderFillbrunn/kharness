@@ -267,7 +267,7 @@ func workerOver(t *testing.T, store *logStore, controller common.TaskController,
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil, options...)
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil, append(options, WithTaskController(tasks))...)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestWorkingACancelledArcLeavesItsTasksToTheHarness(t *testing.T) {
 	store := cancelledTaskArc(t, "changed my mind")
 	controller := &recordingController{}
 
-	worked, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID)
+	worked, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID, 0)
 	if err != nil {
 		t.Fatalf("Work: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestWorkingACancelledArcWithNoTasksDoesNothing(t *testing.T) {
 	}
 	controller := &recordingController{}
 
-	if _, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID); err != nil {
+	if _, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID, 0); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 	if len(controller.stopped) != 0 {
@@ -412,7 +412,7 @@ func TestTheWatcherStopsAToolAlreadyRunning(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := worker.Work(context.Background(), testRef(), testAgentID)
+		_, err := worker.Work(context.Background(), testRef(), testAgentID, 0)
 		done <- err
 	}()
 

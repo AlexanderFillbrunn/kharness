@@ -133,7 +133,7 @@ func TestTranscriptRendersQuestionsForm(t *testing.T) {
 	}
 
 	// A response marks the form answered and keeps the response for display.
-	if err := m.session.answerInterrupt(context.Background(), arc, intID, map[string]any{"answers": map[string]any{"cluster": "prod"}}); err != nil {
+	if _, err := m.session.answerInterrupt(context.Background(), arc, intID, map[string]any{"answers": map[string]any{"cluster": "prod"}}); err != nil {
 		t.Fatalf("answerInterrupt: %v", err)
 	}
 	for _, ev := range storeEvents(t, store) {
@@ -221,7 +221,7 @@ func TestAnswerCommandRefusesUnknownOrAnswered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("interrupt: %v", err)
 	}
-	if err := m.session.answerInterrupt(context.Background(), "arc-1", intID, "production"); err != nil {
+	if _, err := m.session.answerInterrupt(context.Background(), "arc-1", intID, "production"); err != nil {
 		t.Fatalf("answerInterrupt: %v", err)
 	}
 	before := len(storeEvents(t, store))
@@ -439,10 +439,10 @@ func TestAskUserToolInterruptsTheTurn(t *testing.T) {
 	}
 
 	// The answer resumes the arc and the turn finishes.
-	if err := session.answerInterrupt(ctx, arc, intEv.ID, map[string]any{"answers": map[string]any{"cluster": "staging"}}); err != nil {
+	if _, err := session.answerInterrupt(ctx, arc, intEv.ID, map[string]any{"answers": map[string]any{"cluster": "staging"}}); err != nil {
 		t.Fatalf("answerInterrupt: %v", err)
 	}
-	if worked, err := worker.Work(ctx, session.ref(arc), localAgentID); err != nil || !worked {
+	if worked, err := worker.Work(ctx, session.ref(arc), localAgentID, 0); err != nil || !worked {
 		t.Fatalf("Work after the answer: worked=%v err=%v", worked, err)
 	}
 

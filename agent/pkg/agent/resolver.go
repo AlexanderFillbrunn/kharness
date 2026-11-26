@@ -172,9 +172,6 @@ type CompactionSettings struct {
 	// MaxToolResultChars caps one tool result's contribution to a transcript.
 	MaxToolResultChars int `json:"max_tool_result_chars,omitempty"`
 
-	// MaxUserMessageChars rejects an over-long user message outright.
-	MaxUserMessageChars int `json:"max_user_message_chars,omitempty"`
-
 	// ArcThresholdTokens is the arc size that moves the cut to the arc's
 	// live boundary.
 	ArcThresholdTokens int `json:"arc_threshold_tokens,omitempty"`
@@ -369,7 +366,6 @@ func (f *FileResolver) build(settings AgentSettings) (*Agent, error) {
 		// reserve for one more tool result.
 		config.HigherBudget = orDefault(compaction.HigherBudget, config.ContextWindow-ContextWindowReserve)
 		config.MaxToolResultChars = orDefault(compaction.MaxToolResultChars, DefaultMaxToolResultChars)
-		config.MaxUserMessageChars = orDefault(compaction.MaxUserMessageChars, DefaultMaxUserMessageChars)
 		config.ArcThresholdTokens = orDefault(compaction.ArcThresholdTokens, DefaultArcThresholdTokens)
 	}
 

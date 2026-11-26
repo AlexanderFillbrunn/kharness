@@ -139,6 +139,7 @@ func Run(storePath, settingsPath, userID string) error {
 		agent.WithTokenSink(screenTokens{relay: relay}),
 		agent.WithCancelWatcher(cancels),
 		agent.WithCompactionStarter(compactionStart),
+		agent.WithTaskController(runner),
 		agent.WithModes(modes),
 		agent.WithSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
 	if err != nil {
@@ -168,6 +169,9 @@ func Run(storePath, settingsPath, userID string) error {
 		worker:     worker,
 		cancels:    cancels,
 		controller: runner,
+		// No answering-side policy hooks in the harness itself; the session's
+		// hooks field is where a policy layer would plug in.
+		hooks: agent.Hooks{},
 		actor:      users.Actor{UserID: userID, TenantID: "dev"},
 	}
 
@@ -224,10 +228,10 @@ type arcEnqueuer struct {
 	relay  *sender
 }
 
-func (e *arcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, agentID string) error {
+func (e *arcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, agentID string, triggerSeq int) error {
 	go func() {
 		for {
-			worked, err := e.worker.Work(context.Background(), ref, agentID)
+			worked, err := e.worker.Work(context.Background(), ref, agentID, triggerSeq)
 			if err != nil {
 				e.relay.send(arcDoneMsg{err: err})
 				return

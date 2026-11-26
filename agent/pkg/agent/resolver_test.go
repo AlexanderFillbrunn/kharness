@@ -31,7 +31,7 @@ func TestWorkRefusesAnItemNamingNoAgent(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	if _, err := worker.Work(context.Background(), testRef(), ""); err == nil {
+	if _, err := worker.Work(context.Background(), testRef(), "", 0); err == nil {
 		t.Error("a work item naming no agent was accepted")
 	}
 	// The refusal came before the lease, so the arc is free to whoever names
@@ -56,7 +56,7 @@ func TestARunStampsItsEventsWithTheWorkItemsAgent(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	if _, err := worker.Work(context.Background(), testRef(), testAgentID); err != nil {
+	if _, err := worker.Work(context.Background(), testRef(), testAgentID, 0); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 	store.mu.Lock()
@@ -85,7 +85,7 @@ func TestAnUnresolvableAgentFailsTheWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	if _, err := worker.Work(context.Background(), testRef(), testAgentID); err == nil {
+	if _, err := worker.Work(context.Background(), testRef(), testAgentID, 0); err == nil {
 		t.Error("a work item naming an unresolvable agent was accepted")
 	}
 }
@@ -355,9 +355,9 @@ func TestFileResolverResolvesTheCompactionBlock(t *testing.T) {
 	if cfg.MaxToolResultChars != 2000 {
 		t.Errorf("max tool result chars = %d, want the settings' 2000", cfg.MaxToolResultChars)
 	}
-	// The arc threshold and the user-message cap default to disabled (-1).
-	if cfg.MaxUserMessageChars != -1 || cfg.ArcThresholdTokens != -1 {
-		t.Errorf("limits default = %d/%d, want -1 (disabled)", cfg.MaxUserMessageChars, cfg.ArcThresholdTokens)
+	// The arc threshold defaults to disabled (-1).
+	if cfg.ArcThresholdTokens != -1 {
+		t.Errorf("arc threshold default = %d, want -1 (disabled)", cfg.ArcThresholdTokens)
 	}
 	// The compactor is not on the agent anymore; the resolver equips a
 	// compaction worker with a plan instead.

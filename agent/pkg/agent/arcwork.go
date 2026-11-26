@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
@@ -61,6 +62,11 @@ type ArcWorker struct {
 	// and is nil for a worker that leaves the request standing in the log.
 	compactions CompactionStarter
 
+	// tasks is the process's task controller, the way persistor is the
+	// process's log: both are bound to the work item's session when the item
+	// arrives, and handed to the run. Nil for a worker that runs no tasks.
+	tasks common.TaskController
+
 	// modes is how much of the log the worker's runs disclose in their
 	// projections.
 	modes history.Modes
@@ -76,6 +82,14 @@ type ArcWorkerOption func(*ArcWorker)
 // WithTokenSink gives a worker somewhere to stream replies as they arrive.
 func WithTokenSink(tokens TokenSink) ArcWorkerOption {
 	return func(w *ArcWorker) { w.tokens = tokens }
+}
+
+// WithTaskController gives the worker the process's task controller. Each
+// work item's run gets it bound to the item's session (common.InSession) as
+// RunOptions.Controller, the way the persistor is bound — the agent only
+// offers the tasks' metadata.
+func WithTaskController(tasks common.TaskController) ArcWorkerOption {
+	return func(w *ArcWorker) { w.tasks = tasks }
 }
 
 // WithCancelWatcher lets a cancel reach work the run has already started.
@@ -137,7 +151,11 @@ func NewArcWorker(persistor common.EventPersistor, source common.EventSource, re
 // a caller that cannot name one has nothing to hand the worker. The agent is
 // resolved once the arc is held, so a resolver that cannot build it fails a
 // worker that owns the arc rather than one queued behind somebody else.
-func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string) (bool, error) {
+//
+// triggerSeq is the seq of the event that caused the work item, carried on
+// the item by its producer; zero when no single event did. When set, the
+// continuation hook for exactly that event fires before the run.
+func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) (bool, error) {
 	if agentID == "" {
 		return false, errors.New("a work item names no agent")
 	}
@@ -157,9 +175,20 @@ func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string)
 	if err != nil {
 		return false, fmt.Errorf("resolve agent %s for arc %s: %w", agentID, ref, err)
 	}
-	h, snapInfo, err := w.arcHistory(ctx, ref)
+	h, snapInfo, folded, err := w.arcHistory(ctx, ref)
 	if err != nil {
 		return false, err
+	}
+	// The event that caused this item fires its continuation hook — from
+	// the batch when this read carried it, from the fold when a snapshot
+	// already covered it. A trigger a snapshot swallowed without its fold
+	// carrying it gets one full read.
+	if triggerSeq > 0 && !fireTriggerHook(ctx, agent.hooks, h, folded, triggerSeq) {
+		h, snapInfo, folded, err = w.arcHistoryWith(ctx, ref, common.ReadOptions{})
+		if err != nil {
+			return false, err
+		}
+		fireTriggerHook(ctx, agent.hooks, h, folded, triggerSeq)
 	}
 	// The session the work item names is stamped onto everything the run
 	// writes and every task ref it hands out, here where the session is
@@ -174,8 +203,8 @@ func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string)
 			w.notifyCompactionDue(notifyCtx, ref.SessionID, requestID, agentID)
 		},
 	}
-	if agent.tasks != nil {
-		runOpts.Tasks = common.InSession(ref.SessionID, agent.tasks)
+	if w.tasks != nil {
+		runOpts.Controller = common.InSession(ref.SessionID, w.tasks)
 	}
 	runErr := agent.Run(ctx, runOpts)
 	// The save point of a work item: once the run is over, never inside it.
@@ -257,16 +286,23 @@ func (w *ArcWorker) tokenSink(ctx context.Context, ref common.ArcRef) common.Sin
 // snapshot; what is returned alongside is only the snapshot's info, so the
 // save point at the end of the work item can tell how stale it is — the
 // snapshot's fold itself stays here, in the read.
-func (w *ArcWorker) arcHistory(ctx context.Context, ref common.ArcRef) (*history.History, *common.SnapshotInfo, error) {
+func (w *ArcWorker) arcHistory(ctx context.Context, ref common.ArcRef) (*history.History, *common.SnapshotInfo, []*events.Event, error) {
+	return w.arcHistoryWith(ctx, ref, w.snapshots.readOptions())
+}
+
+// arcHistoryWith is the read under the options given: the worker's snapshot
+// policy by default, no snapshots for the one full read a swallowed trigger
+// gets.
+func (w *ArcWorker) arcHistoryWith(ctx context.Context, ref common.ArcRef, opts common.ReadOptions) (*history.History, *common.SnapshotInfo, []*events.Event, error) {
 	// The store partitions by session, so what comes back is this session's;
 	// the fold names no session and does not check.
-	snap, stored, err := w.source.GetEventsForArc(ctx, ref, w.snapshots.readOptions())
+	snap, stored, err := w.source.GetEventsForArc(ctx, ref, opts)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	h, err := common.FoldEvents(snap, stored)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return h, snap.Info(), nil
+	return h, snap.Info(), stored, nil
 }

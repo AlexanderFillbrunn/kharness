@@ -68,6 +68,11 @@ type ToolCall struct {
 	// position it was written at.
 	Seq int
 
+	// MessageID is the assistant message that requested the call, so a
+	// consumer can correlate the call with the message's content without
+	// walking the arc.
+	MessageID string
+
 	// VendorID is the model provider's own identifier for the call, used to
 	// match a result back to the request when replying to the provider.
 	VendorID string
@@ -214,6 +219,23 @@ type AsyncTask struct {
 	// written AsMessage. The completion of such a task is that arc of its own
 	// rather than a note in the origin arc.
 	ResultArc string `json:"result_arc,omitempty"`
+
+	// InResultTrail is how many InResult events the task's result message
+	// carries, or -1 for the whole trail. It is stamped on the invoke event
+	// from the task kind's declaration, so it is log content and resumes with
+	// the rest of the task table. Zero is normalized to -1 at fold.
+	InResultTrail int `json:"in_result_trail,omitempty"`
+
+	// InResultTrailChars caps how many characters the InResult trail in the
+	// task's result message carries; zero or negative means no cap. Like
+	// InResultTrail it is stamped on the invoke event.
+	InResultTrailChars int `json:"in_result_trail_chars,omitempty"`
+
+	// InResultTrailHeader says whether each InResult trail entry in the
+	// task's result message carries a header line with its 1-based index in
+	// the task's trail and its timestamp. Like the caps above it is stamped
+	// on the invoke event.
+	InResultTrailHeader bool `json:"in_result_trail_header,omitempty"`
 
 	// Events is the full transcript of the task: notifications it emitted and
 	// every input interaction it went through.
@@ -371,9 +393,9 @@ type AssistantMessage struct {
 type InterruptStatus string
 
 const (
-	InterruptPending   InterruptStatus = "pending"
-	InterruptApproved  InterruptStatus = "approved"
-	InterruptRejected  InterruptStatus = "rejected"
+	InterruptPending  InterruptStatus = "pending"
+	InterruptApproved InterruptStatus = "approved"
+	InterruptRejected InterruptStatus = "rejected"
 	// InterruptAnswered is an arc-wide interrupt a human answered with
 	// information rather than a verdict on a call.
 	InterruptAnswered  InterruptStatus = "answered"
@@ -488,12 +510,6 @@ type History struct {
 	// the invoke event's place in the origin arc is its correlation.
 	Tasks map[string]*AsyncTask `json:"tasks"`
 
-	// TaskResultTrail is how many InResult task events the result message of
-	// a result-opened arc carries, or -1 for the whole trail. It is set by
-	// whoever builds the read model, from the task kind's declaration with the
-	// agent config's override.
-	TaskResultTrail int `json:"task_result_trail"`
-
 	// LastSeq is the sequence number of the last event applied. Events arrive
 	// in increasing sequence order and may skip numbers, since a history holds
 	// one arc's slice of the log.
@@ -515,9 +531,8 @@ type History struct {
 // log's first event, numbered 0, is accepted.
 func NewHistory() *History {
 	return &History{
-		Tasks:           map[string]*AsyncTask{},
-		TaskResultTrail: -1,
-		LastSeq:         -1,
+		Tasks:   map[string]*AsyncTask{},
+		LastSeq: -1,
 	}
 }
 
@@ -544,8 +559,12 @@ func (h *History) TasksOfArc(arcID string) []*AsyncTask {
 
 // OpeningContent returns what an arc's opening record says: its Content, with
 // the InResult trail of its task folded in where the arc was opened by a
-// task's result. The trail carries the last TaskResultTrail InResult events,
-// or all of them at -1.
+// task's result. The trail carries the task's last InResultTrail InResult
+// events, or all of them at -1, capped further at InResultTrailChars
+// characters where that is positive. Both caps keep the newest entries. Where
+// InResultTrailHeader is set, each entry carries a header line with its
+// 1-based index in the task's whole trail and its timestamp, so the caps do
+// not renumber the surviving entries.
 func (h *History) OpeningContent(arc *Arc) string {
 	if arc.OpenedByTask == "" {
 		return arc.Content
@@ -556,18 +575,48 @@ func (h *History) OpeningContent(arc *Arc) string {
 	}
 
 	var trail []string
+	index := 0
 	for _, event := range task.Events {
 		if event.Type == AsyncTaskEventNotification && event.Visibility.Effective() == events.LLMVisibilityInResult {
-			trail = append(trail, resultText(event.Payload))
+			index++
+			entry := resultText(event.Payload)
+			if task.InResultTrailHeader {
+				entry = fmt.Sprintf("Event %d · %s\n%s", index, formatTime(event.Timestamp), entry)
+			}
+			trail = append(trail, entry)
 		}
 	}
-	if h.TaskResultTrail >= 0 && len(trail) > h.TaskResultTrail {
-		trail = trail[len(trail)-h.TaskResultTrail:]
+	if task.InResultTrail >= 0 && len(trail) > task.InResultTrail {
+		trail = trail[len(trail)-task.InResultTrail:]
+	}
+	if cap := task.InResultTrailChars; cap > 0 {
+		// The character cap drops the oldest entries until the joined trail
+		// fits; a single entry that alone exceeds the cap is truncated to it,
+		// so the trail never vanishes entirely.
+		for len(trail) > 1 && trailChars(trail) > cap {
+			trail = trail[1:]
+		}
+		if len(trail) == 1 {
+			if runes := []rune(trail[0]); len(runes) > cap {
+				trail[0] = string(runes[:cap]) + fmt.Sprintf(
+					"\n… [truncated: the event exceeded the %d-character trail cap; the log holds the whole event]", cap)
+			}
+		}
 	}
 	if len(trail) == 0 {
 		return arc.Content
 	}
 	return arc.Content + "\n" + strings.Join(trail, "\n")
+}
+
+// trailChars is the length of a trail's entries joined with newlines, in
+// characters.
+func trailChars(trail []string) int {
+	n := len(trail) - 1 // the newlines between entries
+	for _, line := range trail {
+		n += len([]rune(line))
+	}
+	return n
 }
 
 // FoldStateFromHistory rebuilds the lookup index for an already-folded
@@ -735,12 +784,13 @@ func (h *History) applyToolCall(ev *events.Event, state *FoldState) error {
 		return errors.New("expected payload type to be ToolCallPayload")
 	}
 	tc := &ToolCall{
-		ID:       ev.ID,
-		Seq:      ev.Seq,
-		VendorID: pl.VendorID,
-		ToolName: pl.ToolName,
-		Args:     pl.Args,
-		Status:   ToolCallStatusPending,
+		ID:        ev.ID,
+		Seq:       ev.Seq,
+		MessageID: pl.MessageID,
+		VendorID:  pl.VendorID,
+		ToolName:  pl.ToolName,
+		Args:      pl.Args,
+		Status:    ToolCallStatusPending,
 	}
 	amsg, ok := state.responses[pl.MessageID]
 	if !ok {
@@ -939,14 +989,23 @@ func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error
 	}
 	_ = arc
 
+	// Zero on the invoke is unset, and folds as the whole trail, matching the
+	// task kind declaration's own default.
+	inResultTrail := pl.InResultTrail
+	if inResultTrail == 0 {
+		inResultTrail = -1
+	}
 	task := &AsyncTask{
-		ID:            ev.ID,
-		Seq:           ev.Seq,
-		CorrelationID: *ev.CorrelationID,
-		TaskName:      pl.TaskName,
-		Status:        AsyncTaskPending,
-		Args:          pl.Args,
-		Events:        make([]AsyncTaskEvent, 0),
+		ID:                  ev.ID,
+		Seq:                 ev.Seq,
+		CorrelationID:       *ev.CorrelationID,
+		TaskName:            pl.TaskName,
+		Status:              AsyncTaskPending,
+		Args:                pl.Args,
+		InResultTrail:       inResultTrail,
+		InResultTrailChars:  pl.InResultTrailChars,
+		InResultTrailHeader: pl.InResultTrailHeader,
+		Events:              make([]AsyncTaskEvent, 0),
 	}
 	if pl.Actor != (users.Actor{}) {
 		actor := pl.Actor

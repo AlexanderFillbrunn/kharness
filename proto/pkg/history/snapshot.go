@@ -48,6 +48,13 @@ func DecodeFold(data []byte) (*History, error) {
 	if h.Tasks == nil {
 		h.Tasks = map[string]*AsyncTask{}
 	}
+	// Folds written before the invoke stamped the trail carry no field and
+	// read zero; normalize to the whole trail, the fold's own default.
+	for _, task := range h.Tasks {
+		if task.InResultTrail == 0 {
+			task.InResultTrail = -1
+		}
+	}
 	if h.LastSeq < -1 {
 		return nil, fmt.Errorf("decoded fold has invalid last seq %d", h.LastSeq)
 	}
@@ -61,10 +68,10 @@ func DecodeFold(data []byte) (*History, error) {
 // sequence order; Update refuses any that are not, so a snapshot and a tail
 // that disagree stop the resume rather than fold a wrong history.
 //
-// TaskResultTrail is session-level configuration rather than log content, so
-// it rides along in the encoding; a caller whose configuration changed since
-// the snapshot was taken sets it again on the result, the same as on a fresh
-// replay.
+// Each task's InResultTrail is log content — stamped on its invoke event —
+// so it rides along in the encoding and resumes with the rest of the task
+// table; folds written before the stamp existed are normalized to -1 at
+// decode.
 func Resume(fold *History, evs []*events.Event) (*History, error) {
 	if fold == nil {
 		return nil, fmt.Errorf("cannot resume from a nil fold")

@@ -1,9 +1,9 @@
 package agent
 
 import (
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"slices"
 	"strings"
 	"testing"
@@ -170,6 +170,38 @@ func TestTheModelIsOfferedToolsAndTasksTogether(t *testing.T) {
 
 // An agent with no tasks offers what it always offered, and every name is an
 // ordinary tool's.
+// The tool surface comes from the agent's task metadata, but a run with no
+// controller cannot start anything: the call is settled as an error and no
+// invoke is written.
+func TestATaskCallOnARunWithoutControllerFails(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "auditor")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "auditor", map[string]any{"scope": "cluster"}),
+		finalReply("cannot"),
+	}}
+	agent, err := NewAgent(nil, NewToolRegistry(), llm, WithTasks(tasks))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want none", len(invokes))
+	}
+	call := h.Arcs[0].Responses[0].ToolCalls[0]
+	if call.Status != history.ToolCallStatusFailed {
+		t.Errorf("call status = %s, want FAILED", call.Status)
+	}
+}
+
 func TestAnAgentWithoutTasksIsUnchanged(t *testing.T) {
 	tools := registryWith(t, "list_pods", nil)
 	agent, err := NewAgent(nil, tools, &scriptedLLM{})
@@ -189,10 +221,10 @@ func TestClassifyNamesTheOperation(t *testing.T) {
 	tasks := taskSourceWith(t, &fakeController{}, "auditor")
 
 	for name, want := range map[string]taskOperation{
-		"auditor":            opStart,
+		"auditor":                       opStart,
 		events.CancelTaskToolName:       opCancel,
 		events.ProvideTaskInputToolName: opProvideInput,
-		"list_pods":          opTool,
+		"list_pods":                     opTool,
 	} {
 		if got := classify(tasks, name); got != want {
 			t.Errorf("classify(%s) = %v, want %v", name, got, want)
@@ -255,7 +287,7 @@ func runCallInArc(t *testing.T, h *history.History, arcID string, tasks TaskSour
 	// names the task ID.
 	runOpts := RunOptions{
 		Persistor: persistor, History: h, ArcID: arcID,
-		Tasks: common.InSession(testSessionID, tasks),
+		Controller: common.InSession(testSessionID, tasks),
 	}
 	if err := agent.Run(context.Background(), runOpts); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -331,6 +363,39 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	// task or stop it later.
 	if text := resultText(t, lastCallIn(t, h, testArcID)); !strings.Contains(text, task.ID) {
 		t.Errorf("result = %q, want it to carry the task id", text)
+	}
+}
+
+// The invoke stamps the kind's trail caps, so the fold carries them on the
+// task record and every reader of the history sees them without the agent.
+func TestTheInvokeCarriesTheKindsTrailCaps(t *testing.T) {
+	controller := &fakeController{}
+	tasks := &fakeTaskSource{
+		kinds: map[string]common.TaskMetadata{"auditor": {
+			Name: "auditor", InResultTrail: 3, InResultTrailChars: 200, InResultTrailHeader: true,
+		}},
+		TaskController: controller,
+	}
+
+	h := userArcHistory(t)
+	persistor := runCallInArc(t, h, testArcID, tasks, LLMToolCall{
+		VendorID: "call_1", ToolName: "auditor", Args: map[string]any{"namespace": "kube-system"}})
+
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("wrote %d invokes, want one", len(invokes))
+	}
+	pl, ok := invokes[0].Payload.(events.AsyncTaskInvokePayload)
+	if !ok {
+		t.Fatalf("invoke payload = %#v, want AsyncTaskInvokePayload", invokes[0].Payload)
+	}
+	if pl.InResultTrail != 3 || pl.InResultTrailChars != 200 || !pl.InResultTrailHeader {
+		t.Errorf("invoke trail settings = %d/%d/%v, want 3/200/true from the kind's declaration", pl.InResultTrail, pl.InResultTrailChars, pl.InResultTrailHeader)
+	}
+	for _, task := range h.Tasks {
+		if task.InResultTrail != 3 || task.InResultTrailChars != 200 || !task.InResultTrailHeader {
+			t.Errorf("task trail settings = %d/%d/%v, want 3/200/true folded from the invoke", task.InResultTrail, task.InResultTrailChars, task.InResultTrailHeader)
+		}
 	}
 }
 

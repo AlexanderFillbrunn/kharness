@@ -55,6 +55,13 @@ type WorkItem struct {
 	// RequestID is the ID of the COMPACTION_REQUESTED event a compaction item
 	// serves. Empty for arc items.
 	RequestID string `json:"request_id,omitempty"`
+
+	// TriggerSeq is the seq of the event that caused this item: the write
+	// that owes the arc a run. The worker fires the continuation hook for
+	// exactly this event, resolved from the log or the fold by seq. Zero for
+	// items no single event caused, like the ones a landed compaction
+	// releases an arc with.
+	TriggerSeq int `json:"trigger_seq,omitempty"`
 }
 
 // Ref returns the arc the item names. It is meaningless for a compaction item.

@@ -12,7 +12,11 @@ import "context"
 // which the arc worker's compaction starter enqueues when a run reports one
 // due — see CompactionEnqueuer.
 type WorkEnqueuer interface {
-	Enqueue(ctx context.Context, ref ArcRef, agentID string) error
+	// Enqueue adds an item for the arc named to the queue. triggerSeq is the
+	// seq of the persisted event that caused the run, carried on the item so
+	// the worker can fire the continuation hook for exactly that event; zero
+	// when no single event caused it.
+	Enqueue(ctx context.Context, ref ArcRef, agentID string, triggerSeq int) error
 }
 
 // CompactionEnqueuer is the sliver of the work queue a compaction starter

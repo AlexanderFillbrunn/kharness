@@ -39,6 +39,11 @@ type session struct {
 	// command writes.
 	controller common.TaskController
 
+	// hooks are the answering-side hooks, consulted before an interrupt
+	// response is written. The harness itself configures none; the field is
+	// the seam a policy layer plugs into.
+	hooks agent.Hooks
+
 	actor users.Actor
 }
 
@@ -65,11 +70,12 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 		Actor:         s.actor,
 		Payload:       events.UserMessagePayload{Content: message, Actor: s.actor},
 	}
-	if _, err := s.persistor.Persist(ctx, opening); err != nil {
+	stored, err := s.persistor.Persist(ctx, opening)
+	if err != nil {
 		return err
 	}
 
-	worked, err := s.worker.Work(ctx, s.ref(arcID), localAgentID)
+	worked, err := s.worker.Work(ctx, s.ref(arcID), localAgentID, stored[0].Seq)
 	if err != nil {
 		return err
 	}
@@ -198,9 +204,42 @@ func (s *session) interrupt(ctx context.Context, arcID, reason string) (string, 
 // ID. The response is whatever the answering side produced — text for a plain
 // answer, structured for a form — and is never validated here. The caller
 // owes the arc a run afterwards, since writing the response without handing
-// the arc back to the worker could strand it.
-func (s *session) answerInterrupt(ctx context.Context, arcID, interruptID string, response any) error {
-	_, err := s.persistor.Persist(ctx, &events.Event{
+// the arc back to the worker could strand it. It returns the seq of the
+// stored response event, to hand that run as its trigger.
+func (s *session) answerInterrupt(ctx context.Context, arcID, interruptID string, response any) (int, error) {
+	// The BeforeInterruptResponse hook decides the answer before it is
+	// written: it may rewrite it, turn it into a rejection on a call-scoped
+	// interrupt, or refuse the write.
+	view := agent.InterruptResponseView{
+		InterruptID: interruptID,
+		ArcID:       arcID,
+		Response:    response,
+		Actor:       s.actor,
+	}
+	if h, err := s.arcHistory(ctx, arcID); err == nil {
+		for _, arc := range h.Arcs {
+			if arc.ID != arcID {
+				continue
+			}
+			for _, in := range arc.Interrupts {
+				if in.ID == interruptID {
+					view.CallID = in.CausationID
+				}
+			}
+			for _, resp := range arc.Responses {
+				for _, call := range resp.ToolCalls {
+					if call.Interrupt != nil && call.Interrupt.ID == interruptID {
+						view.CallID = call.Interrupt.CausationID
+					}
+				}
+			}
+		}
+	}
+	decided, err := agent.DecideInterruptResponse(ctx, s.hooks, view)
+	if err != nil {
+		return 0, err
+	}
+	stored, err := s.persistor.Persist(ctx, &events.Event{
 		SessionID:     s.id,
 		AgentID:       localAgentID,
 		Typ:           events.InterruptResponseEventType,
@@ -208,11 +247,15 @@ func (s *session) answerInterrupt(ctx context.Context, arcID, interruptID string
 		Actor:         s.actor,
 		Payload: events.InterruptResponsePayload{
 			CausationID: interruptID,
-			Response:    response,
+			Response:    decided.Response,
+			IsRejected:  decided.IsRejected,
 			Actor:       s.actor,
 		},
 	})
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return stored[0].Seq, nil
 }
 
 // findInterrupt locates an interrupt by ID anywhere in the session — raised

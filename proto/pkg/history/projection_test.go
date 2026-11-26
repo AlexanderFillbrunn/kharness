@@ -1874,9 +1874,9 @@ func TestInResultEventsAreFoldedIntoTheResultMessage(t *testing.T) {
 		"k(Task auditor with id a1.1 (returned results)\n3 findings\nchecked kube-system\nchecked ingress\nchecked data)", "n{}",
 		"u(thanks)")
 
-	// The last N at N=2.
+	// The last N, carried on the task record at N=2.
 	h := foldEvents(t, log.eventsFor("u2"))
-	h.TaskResultTrail = 2
+	h.Tasks["a1.1"].InResultTrail = 2
 	limited, err := h.Project("u2", DefaultModes())
 	if err != nil {
 		t.Fatalf("Project: %v", err)
@@ -1895,6 +1895,110 @@ func TestInResultEventsAreFoldedIntoTheResultMessage(t *testing.T) {
 	}
 	if !found {
 		t.Error("no result message in the transcript")
+	}
+}
+
+// The character cap on the trail rides on the task record alongside the
+// event cap and keeps the newest entries that fit: the oldest are dropped
+// until the joined trail fits, and a single entry that alone exceeds the cap
+// is truncated to it rather than dropping the whole trail.
+func TestInResultTrailCharCapKeepsTheNewestFittingEntries(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "a1.1", "auditor", nil)
+	log.taskEventInResult("u1", "a1.1", "ir1", "checked kube-system")
+	log.taskEventInResult("u1", "a1.1", "ir2", "checked ingress")
+	log.taskEventInResult("u1", "a1.1", "ir3", "checked data")
+	log.taskResult("u1", "a1.1", "3 findings", events.AsyncTaskOutcomeSuccess)
+	log.user("u2", "thanks")
+
+	resultMessage := func(h *History) string {
+		t.Helper()
+		transcript, err := h.Project("u2", DefaultModes())
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		for _, text := range allTexts(transcript) {
+			if strings.Contains(text, "returned results") {
+				return text
+			}
+		}
+		t.Fatal("no result message in the transcript")
+		return ""
+	}
+
+	// "checked ingress\nchecked data" is 28 characters: the oldest entry is
+	// dropped to fit a 28-character cap.
+	h := foldEvents(t, log.eventsFor("u2"))
+	h.Tasks["a1.1"].InResultTrailChars = len("checked ingress") + 1 + len("checked data")
+	msg := resultMessage(h)
+	if strings.Contains(msg, "checked kube-system") {
+		t.Errorf("the trail carried an entry that did not fit the cap: %q", msg)
+	}
+	if !strings.Contains(msg, "checked ingress") || !strings.Contains(msg, "checked data") {
+		t.Errorf("the trail does not carry the newest fitting entries: %q", msg)
+	}
+
+	// A cap below the newest entry's own length truncates that entry, with a
+	// marker, instead of dropping the trail.
+	h = foldEvents(t, log.eventsFor("u2"))
+	h.Tasks["a1.1"].InResultTrailChars = 5
+	msg = resultMessage(h)
+	if strings.Contains(msg, "checked data") || !strings.Contains(msg, "truncated") {
+		t.Errorf("the oversized entry was not truncated to the cap with a marker: %q", msg)
+	}
+}
+
+// The optional trail header prefixes each InResult entry with its 1-based
+// index in the task's whole trail and its timestamp; the count cap drops
+// older entries without renumbering the survivors.
+func TestInResultTrailHeaderCarriesIndexAndTimestamp(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "a1.1", "auditor", nil)
+	log.taskEventInResult("u1", "a1.1", "ir1", "checked kube-system")
+	log.taskEventInResult("u1", "a1.1", "ir2", "checked ingress")
+	log.taskEventInResult("u1", "a1.1", "ir3", "checked data")
+	log.taskResult("u1", "a1.1", "3 findings", events.AsyncTaskOutcomeSuccess)
+	log.user("u2", "thanks")
+
+	resultMessage := func(h *History) string {
+		t.Helper()
+		transcript, err := h.Project("u2", DefaultModes())
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		for _, text := range allTexts(transcript) {
+			if strings.Contains(text, "returned results") {
+				return text
+			}
+		}
+		t.Fatal("no result message in the transcript")
+		return ""
+	}
+
+	// Off by default: no header lines.
+	h := foldEvents(t, log.eventsFor("u2"))
+	if msg := resultMessage(h); strings.Contains(msg, "#1 ·") {
+		t.Errorf("the trail carried a header with the flag unset: %q", msg)
+	}
+
+	// On: each surviving entry carries its index in the whole trail and its
+	// timestamp. The logger stamps ir2 at seq 4 and ir3 at seq 5, i.e. 4 and 5
+	// seconds after its 2026-09-19 09:00:00 UTC start.
+	h = foldEvents(t, log.eventsFor("u2"))
+	h.Tasks["a1.1"].InResultTrailHeader = true
+	h.Tasks["a1.1"].InResultTrail = 2
+	msg := resultMessage(h)
+	for _, want := range []string{"#2 · 2026-09-19T09:00:04Z\nchecked ingress", "#3 · 2026-09-19T09:00:05Z\nchecked data"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the result message does not contain %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "#1 ·") || strings.Contains(msg, "checked kube-system") {
+		t.Errorf("the count cap did not drop the oldest entry, or renumbered the survivors: %q", msg)
 	}
 }
 

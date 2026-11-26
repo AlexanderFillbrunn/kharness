@@ -279,13 +279,14 @@ func (m model) submitAnswers() (tea.Model, tea.Cmd) {
 
 	response := map[string]any{"answers": f.answers}
 	arcID, interruptID := f.block.arc, f.block.interrupt
-	if err := m.session.answerInterrupt(context.Background(), arcID, interruptID, response); err != nil {
+	triggerSeq, err := m.session.answerInterrupt(context.Background(), arcID, interruptID, response)
+	if err != nil {
 		m.transcript.fail(err)
 	} else {
 		// The write is durable, so the block is answered now — not when the
 		// response event comes back around the program.
 		m.transcript.markAnswered(interruptID, response)
-		resumeArc(m, arcID)
+		resumeArc(m, arcID, triggerSeq)
 	}
 	m.leaveAnswering()
 	return m.refresh(), nil
@@ -449,12 +450,13 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// it, not a new arc: the interrupted arc is what the words are for,
 		// and a new arc would strand it.
 		if pending := m.transcript.pendingInterrupt(); pending != nil {
-			if err := m.session.answerInterrupt(context.Background(), pending.arc, pending.interrupt, message); err != nil {
+			triggerSeq, err := m.session.answerInterrupt(context.Background(), pending.arc, pending.interrupt, message)
+			if err != nil {
 				m.transcript.fail(err)
 				return m.refresh(), nil
 			}
 			m.transcript.markAnswered(pending.interrupt, message)
-			resumeArc(m, pending.arc)
+			resumeArc(m, pending.arc, triggerSeq)
 			return m.refresh(), nil
 		}
 		return m.start(message)

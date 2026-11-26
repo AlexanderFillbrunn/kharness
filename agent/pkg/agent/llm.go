@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // RawToken is a token emitted from the LLM during streaming.
@@ -133,4 +135,150 @@ type LLM interface {
 	// ContextOverflowError at all.
 	StreamResponse(ctx context.Context, transcript *history.ModelTranscript, opts *LLMOptions, tokSink common.Sink[RawToken]) (*LLMResponse, error)
 	Response(ctx context.Context, transcript *history.ModelTranscript, opts *LLMOptions) (*LLMResponse, error)
+}
+
+// llmStep projects the arc so far and calls the LLM with the transcript, then
+// records what it replied.
+func (a Agent) llmStep(ctx context.Context, state *agentState) error {
+	// The message is named before the model is called rather than when the
+	// reply is written, because the text being streamed has to say which
+	// message will record it.
+	messageID := common.NewEventID()
+
+	// The projection happens here rather than inside the model client: it is
+	// a pure function of the log, and the LLM only encodes what it is handed.
+	// The arc being worked is the projection's target.
+	transcript, err := state.history.Project(state.arc.ID, state.modes, a.config.projectionOptions())
+	if err != nil {
+		return fmt.Errorf("project arc %s: %w", state.arc.ID, err)
+	}
+	tools := CombineTools(a.tools, taskToolSet{a.tasks}, interruptToolSet{a.interruptSpecs}).All()
+	req := AssistantRequest{
+		ArcID:           state.arc.ID,
+		Modes:           state.modes,
+		SystemPrompt:    a.systemPrompt,
+		Transcript:      transcript,
+		Tools:           tools,
+		EstimatedTokens: state.history.EstimateArc(state.arc),
+	}
+	// BeforeAssistant may reshape the request — its changes reach only this
+	// call, never the log — or replace the model entirely with a reply of its
+	// own, which is recorded like any other.
+	req, tools, shortCircuit, herr := applyBeforeAssistant(ctx, req, tools, state)
+	if herr != nil {
+		return herr
+	}
+	if shortCircuit != nil {
+		return a.recordResponse(ctx, shortCircuit, messageID, state)
+	}
+	response, err := a.llm.StreamResponse(ctx, req.Transcript, &LLMOptions{
+		SystemPrompt: req.SystemPrompt,
+		Tools:        toolList(tools),
+	}, state.tokenSink(messageID))
+	// A rejection the provider recognises as over budget is recovered, not
+	// recorded as a failure: the non-fatal Error, the request and the
+	// suspension say what happened. A partial reply that came with it — a
+	// length stop — is recorded first, so the log holds what the model said.
+	var overflow *ContextOverflowError
+	if errors.As(err, &overflow) {
+		if response != nil {
+			if rerr := a.recordResponse(ctx, response, messageID, state); rerr != nil {
+				return rerr
+			}
+		}
+		return a.recoverOverflow(ctx, state, overflow.Error())
+	}
+	if err != nil {
+		return fmt.Errorf("error calling LLM: %w", err)
+	}
+	if err := a.recordResponse(ctx, response, messageID, state); err != nil {
+		return err
+	}
+	return nil
+}
+
+// tokenSink labels the model's text with the message that will record it. A
+// run nobody is watching discards it, and the watcher's error is dropped
+// rather than returned: a screen cannot fail a run.
+//
+// The provider is handed a plain common.Sink[string], so no LLM implementation learns
+// what an arc or a message is.
+func (s *agentState) tokenSink(messageID string) common.Sink[RawToken] {
+	return common.SinkFromFunc(func(tok RawToken) error {
+		if s.tokens != nil {
+			_ = s.tokens.Consume(Token{MessageID: messageID, Content: tok.Content, Seq: tok.Seq})
+		}
+		return nil
+	})
+}
+
+// recordResponse writes a reply to the log: the message and one event per call
+// it requested, in one write.
+//
+// They go together because a log holding the message alone reads as an answer
+// the model never gave, and the next run closes the arc on it. The message ID
+// is the one llmStep minted before the call rather than one read back, since
+// the calls have to name it before any of them is written and the tokens had
+// to name it before that.
+func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, messageID string, state *agentState) error {
+	reply := AssistantReply{
+		ArcID:     state.arc.ID,
+		MessageID: messageID,
+		VendorID:  response.VendorID,
+		ModelID:   response.ModelID,
+		Content:   response.Content,
+		Reasoning: response.Reasoning,
+		Usage:     response.Usage,
+		ToolCalls: response.ToolCalls,
+	}
+	// AfterAssistant sees the reply before anything is persisted, so its
+	// changes are what lands in the log — which may deviate from what was
+	// streamed to watchers. Abort vetoes the reply and fails the run.
+	reply, err := applyAfterAssistant(ctx, reply, state)
+	if err != nil {
+		return err
+	}
+
+	batch := make([]*events.Event, 0, len(reply.ToolCalls)+1)
+	batch = append(batch, &events.Event{
+		ID:            messageID,
+		Typ:           events.AssistantMessageEventType,
+		CorrelationID: &state.arc.ID,
+		Payload: events.AssistantMessagePayload{
+			VendorID:  reply.VendorID,
+			ModelID:   reply.ModelID,
+			Content:   reply.Content,
+			Reasoning: reply.Reasoning,
+			Usage:     recordedUsage(reply.Usage),
+		},
+	})
+	for _, call := range reply.ToolCalls {
+		batch = append(batch, &events.Event{
+			Typ:           events.ToolCallEventType,
+			CorrelationID: &state.arc.ID,
+			Payload: events.ToolCallPayload{
+				MessageID: messageID,
+				VendorID:  call.VendorID,
+				ToolName:  call.ToolName,
+				Args:      call.Args,
+			},
+		})
+	}
+
+	_, err = a.persistAndFold(ctx, state, batch...)
+	return err
+}
+
+// recordedUsage carries a reply's cost into the record of it. Nothing is
+// written where the provider reported nothing, so a zero in the log is a
+// measured zero.
+func recordedUsage(usage *TokenUsage) *events.TokenUsage {
+	if usage == nil {
+		return nil
+	}
+	return &events.TokenUsage{
+		Input:       usage.Input,
+		CachedInput: usage.CachedInput,
+		Output:      usage.Output,
+	}
 }

@@ -148,6 +148,18 @@ type TaskMetadata struct {
 	// carries, or -1 for the whole trail.
 	InResultTrail int `json:"in_result_trail,omitempty"`
 
+	// InResultTrailChars caps how many characters the InResult trail in the
+	// task's result message may carry, counting the entries joined with
+	// newlines. The oldest entries are dropped first; a single entry that
+	// alone exceeds the cap is truncated to it. Zero or negative means no
+	// cap.
+	InResultTrailChars int `json:"in_result_trail_chars,omitempty"`
+
+	// InResultTrailHeader says whether each InResult trail entry in the
+	// task's result message carries a header line with the entry's 1-based
+	// index in the task's trail and its timestamp.
+	InResultTrailHeader bool `json:"in_result_trail_header,omitempty"`
+
 	// EventLimit caps the arc-opening (AsMessage) notification events per
 	// task. Zero means no limit. Past the limit a notification is demoted per
 	// OverflowPolicy instead of opening an arc.
@@ -187,6 +199,18 @@ func WithInResultTrail(n int) TaskOption {
 	return func(m *TaskMetadata) { m.InResultTrail = n }
 }
 
+// WithInResultTrailChars caps how many characters the InResult trail in the
+// task's result message carries; zero or negative means no cap.
+func WithInResultTrailChars(n int) TaskOption {
+	return func(m *TaskMetadata) { m.InResultTrailChars = n }
+}
+
+// WithInResultTrailHeader gives each InResult trail entry in the task's
+// result message a header line with its index in the trail and its timestamp.
+func WithInResultTrailHeader() TaskOption {
+	return func(m *TaskMetadata) { m.InResultTrailHeader = true }
+}
+
 // WithEventLimit caps the arc-opening notification events per task of this
 // kind; zero means no limit.
 func WithEventLimit(n int) TaskOption {
@@ -199,8 +223,21 @@ func WithOverflowPolicy(policy OverflowPolicy) TaskOption {
 	return func(m *TaskMetadata) { m.OverflowPolicy = policy }
 }
 
-// MetadataSource answers task metadata by name. It is the sliver of the
-// registry the ingress needs: the producer side resolves reports against the
+// TaskSet is the metadata of a set of task kinds — the task-side ToolSet:
+// what a caller offers from it, in a fixed order and by name. Running a task
+// is not here; that is the TaskController's, and a TaskSource is the two
+// together.
+type TaskSet interface {
+	// All returns every kind in the set, in a fixed order, so that two
+	// callers built from the same set offer the same kinds in the same order.
+	All() []TaskMetadata
+
+	// Get returns one kind by name.
+	Get(name string) (TaskMetadata, bool)
+}
+
+// MetadataSource answers task metadata by name. It is the sliver of a TaskSet
+// the ingress needs: the producer side resolves reports against the
 // declarations and never starts anything.
 type MetadataSource interface {
 	Get(name string) (TaskMetadata, bool)
@@ -262,4 +299,20 @@ func (r *TaskRegistry) Names() []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// All returns every registered kind's metadata, in the fixed order Names
+// gives, so a registry is a TaskSet as it stands.
+func (r *TaskRegistry) All() []TaskMetadata {
+	if r == nil {
+		return nil
+	}
+	names := r.Names()
+	kinds := make([]TaskMetadata, 0, len(names))
+	for _, name := range names {
+		if meta, ok := r.tasks[name]; ok {
+			kinds = append(kinds, meta)
+		}
+	}
+	return kinds
 }

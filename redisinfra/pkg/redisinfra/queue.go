@@ -55,6 +55,11 @@ type WorkItem struct {
 	// RequestID is the ID of the COMPACTION_REQUESTED event a compaction
 	// item serves. Empty for arc items.
 	RequestID string `json:"request_id,omitempty"`
+
+	// TriggerSeq is the seq of the event that caused the item, carried on
+	// the payload so a retried item still names the same trigger. The wire
+	// names match common.WorkItem, so both shapes read one stream.
+	TriggerSeq int `json:"trigger_seq,omitempty"`
 }
 
 // ref names the arc the item wants a run of. It is meaningless for a
@@ -71,7 +76,7 @@ func (i WorkItem) isCompaction() bool { return i.Kind == common.WorkItemKindComp
 // worker without depending on how one is built, and so that a test can run
 // the queue against a worker that is not an agent.
 type ArcRunner interface {
-	Work(ctx context.Context, ref common.ArcRef, agentID string) (worked bool, err error)
+	Work(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) (worked bool, err error)
 }
 
 // CompactionRunner is the shape of CompactionWorker.Work, which the consumer
@@ -89,8 +94,9 @@ type CompactionRunner interface {
 type WorkQueue interface {
 	// Enqueue adds an item for the arc named to the queue. It is the sliver of
 	// the queue the framework's report path needs, so pkg/agent can hand over
-	// an arc it opened without importing this package.
-	Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error
+	// an arc it opened without importing this package. triggerSeq is the seq
+	// of the persisted event that caused the run, carried on the item.
+	Enqueue(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) error
 	// EnqueueCompaction adds an item for the compaction request named, served
 	// by the compaction worker rather than the arc worker.
 	EnqueueCompaction(ctx context.Context, sessionID, requestID, agentID string) error
@@ -230,11 +236,11 @@ var _ WorkQueue = (*RedisWorkQueue)(nil)
 // could never be worked: ArcWorker.Work refuses an empty agent id, and an
 // item enqueued anyway would fail on every consumer until it exhausted its
 // attempts and arrived in the dead stream saying nothing beyond that.
-func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref common.ArcRef, agentID string) error {
+func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref common.ArcRef, agentID string, triggerSeq int) error {
 	if agentID == "" {
 		return fmt.Errorf("a work item for arc %s names no agent", ref)
 	}
-	item := WorkItem{SessionID: ref.SessionID, ArcID: ref.ArcID, AgentID: agentID}
+	item := WorkItem{SessionID: ref.SessionID, ArcID: ref.ArcID, AgentID: agentID, TriggerSeq: triggerSeq}
 	if err := q.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: q.stream,
 		Values: map[string]any{"payload": string(mustMarshal(item))},
@@ -438,7 +444,7 @@ func (q *RedisWorkQueue) work(ctx context.Context, arcs ArcRunner, compactions C
 		return
 	}
 	q.workItem(ctx, msg, item, func() (bool, error) {
-		return arcs.Work(ctx, item.ref(), item.AgentID)
+		return arcs.Work(ctx, item.ref(), item.AgentID, item.TriggerSeq)
 	})
 }
 

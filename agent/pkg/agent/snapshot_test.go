@@ -67,7 +67,7 @@ func TestArcWorkerSavesASnapshotAtTheEndOfAWorkItem(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	if worked, err := worker.Work(context.Background(), testRef(), testAgentID); err != nil || !worked {
+	if worked, err := worker.Work(context.Background(), testRef(), testAgentID, 0); err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}
 
@@ -114,7 +114,7 @@ func TestArcWorkerWithoutThePolicyNeverTouchesSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
-	if worked, err := worker.Work(context.Background(), testRef(), testAgentID); err != nil || !worked {
+	if worked, err := worker.Work(context.Background(), testRef(), testAgentID, 0); err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}
 	if source.snapshotReads != 0 {
@@ -142,7 +142,7 @@ func TestSnapshotPolicyMinEventsThrottlesSaving(t *testing.T) {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	if worked, err := worker.Work(context.Background(), testRef(), testAgentID); err != nil || !worked {
+	if worked, err := worker.Work(context.Background(), testRef(), testAgentID, 0); err != nil || !worked {
 		t.Fatalf("Work = %v, %v", worked, err)
 	}
 	if store.snap == nil {
@@ -152,7 +152,7 @@ func TestSnapshotPolicyMinEventsThrottlesSaving(t *testing.T) {
 
 	// A second arc, worked by the same worker.
 	arcHistoryWith(t, store, userEvent(10, "arc-2", "second question"))
-	if worked, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: "arc-2"}, testAgentID); err != nil || !worked {
+	if worked, err := worker.Work(context.Background(), common.ArcRef{SessionID: testSessionID, ArcID: "arc-2"}, testAgentID, 0); err != nil || !worked {
 		t.Fatalf("Work arc-2 = %v, %v", worked, err)
 	}
 	if store.snap.Seq() != firstSeq {
