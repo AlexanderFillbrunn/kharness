@@ -1981,7 +1981,7 @@ func TestInResultTrailHeaderCarriesIndexAndTimestamp(t *testing.T) {
 
 	// Off by default: no header lines.
 	h := foldEvents(t, log.eventsFor("u2"))
-	if msg := resultMessage(h); strings.Contains(msg, "#1 ·") {
+	if msg := resultMessage(h); strings.Contains(msg, "Event 1 ·") {
 		t.Errorf("the trail carried a header with the flag unset: %q", msg)
 	}
 
@@ -1992,12 +1992,12 @@ func TestInResultTrailHeaderCarriesIndexAndTimestamp(t *testing.T) {
 	h.Tasks["a1.1"].InResultTrailHeader = true
 	h.Tasks["a1.1"].InResultTrail = 2
 	msg := resultMessage(h)
-	for _, want := range []string{"#2 · 2026-09-19T09:00:04Z\nchecked ingress", "#3 · 2026-09-19T09:00:05Z\nchecked data"} {
+	for _, want := range []string{"Event 2 · 2026-09-19T09:00:04Z\nchecked ingress", "Event 3 · 2026-09-19T09:00:05Z\nchecked data"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the result message does not contain %q:\n%s", want, msg)
 		}
 	}
-	if strings.Contains(msg, "#1 ·") || strings.Contains(msg, "checked kube-system") {
+	if strings.Contains(msg, "Event 1 ·") || strings.Contains(msg, "checked kube-system") {
 		t.Errorf("the count cap did not drop the oldest entry, or renumbered the survivors: %q", msg)
 	}
 }
