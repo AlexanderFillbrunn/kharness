@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
@@ -235,20 +234,21 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	// A previous run handed this launch off and stopped before recording it.
 	// The launch is not retried: whether the task took hold is not known.
 	if task.DispatchedSeq != nil {
-		return a.recordLaunch(ctx, task, nil, errors.New(
+		return a.recordLaunch(ctx, task, nil,
 			"a run stopped before it recorded the launch of this task; whether it took hold is not "+
-				"known, so check before starting it again"), state)
+				"known, so check before starting it again", state)
 	}
 
 	d := a.decideLaunch(ctx, task, state)
 	switch {
 	case d.hookErr != nil:
-		return a.recordLaunch(ctx, task, nil, fmt.Errorf("the task policy failed, so the task was not started: %w", d.hookErr), state)
+		return a.recordLaunch(ctx, task, nil,
+			fmt.Sprintf("the task policy failed, so the task was not started: %v", d.hookErr), state)
 	case d.block != nil:
 		state.logger.WarnContext(ctx, "task start blocked by policy", "task", task.ID, "kind", task.TaskName)
 		// The guardrail event names the task by its invoke ID; the
 		// launch-result event written beside it settles the task.
-		return a.recordLaunch(ctx, task, nil, errors.New(d.block.Message), state,
+		return a.recordLaunch(ctx, task, nil, d.block.Message, state,
 			&events.Event{
 				Typ:           events.GuardrailBlockedEventType,
 				CorrelationID: &state.arc.ID,
@@ -257,14 +257,16 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	case d.ask != nil:
 		return a.raiseTaskAsk(ctx, task, d.ask, state)
 	case d.answer != nil:
-		return a.recordLaunch(ctx, task, nil, fmt.Errorf(
-			"the task start was answered by policy without the task starting: %v", d.answer.Result), state)
+		// An answer settles the request without the task starting: nothing
+		// ran, so the launch result says so and no task result exists.
+		return a.recordLaunch(ctx, task, nil,
+			fmt.Sprintf("the task start was answered by policy without the task starting: %v", d.answer.Result), state)
 	}
 
 	controller := a.controllerFor(state)
 	if controller == nil {
-		return a.recordLaunch(ctx, task, nil, errors.New(
-			"this run has no task controller bound to it, so the task could not be started"), state)
+		return a.recordLaunch(ctx, task, nil,
+			"this run has no task controller bound to it, so the task could not be started", state)
 	}
 	if _, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.ToolDispatchedEventType,
@@ -288,15 +290,21 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	if err != nil {
 		state.logger.WarnContext(ctx, "task launch failed", "task", task.ID, "kind", task.TaskName, "error", err)
 	}
-	return a.recordLaunch(ctx, task, launch, err, state)
+	reason := ""
+	if err != nil {
+		reason = err.Error()
+	}
+	return a.recordLaunch(ctx, task, launch, reason, state)
 }
 
 // recordLaunch writes the one launch-result event a launch produces: the launch
 // verdict, the external reference the runner assigned (the task's own ID
-// where the runner assigned none), and the runner's raw response. A failed
-// launch settles the task — ASYNC_TASK_RESULT is reserved for work that
-// actually started — and no result event is written for it.
-func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, cause error, state *agentState, extra ...*events.Event) error {
+// where the runner assigned none), and the runner's raw response. An empty
+// reason means the launch succeeded; any other reason — a failure, a policy
+// block, a policy answer, a handed-off launch never recorded — means it did
+// not, and settles the task: ASYNC_TASK_RESULT is reserved for work that
+// actually started, and no result event is written for a launch that did not.
+func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, reason string, state *agentState, extra ...*events.Event) error {
 	externalRef := task.ID
 	var response any
 	if launch != nil {
@@ -305,29 +313,25 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 		}
 		response = launch.Response
 	}
-	errText := ""
-	if cause != nil {
-		errText = cause.Error()
-	}
 	launchResult := &events.Event{
 		Typ:           events.AsyncTaskLaunchResultEventType,
 		CorrelationID: &task.ID,
 		Payload: events.AsyncTaskLaunchResultPayload{
 			CausationID:   task.ID,
 			ExternalRef:   externalRef,
-			Launched:      cause == nil,
+			Launched:      reason == "",
 			Launch:        response,
-			Error:         errText,
+			Error:         reason,
 			LLMVisibility: events.LLMVisibilityNone,
 		},
 	}
 	if _, err := a.persistAndFold(ctx, state, append(extra, launchResult)...); err != nil {
 		return err
 	}
-	if cause == nil {
+	if reason == "" {
 		state.logger.InfoContext(ctx, "task launched", "task", task.ID, "kind", task.TaskName, "external_ref", externalRef)
 	} else {
-		state.logger.InfoContext(ctx, "task launch recorded as failed", "task", task.ID, "kind", task.TaskName, "error", errText)
+		state.logger.InfoContext(ctx, "task not launched", "task", task.ID, "kind", task.TaskName, "reason", reason)
 	}
 	return nil
 }
@@ -393,12 +397,12 @@ func (a Agent) raiseTaskAsk(ctx context.Context, task *history.AsyncTask, ask *A
 	if hook := state.hooks.BeforeInterrupt; hook != nil {
 		c, err := hook(ctx, req)
 		if err != nil {
-			return a.recordLaunch(ctx, task, nil, fmt.Errorf("the interrupt policy failed, so the task was not started: %w", err), state)
+			return a.recordLaunch(ctx, task, nil, fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err), state)
 		}
 		changes = c
 	}
 	if changes.Block != nil {
-		return a.recordLaunch(ctx, task, nil, errors.New(changes.Block.Message), state)
+		return a.recordLaunch(ctx, task, nil, changes.Block.Message, state)
 	}
 	reason, context := req.Reason, req.Context
 	if changes.Reason != nil {

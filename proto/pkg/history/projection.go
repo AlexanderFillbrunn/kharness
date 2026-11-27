@@ -1038,13 +1038,17 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 		}
 	}
 	if !task.Launched {
+		content := fmt.Sprintf("task %s could not be started: %s.", task.TaskName, resultText(task.Result))
+		if task.DispatchedSeq != nil {
+			// The launch reached a runner, so whether it took hold before the
+			// failure is genuinely not known.
+			content += " Whether it took hold before the failure is not known, so check before starting it again."
+		}
 		return ModelToolMessage{
 			ToolCallID: task.ID,
 			Outcome:    ModelToolOutcomeFailed,
 			IsError:    true,
-			Content: fmt.Sprintf(
-				"task %s could not be started: %s. Whether it took hold before the failure is not known, "+
-					"so check before starting it again.", task.TaskName, resultText(task.Result)),
+			Content:    content,
 		}
 	}
 	return ModelToolMessage{

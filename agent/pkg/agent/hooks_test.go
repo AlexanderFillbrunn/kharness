@@ -1547,3 +1547,46 @@ func TestTriggerSwallowedByAnotherArcsSnapshotGetsAFullRead(t *testing.T) {
 }
 
 // DecideInterruptResponse is what an answering side calls before persisting:
+
+// A BeforeTaskStart Answer settles the request without the task starting: the
+// launch result records Launched=false with the answer as the reason, and no
+// task result is written, since nothing ran.
+func TestBeforeTaskStartAnswerDoesNotStart(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", map[string]any{"env": "prod"}),
+		finalReply("answered"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{HookEffects: HookEffects{Answer: &Answer{Result: "not needed"}}}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || !strings.Contains(meta.Error, "answered by policy") || !strings.Contains(meta.Error, "not needed") {
+		t.Errorf("launch result = %+v, want Launched=false with the policy answer as the reason", meta)
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: nothing ran", len(results))
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED settled by the launch result", task.Status)
+	}
+}

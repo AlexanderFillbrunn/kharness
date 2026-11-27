@@ -367,7 +367,9 @@ type AsyncTaskLaunchResultPayload struct {
 	// and for outbound calls that need the runner's own IDs. Nil on failure.
 	Launch any `json:"launch,omitempty"`
 
-	// Error is the launch failure's reason. Empty when Launched is true.
+	// Error is why the task was not launched — a runner failure, a policy
+	// block, a policy answer, a launch never recorded. Empty when Launched
+	// is true.
 	Error string `json:"error,omitempty"`
 
 	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
