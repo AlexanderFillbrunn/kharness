@@ -37,14 +37,16 @@ tool list is fixed at build.
 
 A2A → tasks
 --------------------
-`WithA2A` reads the agent card (`{BaseURL}/.well-known/agent-card.json`, then
-`/.well-known/agent.json`) and maps each skill to a task kind: the skill's ID
-(or name) as the kind name, its description, and its `inputSchema` when the
-card carries one. The kinds are offered to the model exactly like local task
-kinds — one tool per kind plus the cancel/answer tools.
+`WithA2A` resolves the agent card (`{BaseURL}/.well-known/agent-card.json`,
+then `/.well-known/agent.json`) with the official
+[a2a-go](https://github.com/a2aproject/a2a-go) SDK and maps each skill to a
+task kind: the skill's ID (or name) as the kind name, its description. The
+kinds are offered to the model exactly like local task kinds — one tool per
+kind plus the cancel/answer tools.
 
-The controller speaks minimal JSON-RPC (`message/send`, `tasks/cancel`). A
-start sends the args as a text message with **our task ID as the A2A
+The controller speaks A2A through the SDK's client (JSON-RPC transport,
+`message/send`, `tasks/cancel`). A start sends the args as a message part —
+a data part when the args are a JSON object — with **our task ID as the A2A
 `taskId` and our session as the `contextId`**, so the server's callbacks echo
 them back. If the server answers with a task of its own ID, that ID becomes
 the launch's `ExternalRef`, recorded in the `ASYNC_TASK_LAUNCH_RESULT` event

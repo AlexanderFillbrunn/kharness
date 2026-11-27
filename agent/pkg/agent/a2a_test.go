@@ -50,12 +50,18 @@ func newA2AFixture(t *testing.T) *a2aFixture {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var req rpcRequest
+		var req struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Method  string          `json:"method"`
+			Params  json.RawMessage `json:"params"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		params, _ := req.Params.(map[string]any)
+		var params map[string]any
+		_ = json.Unmarshal(req.Params, &params)
 		f.mu.Lock()
 		f.calls = append(f.calls, req.Method)
 		if req.Method == "message/send" {
@@ -69,9 +75,15 @@ func newA2AFixture(t *testing.T) *a2aFixture {
 		var result any
 		switch req.Method {
 		case "message/send":
-			result = map[string]any{"task": map[string]any{"id": "srv-task-1", "status": map[string]any{"state": "submitted"}}}
+			result = map[string]any{
+				"kind": "task", "id": "srv-task-1", "contextId": "ctx-1",
+				"status": map[string]any{"state": "submitted"},
+			}
 		case "tasks/cancel":
-			result = map[string]any{"id": "srv-task-1", "status": map[string]any{"state": "canceled"}}
+			result = map[string]any{
+				"kind": "task", "id": "srv-task-1",
+				"status": map[string]any{"state": "canceled"},
+			}
 		default:
 			result = map[string]any{}
 		}

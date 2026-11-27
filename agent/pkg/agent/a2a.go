@@ -1,27 +1,30 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/a2aproject/a2a-go/a2a"
+	"github.com/a2aproject/a2a-go/a2aclient"
+	"github.com/a2aproject/a2a-go/a2aclient/agentcard"
+
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 )
 
 // This file bridges one A2A agent into an agent's task surface: WithA2A
-// fetches the remote agent's card, maps its skills to task kinds, and folds a
-// TaskSource over a minimal JSON-RPC client into the agent's tasks, so the
-// existing name-collision checks in NewAgent apply to remote kinds unchanged
-// and the run's controller (or the agent's own task source, when the run has
-// none — see controllerFor) starts them like any other task.
+// resolves the remote agent's card with the official a2a-go SDK, maps its
+// skills to task kinds, and folds a TaskSource over an a2aclient into the
+// agent's tasks, so the existing name-collision checks in NewAgent apply to
+// remote kinds unchanged and the run's controller (or the agent's own task
+// source, when the run has none — see controllerFor) starts them like any
+// other task.
 //
 // The launch carries our task ID as the A2A taskId and our session as the
 // contextId, so the server echoes them back; when the server answers with a
@@ -39,9 +42,9 @@ type A2AConfig struct {
 	// Name identifies the remote agent in errors and log lines.
 	Name string
 
-	// BaseURL is the agent's base URL; the card is read from
+	// BaseURL is the agent's base URL; the card is resolved from
 	// {BaseURL}/.well-known/agent-card.json (then /.well-known/agent.json),
-	// and its url field, when present, is the JSON-RPC endpoint.
+	// and the card's url field is the JSON-RPC endpoint.
 	BaseURL string
 
 	// HTTPClient is the client for the card fetch and every RPC. When nil,
@@ -55,7 +58,7 @@ type A2AConfig struct {
 	// Headers are sent on every request, after AuthToken.
 	Headers map[string]string
 
-	// Timeout bounds the card fetch and each RPC. Zero means
+	// Timeout bounds the card fetch and each call. Zero means
 	// DefaultA2ATimeout.
 	Timeout time.Duration
 
@@ -68,7 +71,7 @@ type A2AConfig struct {
 const DefaultA2ATimeout = 10 * time.Second
 
 // WithA2A gives an agent the skills of one remote A2A agent as task kinds. The
-// card is fetched while the agent is built, so an unreachable agent or a name
+// card is resolved while the agent is built, so an unreachable agent or a name
 // collision with a local tool or task fails NewAgent rather than a run.
 func WithA2A(cfg A2AConfig) AgentOption {
 	return func(a *Agent) error {
@@ -81,25 +84,8 @@ func WithA2A(cfg A2AConfig) AgentOption {
 	}
 }
 
-// agentCard is the subset of the A2A agent card the bridge reads.
-type agentCard struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	URL         string     `json:"url"`
-	Version     string     `json:"version"`
-	Skills      []a2aSkill `json:"skills"`
-}
-
-type a2aSkill struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	// InputSchema is not part of the core card; honored when the card
-	// carries one, as the task kind's input schema.
-	InputSchema any `json:"inputSchema,omitempty"`
-}
-
-// connectA2A fetches the card and builds the task source over it.
+// connectA2A resolves the card and builds the task source over an a2a-go
+// client speaking JSON-RPC.
 func connectA2A(cfg A2AConfig) (TaskSource, error) {
 	if cfg.Name == "" {
 		return nil, errors.New("an A2A agent needs a name")
@@ -125,13 +111,21 @@ func connectA2A(cfg A2AConfig) (TaskSource, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	card, err := fetchAgentCard(ctx, httpClient, strings.TrimRight(cfg.BaseURL, "/"))
+	baseURL := strings.TrimRight(cfg.BaseURL, "/")
+	resolver := agentcard.NewResolver(httpClient)
+	card, err := resolver.Resolve(ctx, baseURL)
+	if err != nil {
+		// Older agents publish the card at agent.json.
+		card, err = resolver.Resolve(ctx, baseURL, agentcard.WithPath("/.well-known/agent.json"))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetch card of A2A agent %s: %w", cfg.Name, err)
 	}
-	endpoint := card.URL
-	if endpoint == "" {
-		endpoint = strings.TrimRight(cfg.BaseURL, "/")
+	if card.URL == "" {
+		card.URL = baseURL
+	}
+	if card.PreferredTransport == "" {
+		card.PreferredTransport = a2a.TransportProtocolJSONRPC
 	}
 
 	registry := common.NewTaskRegistry()
@@ -150,120 +144,29 @@ func connectA2A(cfg A2AConfig) (TaskSource, error) {
 		if err := registry.RegisterTask(common.TaskMetadata{
 			Name:        name,
 			Description: description,
-			InputSchema: skill.InputSchema,
 		}); err != nil {
 			return nil, fmt.Errorf("A2A agent %s: %w", cfg.Name, err)
 		}
 	}
-	logger.InfoContext(ctx, "A2A agent card loaded", "skills", len(card.Skills), "endpoint", endpoint)
 
-	client := &a2aClient{endpoint: endpoint, http: httpClient, timeout: timeout, logger: logger}
-	return &a2aSource{set: registry, controller: &a2aController{client: client, byTask: map[string]string{}}}, nil
-}
-
-// fetchAgentCard reads the card from the well-known locations.
-func fetchAgentCard(ctx context.Context, client *http.Client, baseURL string) (*agentCard, error) {
-	var lastErr error
-	for _, path := range []string{"/.well-known/agent-card.json", "/.well-known/agent.json"} {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
-			lastErr = fmt.Errorf("%s: not found", path)
-			continue
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s: %s", path, resp.Status)
-		}
-		var card agentCard
-		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&card); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		return &card, nil
-	}
-	return nil, lastErr
-}
-
-// a2aClient is a minimal A2A JSON-RPC client: POST, one response, no
-// streaming. Enough for message/send, tasks/cancel and tasks/get.
-type a2aClient struct {
-	endpoint string
-	http     *http.Client
-	timeout  time.Duration
-	logger   *slog.Logger
-
-	mu     sync.Mutex
-	nextID int64
-}
-
-type rpcRequest struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      int64  `json:"id"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-}
-
-type rpcResponse struct {
-	Result json.RawMessage `json:"result"`
-	Error  *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// call runs one JSON-RPC method and decodes the result into out.
-func (c *a2aClient) call(ctx context.Context, method string, params any, out any) error {
-	c.mu.Lock()
-	c.nextID++
-	id := c.nextID
-	c.mu.Unlock()
-
-	body, err := json.Marshal(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
+	client, err := a2aclient.NewFromCard(ctx, card,
+		a2aclient.WithConfig(a2aclient.Config{
+			PreferredTransports: []a2a.TransportProtocol{a2a.TransportProtocolJSONRPC},
+		}),
+		a2aclient.WithJSONRPCTransport(httpClient),
+	)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("connect to A2A agent %s at %s: %w", cfg.Name, card.URL, err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	logger.InfoContext(ctx, "A2A agent card loaded", "skills", len(card.Skills), "endpoint", card.URL)
 
-	c.logger.DebugContext(ctx, "A2A call", "method", method, "id", id)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", method, resp.Status)
-	}
-	var rpcResp rpcResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<22)).Decode(&rpcResp); err != nil {
-		return fmt.Errorf("%s: decode response: %w", method, err)
-	}
-	if rpcResp.Error != nil {
-		return fmt.Errorf("%s: rpc error %d: %s", method, rpcResp.Error.Code, rpcResp.Error.Message)
-	}
-	if out != nil && len(rpcResp.Result) > 0 {
-		if err := json.Unmarshal(rpcResp.Result, out); err != nil {
-			return fmt.Errorf("%s: decode result: %w", method, err)
-		}
-	}
-	return nil
+	return &a2aSource{set: registry, controller: &a2aController{
+		client: client, timeout: timeout, logger: logger, byTask: map[string]string{},
+	}}, nil
 }
 
 // a2aSource is one remote A2A agent as a TaskSource: the card's skills as the
-// kind metadata, and a controller that speaks to the agent over JSON-RPC.
+// kind metadata, and a controller that speaks A2A through the SDK's client.
 type a2aSource struct {
 	set        *common.TaskRegistry
 	controller *a2aController
@@ -286,7 +189,9 @@ func (s *a2aSource) ProvideInput(ctx context.Context, ref common.TaskRef, reques
 // ID — the log's launch-result event carries it too, but the controller reads
 // its own table, since it is the process that started the task.
 type a2aController struct {
-	client *a2aClient
+	client  *a2aclient.Client
+	timeout time.Duration
+	logger  *slog.Logger
 
 	mu     sync.Mutex
 	byTask map[string]string
@@ -297,54 +202,54 @@ type a2aController struct {
 // The task object in the reply, when there is one, carries the server's own
 // ID, which becomes the launch's ExternalRef.
 func (c *a2aController) Start(ctx context.Context, name string, ref common.TaskRef, args any) (*common.TaskLaunch, error) {
-	argsJSON, err := json.Marshal(args)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	res, err := c.client.SendMessage(ctx, &a2a.MessageSendParams{Message: &a2a.Message{
+		ID:        a2a.NewMessageID(),
+		Role:      a2a.MessageRoleUser,
+		TaskID:    a2a.TaskID(ref.ID),
+		ContextID: ref.SessionID,
+		Parts:     a2aParts(args),
+	}})
 	if err != nil {
-		return nil, fmt.Errorf("marshal args for task %s: %w", name, err)
-	}
-	params := map[string]any{
-		"message": map[string]any{
-			"role":      "user",
-			"messageId": common.NewEventID(),
-			"taskId":    ref.ID,
-			"contextId": ref.SessionID,
-			"parts":     []any{map[string]any{"kind": "text", "text": string(argsJSON)}},
-		},
-	}
-	var result map[string]any
-	if err := c.client.call(ctx, "message/send", params, &result); err != nil {
 		return nil, err
 	}
 	externalRef := ref.ID
-	if task, ok := result["task"].(map[string]any); ok {
-		if id, ok := task["id"].(string); ok && id != "" {
-			externalRef = id
-		}
+	if task, ok := res.(*a2a.Task); ok && task.ID != "" {
+		externalRef = string(task.ID)
 	}
 	c.mu.Lock()
 	c.byTask[ref.ID] = externalRef
 	c.mu.Unlock()
-	return &common.TaskLaunch{ExternalRef: externalRef, Response: result}, nil
+	c.logger.DebugContext(ctx, "A2A task started", "task", ref.ID, "external_ref", externalRef)
+	return &common.TaskLaunch{ExternalRef: externalRef, Response: res}, nil
 }
 
 // Cancel asks the remote task to stop, addressed by the vendor task ID.
 func (c *a2aController) Cancel(ctx context.Context, ref common.TaskRef, reason string) error {
-	return c.client.call(ctx, "tasks/cancel", map[string]any{"id": c.vendorID(ref)}, nil)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	_, err := c.client.CancelTask(ctx, &a2a.TaskIDParams{
+		ID:       a2a.TaskID(c.vendorID(ref)),
+		Metadata: map[string]any{"reason": reason},
+	})
+	return err
 }
 
 // ProvideInput answers a waiting remote task with a message on the same task,
 // the request ID carried in the message metadata for the server to correlate.
 func (c *a2aController) ProvideInput(ctx context.Context, ref common.TaskRef, requestID, input string) error {
-	params := map[string]any{
-		"message": map[string]any{
-			"role":      "user",
-			"messageId": common.NewEventID(),
-			"taskId":    c.vendorID(ref),
-			"contextId": ref.SessionID,
-			"metadata":  map[string]any{"request_id": requestID},
-			"parts":     []any{map[string]any{"kind": "text", "text": input}},
-		},
-	}
-	return c.client.call(ctx, "message/send", params, nil)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	_, err := c.client.SendMessage(ctx, &a2a.MessageSendParams{Message: &a2a.Message{
+		ID:        a2a.NewMessageID(),
+		Role:      a2a.MessageRoleUser,
+		TaskID:    a2a.TaskID(c.vendorID(ref)),
+		ContextID: ref.SessionID,
+		Metadata:  map[string]any{"request_id": requestID},
+		Parts:     a2a.ContentParts{a2a.TextPart{Text: input}},
+	}})
+	return err
 }
 
 // vendorID is the ID the remote server knows the task by: the one it assigned,
@@ -356,4 +261,17 @@ func (c *a2aController) vendorID(ref common.TaskRef) string {
 		return id
 	}
 	return ref.ID
+}
+
+// a2aParts carries the task's args as message parts: a data part when the
+// args are a JSON object, a text part holding the JSON otherwise.
+func a2aParts(args any) a2a.ContentParts {
+	if m, ok := args.(map[string]any); ok {
+		return a2a.ContentParts{a2a.DataPart{Data: m}}
+	}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		raw = []byte(fmt.Sprintf("%v", args))
+	}
+	return a2a.ContentParts{a2a.TextPart{Text: string(raw)}}
 }
