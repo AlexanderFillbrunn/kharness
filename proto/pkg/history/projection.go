@@ -1059,6 +1059,23 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 				Content:    content,
 			}
 		}
+		if task.LaunchResultText != "" {
+			// A launch result without a task result: the hook told the model
+			// what the start call returned, and the task itself settled with
+			// an empty result. An error launch result fails the call, a plain
+			// one does not.
+			isErr := resultText(task.Result) != ""
+			outcome := ModelToolOutcomeSuccess
+			if isErr {
+				outcome = ModelToolOutcomeFailed
+			}
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    outcome,
+				IsError:    isErr,
+				Content:    task.LaunchResultText,
+			}
+		}
 		if task.DispatchedSeq != nil {
 			// The launch reached a runner: the error is real and whether it
 			// took hold before the failure is genuinely not known.

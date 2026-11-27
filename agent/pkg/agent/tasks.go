@@ -259,36 +259,42 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 			})
 	case d.ask != nil:
 		return a.raiseTaskAsk(ctx, task, d.ask, state)
-	case d.result != nil:
-		// A Result fakes the task's outcome without the task starting:
-		// nothing ran, so the launch result says so — and the result is
-		// recorded verbatim as the task's ASYNC_TASK_RESULT in the same
-		// batch, the way a tool call's Answer becomes its tool result.
-		// LaunchResult controls what the launch itself reports: with IsError
-		// its text becomes the launch's Error, otherwise it is the launch
-		// answer the model is told the start call returned.
+	case d.result != nil || d.launchResult != nil:
+		// Policy settled the start without the task running. A Result fakes
+		// the task's outcome and is written verbatim as its ASYNC_TASK_RESULT
+		// in the same batch, the way a tool call's Answer becomes its tool
+		// result — unless the launch result is an error: then the error alone
+		// settles the task and no result is written at all. LaunchResult
+		// controls what the launch itself reports: with IsError its text
+		// becomes the launch's Error, otherwise it is the launch answer the
+		// model is told the start call returned. Set alone, the task result
+		// stays empty.
 		out := launchOutcome{result: d.result}
 		if d.launchResult != nil {
 			out.launchResultText = d.launchResult.Text
 			if d.launchResult.IsError {
 				out.reason = d.launchResult.Text
+				out.result = nil
 			}
 		}
-		outcome := events.AsyncTaskOutcomeSuccess
-		if d.result.IsError {
-			outcome = events.AsyncTaskOutcomeFailed
-		}
-		return a.recordLaunch(ctx, task, nil, out, state,
-			&events.Event{
+		var extras []*events.Event
+		if out.result != nil {
+			outcome := events.AsyncTaskOutcomeSuccess
+			if out.result.IsError {
+				outcome = events.AsyncTaskOutcomeFailed
+			}
+			extras = append(extras, &events.Event{
 				Typ:           events.AsyncTaskResultEventType,
 				CorrelationID: &task.ID,
 				Payload: events.AsyncTaskResultPayload{
 					CausationID:   task.ID,
-					Result:        d.result.Result,
+					Result:        out.result.Result,
 					Outcome:       outcome,
 					LLMVisibility: events.LLMVisibilityNone,
 				},
 			})
+		}
+		return a.recordLaunch(ctx, task, nil, out, state, extras...)
 	}
 
 	controller := a.controllerFor(state)
@@ -375,6 +381,8 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 		state.logger.InfoContext(ctx, "task launched", "task", task.ID, "kind", task.TaskName, "external_ref", externalRef)
 	case out.result != nil && out.reason == "":
 		state.logger.InfoContext(ctx, "task start answered by policy, not launched", "task", task.ID, "kind", task.TaskName)
+	case out.launchResultText != "":
+		state.logger.InfoContext(ctx, "task start launch result set by policy, not launched", "task", task.ID, "kind", task.TaskName)
 	default:
 		state.logger.InfoContext(ctx, "task not launched", "task", task.ID, "kind", task.TaskName, "reason", out.reason)
 	}

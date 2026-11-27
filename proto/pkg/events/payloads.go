@@ -380,12 +380,15 @@ type AsyncTaskLaunchResultPayload struct {
 	// Launched=false — nothing ran — and the answer is also written verbatim
 	// as the task's ASYNC_TASK_RESULT. The projection renders it as the start
 	// call's result, the way a tool call's Answer becomes its tool result.
+	// Nil when the hook reported the launch itself as an error (Error carries
+	// the text and no RESULT event is written) or set the launch result alone.
 	Result *TaskResult `json:"result,omitempty"`
 
-	// LaunchResult overrides what the model is told the launch call returned.
-	// Empty means the default: a note that the start was intercepted, with the
-	// Result alongside. Set it to hide from the model that the task never
-	// launched.
+	// LaunchResult is what the model is told the launch call returned when a
+	// policy hook settled the start without the task running. Empty means the
+	// default: a note that the start was intercepted, with the Result
+	// alongside. Set it to hide from the model that the task never launched,
+	// or without a Result to leave the task result empty.
 	LaunchResult string `json:"launch_result,omitempty"`
 
 	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`

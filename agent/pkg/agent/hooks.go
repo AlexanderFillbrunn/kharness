@@ -766,11 +766,13 @@ type ToolCallEffects struct {
 }
 
 // TaskStartEffects are the effects of BeforeTaskStart, in task vocabulary:
-// exactly one of Run, Block, Ask, Result is set. A Result fakes the task's
-// outcome — it is written verbatim as the task's ASYNC_TASK_RESULT — and
-// LaunchResult controls what the launch itself reports: with IsError the text
-// becomes the launch's Error, otherwise it is the launch answer the model is
-// told the start call returned. Args overrides the args the task runs with.
+// exactly one of Run, Block, Ask, Result, or a LaunchResult alone. A Result
+// fakes the task's outcome — it is written verbatim as the task's
+// ASYNC_TASK_RESULT — and LaunchResult controls what the launch itself
+// reports: with IsError the text becomes the launch's Error and no task
+// result is written at all, otherwise it is the launch answer the model is
+// told the start call returned. A LaunchResult set alone leaves the task
+// result empty. Args overrides the args the task runs with.
 type TaskStartEffects struct {
 	Run          bool
 	Block        *BlockRequest
@@ -780,7 +782,9 @@ type TaskStartEffects struct {
 	Args         *TaskArgs
 }
 
-// validate requires exactly one of run/block/ask/result.
+// validate requires exactly one of run/block/ask/result, or a launchResult
+// alone. A launchResult may ride with a result to override the text the model
+// is told, never with run/block/ask.
 func (e TaskStartEffects) validate() error {
 	n := 0
 	for _, set := range []bool{e.Run, e.Block != nil, e.Ask != nil, e.Result != nil} {
@@ -788,15 +792,19 @@ func (e TaskStartEffects) validate() error {
 			n++
 		}
 	}
-	if n != 1 {
-		return fmt.Errorf("a task start result sets %d of run/block/ask/result, want exactly one", n)
+	if e.LaunchResult != nil && (e.Run || e.Block != nil || e.Ask != nil) {
+		return fmt.Errorf("a task start effect sets launchResult together with run/block/ask; launchResult only applies when the start is settled without the task running")
+	}
+	if n > 1 || (n == 0 && e.LaunchResult == nil) {
+		return fmt.Errorf("a task start effect sets %d of run/block/ask/result, want exactly one, or a launchResult alone", n)
 	}
 	return nil
 }
 
 // LaunchResult is what a BeforeTaskStart hook reports for the launch itself
-// when it intercepted the start: Text becomes the launch's Error when IsError,
-// and the launch answer the model is told otherwise.
+// when it settled the start without the task running: Text becomes the
+// launch's Error when IsError, and the launch answer the model is told
+// otherwise. Set alone, no task result is written.
 type LaunchResult struct {
 	Text    string
 	IsError bool

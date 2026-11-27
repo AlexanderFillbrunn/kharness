@@ -1662,10 +1662,53 @@ func TestBeforeTaskStartLaunchResultOverridesModelMessage(t *testing.T) {
 	}
 }
 
-// A LaunchResult marked IsError becomes the launch's Error: the launch is an
-// error, the task settles failed, and the model sees a failed result with that
-// text.
+// A LaunchResult marked IsError becomes the launch's Error, and no task
+// result is written at all: the error alone settles the task as failed, and
+// the model sees a failed start call with that text.
 func TestBeforeTaskStartLaunchResultIsError(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				LaunchResult: &LaunchResult{Text: "quota exceeded", IsError: true},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.Error != "quota exceeded" || meta.Result != nil || meta.LaunchResult != "quota exceeded" {
+		t.Errorf("launch result = %+v, want Launched=false, Error=%q, no Result, LaunchResult=%q", meta, "quota exceeded", "quota exceeded")
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: an error launch result writes no task result", len(results))
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED settled by the launch error", task.Status)
+	}
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Content != "quota exceeded" || result.Outcome != history.ModelToolOutcomeFailed || !result.IsError {
+		t.Errorf("projected result = %+v, want the error text as a failed result", result)
+	}
+}
+
+// Even with a Result set, an IsError launch result suppresses the task result:
+// the launch error alone settles the task.
+func TestBeforeTaskStartLaunchResultIsErrorSuppressesResult(t *testing.T) {
 	controller := &fakeController{}
 	tasks := taskSourceWith(t, controller, "deploy_task")
 	llm := &scriptedLLM{replies: []*LLMResponse{
@@ -1688,23 +1731,60 @@ func TestBeforeTaskStartLaunchResultIsError(t *testing.T) {
 	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(controller.started) != 0 {
-		t.Errorf("started tasks = %v, want none", controller.started)
-	}
 	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
-	if meta.Launched || meta.Error != "quota exceeded" || meta.Result == nil {
-		t.Errorf("launch result = %+v, want Launched=false, Error=%q from the IsError launch result", meta, "quota exceeded")
+	if meta.Error != "quota exceeded" || meta.Result != nil {
+		t.Errorf("launch result = %+v, want Error=%q and no Result: the IsError launch result wins", meta, "quota exceeded")
 	}
-	results := persistedOfType(persistor, events.AsyncTaskResultEventType)
-	if len(results) != 1 || results[0].Payload.(events.AsyncTaskResultPayload).Outcome != events.AsyncTaskOutcomeFailed {
-		t.Errorf("task results = %v, want one FAILED result", results)
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none", len(results))
 	}
 	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
 		t.Errorf("task status = %s, want FAILED", task.Status)
 	}
-	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
-	if result.Content != "quota exceeded" || result.Outcome != history.ModelToolOutcomeFailed || !result.IsError {
-		t.Errorf("projected result = %+v, want the error text as a failed result", result)
+}
+
+// A LaunchResult set alone reports the launch without faking a task outcome:
+// no ASYNC_TASK_RESULT is written and the task settles with an empty result,
+// while the model is told exactly the launch result text.
+func TestBeforeTaskStartLaunchResultAloneLeavesEmptyResult(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				LaunchResult: &LaunchResult{Text: "already deployed"},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.Error != "" || meta.Result != nil || meta.LaunchResult != "already deployed" {
+		t.Errorf("launch result = %+v, want Launched=false, Error empty, no Result, LaunchResult=%q", meta, "already deployed")
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: no result was faked", len(results))
+	}
+	task := h.TasksInOrder()[0]
+	if task.Status != history.AsyncTaskFailed || task.Result != "" {
+		t.Errorf("task = status %s result %v, want FAILED with an empty result", task.Status, task.Result)
+	}
+	result := projectedTaskResult(t, h, testArcID, task.ID)
+	if result.Content != "already deployed" || result.Outcome != history.ModelToolOutcomeSuccess || result.IsError {
+		t.Errorf("projected result = %+v, want the launch result text as a successful result", result)
 	}
 }
 
