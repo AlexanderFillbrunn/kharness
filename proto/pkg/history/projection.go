@@ -1097,16 +1097,23 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 			Content:    "the task start was refused by policy",
 		}
 	}
+	content := fmt.Sprintf(
+		"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
+			"Anything it says reaches you as a turn of its own, a question included, so there is "+
+			"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
+			"it yourself with %s, or put the question to the user first and then answer with %s "+
+			"once you have their reply; stop it with %s. All take that id.",
+		task.TaskName, task.ID, events.ProvideTaskInputToolName, events.ProvideTaskInputToolName, events.CancelTaskToolName)
+	if task.Response != nil {
+		// The runner's launch response is the start call's result: it carries
+		// whatever the runner assigned — an A2A server's task and context ids,
+		// which the model passes back to continue the conversation.
+		content += " Launch response: " + resultText(task.Response)
+	}
 	return ModelToolMessage{
 		ToolCallID: task.ID,
 		Outcome:    ModelToolOutcomeSuccess,
-		Content: fmt.Sprintf(
-			"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
-				"Anything it says reaches you as a turn of its own, a question included, so there is "+
-				"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
-				"it yourself with %s, or put the question to the user first and then answer with %s "+
-				"once you have their reply; stop it with %s. All take that id.",
-			task.TaskName, task.ID, events.ProvideTaskInputToolName, events.ProvideTaskInputToolName, events.CancelTaskToolName),
+		Content:    content,
 	}
 }
 

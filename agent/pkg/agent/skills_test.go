@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // fakeSkillSet is a SkillSet of canned skills, with a Load that reports the

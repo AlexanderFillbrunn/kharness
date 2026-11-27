@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/users"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -43,12 +43,12 @@ func (f *fakeArcEnqueuer) Enqueue(_ context.Context, ref common.ArcRef, _ string
 // can cross them with short text.
 func compactionConfig() *AgentConfig {
 	return &AgentConfig{
-		Compaction:          true,
-		LowerBudget:         100,
-		HigherBudget:        150,
-		MaxToolResultChars:  1000,
-		ArcThresholdTokens:  10000,
-		ContextWindow:       32000,
+		Compaction:         true,
+		LowerBudget:        100,
+		HigherBudget:       150,
+		MaxToolResultChars: 1000,
+		ArcThresholdTokens: 10000,
+		ContextWindow:      32000,
 	}
 }
 
@@ -384,7 +384,6 @@ func TestAdmissionSuspendsOverHigherBudget(t *testing.T) {
 		t.Errorf("the suspension names request %s, want %s", payload.CausationID, request.ID)
 	}
 }
-
 
 // AC-7: a run that crosses the higher budget between rounds suspends onto the
 // request its own earlier round triggered and writes no second one.

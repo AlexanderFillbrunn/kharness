@@ -156,8 +156,22 @@ func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...Agent
 
 	// The model picks by name and the agent routes by name, so one name
 	// registered twice is a call that reaches whichever is checked first.
+	// The check spans the combined providers: a bridged MCP tool colliding
+	// with a local one fails the build here, not at call time.
+	toolNames := map[string]bool{}
+	for _, tool := range agent.tools.All() {
+		if toolNames[tool.Name] {
+			return nil, fmt.Errorf("%s is registered as a tool twice, by two sources", tool.Name)
+		}
+		toolNames[tool.Name] = true
+	}
 	if agent.tasks != nil {
+		seen := map[string]bool{}
 		for _, meta := range agent.tasks.All() {
+			if seen[meta.Name] {
+				return nil, fmt.Errorf("%s is offered by two task sources", meta.Name)
+			}
+			seen[meta.Name] = true
 			if _, taken := agent.tools.Get(meta.Name); taken {
 				return nil, fmt.Errorf("%s is registered as both a tool and a task", meta.Name)
 			}

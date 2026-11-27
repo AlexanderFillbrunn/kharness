@@ -1,10 +1,10 @@
 package agent
 
 import (
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"encoding/json"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"io"
 	"net/http"
 	"net/http/httptest"

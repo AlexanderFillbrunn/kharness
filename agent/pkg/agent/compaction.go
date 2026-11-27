@@ -8,8 +8,8 @@ import (
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // This file holds compaction in the agent: the loop's budget checks and the

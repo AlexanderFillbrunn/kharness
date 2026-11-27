@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 
-	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
+	"fillbrunn.ai/kube-agent/proto/pkg/history"
 )
 
 // RawToken is a token emitted from the LLM during streaming.
 type RawToken struct {
 	Content string
-	Seq int
+	Seq     int
 }
 
 // LLMOptions holds information for an LLM to control how new prompts are handled.
@@ -31,9 +31,9 @@ type LLMOptions struct {
 type LLMError struct {
 	// Status is the HTTP status the error arrived with, or 200 where the
 	// provider sent an error object inside an otherwise successful stream.
-	Status int
-	Type   string
-	Code   string
+	Status  int
+	Type    string
+	Code    string
 	Message string
 }
 

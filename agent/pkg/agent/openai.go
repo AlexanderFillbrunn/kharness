@@ -1,12 +1,12 @@
 package agent
 
 import (
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
 	"io"
 	"net/http"
@@ -438,10 +438,10 @@ func readStream(body io.Reader, tokSink common.Sink[RawToken]) (*openAICompletio
 	var order []int
 
 	tokCounter := 0
-	sink := common.SinkFromFunc(func (s string) error {
+	sink := common.SinkFromFunc(func(s string) error {
 		tokSink.Consume(RawToken{
 			Content: s,
-			Seq: tokCounter,
+			Seq:     tokCounter,
 		})
 		tokCounter += 1
 		return nil

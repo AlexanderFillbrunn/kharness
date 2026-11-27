@@ -213,8 +213,8 @@ func TestPerEventRoutingFallbackAndDisabled(t *testing.T) {
 	w, err := NewWebhooks(WebhookConfig{
 		DeliveryConfig: fastDelivery(global.URL),
 		Events: map[WebhookEvent]DeliveryConfig{
-			EventToolCallBefore:   {URL: guard.URL},
-			EventAssistantBefore:  {Disabled: true},
+			EventToolCallBefore:  {URL: guard.URL},
+			EventAssistantBefore: {Disabled: true},
 		},
 		AllowInsecure: true,
 	})

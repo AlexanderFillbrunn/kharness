@@ -2063,6 +2063,33 @@ func TestTaskStartProjectsAsCallAndResult(t *testing.T) {
 	}
 }
 
+// The synthesized start result carries the runner's launch response, so a
+// reference the runner assigned — an A2A server's context id — reaches the
+// model, which passes it back to continue the conversation.
+func TestLaunchedTaskStartResultCarriesLaunchResponse(t *testing.T) {
+	log := newLogger()
+	log.user("arc-1", "book a flight")
+	log.assistant("arc-1", "m1", "starting")
+	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
+		TaskName: "booker", Args: map[string]any{"args": map[string]any{"to": "Paris"}}, MessageID: "m1", Actor: testActor})
+	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
+		CausationID: "task-1", ExternalRef: "srv-9", Launched: true,
+		Response:      map[string]any{"id": "srv-9", "contextId": "ctx-1"},
+		LLMVisibility: events.LLMVisibilityNone})
+	log.assistant("arc-1", "m2", "done")
+
+	transcript := project(t, log, "arc-1", DefaultModes())
+	for _, m := range transcript.Messages {
+		if tm, ok := m.(ModelToolMessage); ok && tm.ToolCallID == "task-1" {
+			if tm.Outcome != ModelToolOutcomeSuccess || !strings.Contains(tm.Content, "ctx-1") {
+				t.Errorf("start result = %+v, want success carrying the launch response's context id", tm)
+			}
+			return
+		}
+	}
+	t.Fatal("no synthesized result for the task start")
+}
+
 // A launch recorded as failed projects as the call's error result. The
 // ASYNC_TASK_RESULT event is for work that started; a failed launch is settled
 // by its launch-result event and writes none.
