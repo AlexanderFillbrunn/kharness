@@ -372,7 +372,19 @@ type AsyncTaskLaunchResultPayload struct {
 	// is true.
 	Error string `json:"error,omitempty"`
 
+	// Answer is the policy hook's answer when it settled the start without
+	// the task running. The log still records Launched=false — nothing ran —
+	// and the projection renders the answer as the start call's result, the
+	// way a tool call's Answer becomes its tool result.
+	Answer *TaskAnswer `json:"answer,omitempty"`
+
 	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
+}
+
+// TaskAnswer is a policy hook's answer to a call, as recorded in the log.
+type TaskAnswer struct {
+	Result  any  `json:"result"`
+	IsError bool `json:"is_error,omitempty"`
 }
 
 func (AsyncTaskLaunchResultPayload) EventType() EventType {

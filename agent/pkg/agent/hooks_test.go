@@ -1549,8 +1549,9 @@ func TestTriggerSwallowedByAnotherArcsSnapshotGetsAFullRead(t *testing.T) {
 // DecideInterruptResponse is what an answering side calls before persisting:
 
 // A BeforeTaskStart Answer settles the request without the task starting: the
-// launch result records Launched=false with the answer as the reason, and no
-// task result is written, since nothing ran.
+// launch result records Launched=false, no task result is written since nothing
+// ran, and the projection renders the hook's answer as the start call's
+// result — the way a tool call's Answer becomes its tool result.
 func TestBeforeTaskStartAnswerDoesNotStart(t *testing.T) {
 	controller := &fakeController{}
 	tasks := taskSourceWith(t, controller, "deploy_task")
@@ -1580,13 +1581,21 @@ func TestBeforeTaskStartAnswerDoesNotStart(t *testing.T) {
 		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
 	}
 	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
-	if meta.Launched || !strings.Contains(meta.Error, "answered by policy") || !strings.Contains(meta.Error, "not needed") {
+	if meta.Launched || !strings.Contains(meta.Error, "answered by policy") {
 		t.Errorf("launch result = %+v, want Launched=false with the policy answer as the reason", meta)
+	}
+	if meta.Answer == nil || meta.Answer.Result != "not needed" {
+		t.Errorf("launch result answer = %+v, want the hook's answer carried for the projection", meta.Answer)
 	}
 	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
 		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: nothing ran", len(results))
 	}
 	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
 		t.Errorf("task status = %s, want FAILED settled by the launch result", task.Status)
+	}
+	// The model sees the answer as the start call's result, not as an error.
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Content != "not needed" || result.Outcome != history.ModelToolOutcomeSuccess || result.IsError {
+		t.Errorf("projected result = %+v, want the answer as a success result", result)
 	}
 }

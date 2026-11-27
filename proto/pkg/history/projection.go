@@ -1038,6 +1038,21 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 		}
 	}
 	if !task.Launched {
+		// A policy answer settled the start without the task running: the log
+		// says so, and the model gets the answer as the call's result, the way
+		// a tool call's Answer becomes its tool result.
+		if task.Answer != nil {
+			outcome := ModelToolOutcomeSuccess
+			if task.Answer.IsError {
+				outcome = ModelToolOutcomeFailed
+			}
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    outcome,
+				IsError:    task.Answer.IsError,
+				Content:    resultText(task.Answer.Result),
+			}
+		}
 		content := fmt.Sprintf("task %s could not be started: %s.", task.TaskName, resultText(task.Result))
 		if task.DispatchedSeq != nil {
 			// The launch reached a runner, so whether it took hold before the

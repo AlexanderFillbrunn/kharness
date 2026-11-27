@@ -236,19 +236,19 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	if task.DispatchedSeq != nil {
 		return a.recordLaunch(ctx, task, nil,
 			"a run stopped before it recorded the launch of this task; whether it took hold is not "+
-				"known, so check before starting it again", state)
+				"known, so check before starting it again", nil, state)
 	}
 
 	d := a.decideLaunch(ctx, task, state)
 	switch {
 	case d.hookErr != nil:
 		return a.recordLaunch(ctx, task, nil,
-			fmt.Sprintf("the task policy failed, so the task was not started: %v", d.hookErr), state)
+			fmt.Sprintf("the task policy failed, so the task was not started: %v", d.hookErr), nil, state)
 	case d.block != nil:
 		state.logger.WarnContext(ctx, "task start blocked by policy", "task", task.ID, "kind", task.TaskName)
 		// The guardrail event names the task by its invoke ID; the
 		// launch-result event written beside it settles the task.
-		return a.recordLaunch(ctx, task, nil, d.block.Message, state,
+		return a.recordLaunch(ctx, task, nil, d.block.Message, nil, state,
 			&events.Event{
 				Typ:           events.GuardrailBlockedEventType,
 				CorrelationID: &state.arc.ID,
@@ -258,15 +258,18 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 		return a.raiseTaskAsk(ctx, task, d.ask, state)
 	case d.answer != nil:
 		// An answer settles the request without the task starting: nothing
-		// ran, so the launch result says so and no task result exists.
+		// ran, so the launch result says so and no task result exists. The
+		// answer itself rides the launch result and the projection renders
+		// it as the start call's result, as for a tool call.
 		return a.recordLaunch(ctx, task, nil,
-			fmt.Sprintf("the task start was answered by policy without the task starting: %v", d.answer.Result), state)
+			"the task start was answered by policy without the task starting",
+			&events.TaskAnswer{Result: d.answer.Result, IsError: d.answer.IsError}, state)
 	}
 
 	controller := a.controllerFor(state)
 	if controller == nil {
 		return a.recordLaunch(ctx, task, nil,
-			"this run has no task controller bound to it, so the task could not be started", state)
+			"this run has no task controller bound to it, so the task could not be started", nil, state)
 	}
 	if _, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.ToolDispatchedEventType,
@@ -294,7 +297,7 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	if err != nil {
 		reason = err.Error()
 	}
-	return a.recordLaunch(ctx, task, launch, reason, state)
+	return a.recordLaunch(ctx, task, launch, reason, nil, state)
 }
 
 // recordLaunch writes the one launch-result event a launch produces: the launch
@@ -304,7 +307,7 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 // block, a policy answer, a handed-off launch never recorded — means it did
 // not, and settles the task: ASYNC_TASK_RESULT is reserved for work that
 // actually started, and no result event is written for a launch that did not.
-func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, reason string, state *agentState, extra ...*events.Event) error {
+func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, reason string, answer *events.TaskAnswer, state *agentState, extra ...*events.Event) error {
 	externalRef := task.ID
 	var response any
 	if launch != nil {
@@ -322,6 +325,7 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 			Launched:      reason == "",
 			Launch:        response,
 			Error:         reason,
+			Answer:        answer,
 			LLMVisibility: events.LLMVisibilityNone,
 		},
 	}
@@ -397,12 +401,12 @@ func (a Agent) raiseTaskAsk(ctx context.Context, task *history.AsyncTask, ask *A
 	if hook := state.hooks.BeforeInterrupt; hook != nil {
 		c, err := hook(ctx, req)
 		if err != nil {
-			return a.recordLaunch(ctx, task, nil, fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err), state)
+			return a.recordLaunch(ctx, task, nil, fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err), nil, state)
 		}
 		changes = c
 	}
 	if changes.Block != nil {
-		return a.recordLaunch(ctx, task, nil, changes.Block.Message, state)
+		return a.recordLaunch(ctx, task, nil, changes.Block.Message, nil, state)
 	}
 	reason, context := req.Reason, req.Context
 	if changes.Reason != nil {

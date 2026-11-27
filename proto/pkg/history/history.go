@@ -234,6 +234,10 @@ type AsyncTask struct {
 	// blocked the launch; the launch-result event beside it settles the task.
 	BlockedMessage string `json:"blocked_message,omitempty"`
 
+	// Answer is a policy hook's answer that settled the start without the
+	// task running; the projection renders it as the start call's result.
+	Answer *events.TaskAnswer `json:"answer,omitempty"`
+
 	// Actor is who started the task, recorded on the invoke and copied
 	// forward onto every event the task emits. It records who started the
 	// work; it is not a live grant of authority.
@@ -1199,6 +1203,7 @@ func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState)
 	task.ExternalRef = pl.ExternalRef
 	task.Launch = pl.Launch
 	task.Launched = pl.Launched
+	task.Answer = pl.Answer
 	task.LaunchSeq = &ev.Seq
 	if !pl.Launched {
 		task.Result = pl.Error
