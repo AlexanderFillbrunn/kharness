@@ -1205,7 +1205,11 @@ func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState)
 	task.Launched = pl.Launched
 	task.Answer = pl.Answer
 	task.LaunchSeq = &ev.Seq
-	if !pl.Launched {
+	// A launch that was not launched and not answered settles the task as
+	// failed here. One answered by policy does not: the RESULT event written
+	// beside it settles the task with the answer, the way a tool call's
+	// Answer settles the call.
+	if !pl.Launched && pl.Answer == nil && task.FinishedSeq == nil {
 		task.Result = pl.Error
 		task.FinishedAt = &ev.Timestamp
 		task.FinishedSeq = &ev.Seq

@@ -258,12 +258,27 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 		return a.raiseTaskAsk(ctx, task, d.ask, state)
 	case d.answer != nil:
 		// An answer settles the request without the task starting: nothing
-		// ran, so the launch result says so and no task result exists. The
-		// answer itself rides the launch result and the projection renders
-		// it as the start call's result, as for a tool call.
+		// ran, so the launch result says so — and the answer is recorded as
+		// the task's result, in the same batch, the way a tool call's Answer
+		// becomes its tool result. The projection renders it as the start
+		// call's result.
+		outcome := events.AsyncTaskOutcomeSuccess
+		if d.answer.IsError {
+			outcome = events.AsyncTaskOutcomeFailed
+		}
 		return a.recordLaunch(ctx, task, nil,
 			"the task start was answered by policy without the task starting",
-			&events.TaskAnswer{Result: d.answer.Result, IsError: d.answer.IsError}, state)
+			&events.TaskAnswer{Result: d.answer.Result, IsError: d.answer.IsError}, state,
+			&events.Event{
+				Typ:           events.AsyncTaskResultEventType,
+				CorrelationID: &task.ID,
+				Payload: events.AsyncTaskResultPayload{
+					CausationID:   task.ID,
+					Result:        d.answer.Result,
+					Outcome:       outcome,
+					LLMVisibility: events.LLMVisibilityNone,
+				},
+			})
 	}
 
 	controller := a.controllerFor(state)
@@ -329,7 +344,7 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 			LLMVisibility: events.LLMVisibilityNone,
 		},
 	}
-	if _, err := a.persistAndFold(ctx, state, append(extra, launchResult)...); err != nil {
+	if _, err := a.persistAndFold(ctx, state, append([]*events.Event{launchResult}, extra...)...); err != nil {
 		return err
 	}
 	if reason == "" {

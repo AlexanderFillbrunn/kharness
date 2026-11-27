@@ -1549,10 +1549,11 @@ func TestTriggerSwallowedByAnotherArcsSnapshotGetsAFullRead(t *testing.T) {
 // DecideInterruptResponse is what an answering side calls before persisting:
 
 // A BeforeTaskStart Answer settles the request without the task starting: the
-// launch result records Launched=false, no task result is written since nothing
-// ran, and the projection renders the hook's answer as the start call's
-// result — the way a tool call's Answer becomes its tool result.
-func TestBeforeTaskStartAnswerDoesNotStart(t *testing.T) {
+// launch result records Launched=false, and the answer is recorded as the
+// task's own result in the same batch — the way a tool call's Answer becomes
+// its tool result — so the task settles with the answer, not as failed. The
+// projection renders the answer as the start call's result.
+func TestBeforeTaskStartAnswerRecordsTaskResult(t *testing.T) {
 	controller := &fakeController{}
 	tasks := taskSourceWith(t, controller, "deploy_task")
 	llm := &scriptedLLM{replies: []*LLMResponse{
@@ -1587,14 +1588,19 @@ func TestBeforeTaskStartAnswerDoesNotStart(t *testing.T) {
 	if meta.Answer == nil || meta.Answer.Result != "not needed" {
 		t.Errorf("launch result answer = %+v, want the hook's answer carried for the projection", meta.Answer)
 	}
-	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
-		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: nothing ran", len(results))
+	results := persistedOfType(persistor, events.AsyncTaskResultEventType)
+	if len(results) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_RESULT events, want 1 carrying the answer", len(results))
 	}
-	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
-		t.Errorf("task status = %s, want FAILED settled by the launch result", task.Status)
+	if pl := results[0].Payload.(events.AsyncTaskResultPayload); pl.Result != "not needed" || pl.Outcome != events.AsyncTaskOutcomeSuccess {
+		t.Errorf("task result = %+v, want the answer as a success result", pl)
+	}
+	task := h.TasksInOrder()[0]
+	if task.Status != history.AsyncTaskSuccess {
+		t.Errorf("task status = %s, want SUCCESS settled by the answer result", task.Status)
 	}
 	// The model sees the answer as the start call's result, not as an error.
-	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	result := projectedTaskResult(t, h, testArcID, task.ID)
 	if result.Content != "not needed" || result.Outcome != history.ModelToolOutcomeSuccess || result.IsError {
 		t.Errorf("projected result = %+v, want the answer as a success result", result)
 	}
