@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -80,13 +81,32 @@ return start
 // GetEventsForArc.
 type RedisEventStore struct {
 	client *redis.Client
+
+	// logger receives the store's records: appends and reads at Debug,
+	// snapshot saves at Debug, Redis failures at Error. Set with
+	// WithStoreLogger; nil becomes slog.Default() at build.
+	logger *slog.Logger
+}
+
+// StoreOption configures a RedisEventStore.
+type StoreOption func(*RedisEventStore)
+
+// WithStoreLogger gives a store the logger its reads and writes report to.
+// Nil means slog.Default().
+func WithStoreLogger(logger *slog.Logger) StoreOption {
+	return func(s *RedisEventStore) { s.logger = logger }
 }
 
 // NewRedisEventStore returns a store over the client given. The client is
 // borrowed rather than owned: closing it is the caller's, since a service
 // will have more than one of these on the same connection pool.
-func NewRedisEventStore(client *redis.Client) *RedisEventStore {
-	return &RedisEventStore{client: client}
+func NewRedisEventStore(client *redis.Client, options ...StoreOption) *RedisEventStore {
+	s := &RedisEventStore{client: client}
+	for _, option := range options {
+		option(s)
+	}
+	s.logger = resolveLogger(s.logger).With("component", "store")
+	return s
 }
 
 var _ common.EventPersistor = (*RedisEventStore)(nil)
@@ -132,6 +152,7 @@ func (s *RedisEventStore) Persist(ctx context.Context, evs ...*events.Event) ([]
 
 	start, err := appendScript.Run(ctx, s.client, []string{logKey(session)}, lines).Int()
 	if err != nil {
+		s.logger.ErrorContext(ctx, "could not append to the log", "session", session, "count", len(lines), "error", err)
 		return nil, fmt.Errorf("append to %s: %w", session, err)
 	}
 	for i := range stored {
@@ -141,6 +162,7 @@ func (s *RedisEventStore) Persist(ctx context.Context, evs ...*events.Event) ([]
 		one.Seq = start + i
 		stored[i] = &one
 	}
+	s.logger.DebugContext(ctx, "events appended", "session", session, "count", len(stored), "first_seq", start, "last_seq", start+len(stored)-1)
 	return stored, nil
 }
 
@@ -161,11 +183,14 @@ func (s *RedisEventStore) SaveSnapshot(ctx context.Context, sessionID string, fo
 	}
 	res, err := saveSnapshotScript.Run(ctx, s.client, []string{snapshotKey(sessionID), logKey(sessionID)}, fold.LastSeq, string(record)).Int()
 	if err != nil {
+		s.logger.ErrorContext(ctx, "could not save the snapshot", "session", sessionID, "error", err)
 		return fmt.Errorf("save snapshot of %s: %w", sessionID, err)
 	}
 	if res < 0 {
+		s.logger.WarnContext(ctx, "snapshot claims a seq beyond the log, refused", "session", sessionID, "seq", fold.LastSeq)
 		return fmt.Errorf("snapshot of %s claims seq %d beyond the log", sessionID, fold.LastSeq)
 	}
+	s.logger.DebugContext(ctx, "snapshot saved", "session", sessionID, "seq", fold.LastSeq)
 	return nil
 }
 
@@ -306,9 +331,16 @@ func (s *RedisEventStore) TaskState(ctx context.Context, sessionID, taskID strin
 func (s *RedisEventStore) read(ctx context.Context, sessionID string) ([]*events.Event, error) {
 	lines, err := s.client.LRange(ctx, logKey(sessionID), 0, -1).Result()
 	if err != nil {
+		s.logger.ErrorContext(ctx, "could not read the log", "session", sessionID, "error", err)
 		return nil, fmt.Errorf("read %s: %w", sessionID, err)
 	}
-	return decodeLines(sessionID, lines)
+	evs, err := decodeLines(sessionID, lines)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "could not decode the log", "session", sessionID, "error", err)
+		return nil, err
+	}
+	s.logger.DebugContext(ctx, "log read", "session", sessionID, "count", len(evs))
+	return evs, nil
 }
 
 // readFrom decodes the entries of a session's log from the given seq on — the

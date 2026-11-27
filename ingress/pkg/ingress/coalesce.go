@@ -2,6 +2,7 @@ package ingress
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,11 @@ type Coalescer struct {
 	// event limit, where one is set.
 	limitOverride *int
 
+	// logger receives the coalescer's records: a merged flush at Debug, a
+	// demotion past the event limit at Warn. Set with WithCoalesceLogger; nil
+	// becomes slog.Default() at build.
+	logger *slog.Logger
+
 	now func() time.Time
 }
 
@@ -36,6 +42,12 @@ type CoalesceOption func(*Coalescer)
 // WithEventLimitOverride sets the global override of the per-kind event limit.
 func WithEventLimitOverride(limit int) CoalesceOption {
 	return func(c *Coalescer) { c.limitOverride = &limit }
+}
+
+// WithCoalesceLogger gives a coalescer the logger its coalescing reports to.
+// Nil means slog.Default().
+func WithCoalesceLogger(logger *slog.Logger) CoalesceOption {
+	return func(c *Coalescer) { c.logger = logger }
 }
 
 // NewCoalescer returns an empty coalescer.
@@ -48,6 +60,7 @@ func NewCoalescer(options ...CoalesceOption) *Coalescer {
 	for _, option := range options {
 		option(c)
 	}
+	c.logger = resolveLogger(c.logger).With("component", "coalescer")
 	return c
 }
 
@@ -92,6 +105,7 @@ func (c *Coalescer) Offer(ref common.TaskRef, metadata common.TaskMetadata, repo
 		c.mu.Unlock()
 		// Past the limit the event is demoted instead of opening an arc: the
 		// overflow policy says ignored (None) or folded (InResult).
+		c.logger.Warn("notification past the kind's event limit, demoting it", "task", ref.ID, "class", report.Class, "limit", limit)
 		demoted := report
 		switch metadata.OverflowPolicy {
 		case common.OverflowFold:
@@ -148,6 +162,7 @@ func (c *Coalescer) flushLocked(key coalesceKey) {
 		window.timer.Stop()
 	}
 	c.admitted[window.ref.ID]++
+	c.logger.Debug("coalesced notifications into one report", "task", window.ref.ID, "class", window.class, "merged", len(window.payloads))
 
 	merged := TaskReport{
 		Kind:    TaskReportNotification,

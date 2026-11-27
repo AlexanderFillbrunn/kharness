@@ -200,7 +200,9 @@ type WebhookConfig struct {
 	// Timeout only tightens them.
 	HTTPClient *http.Client
 
-	// Logger receives drops and permanent failures. Nil means slog.Default().
+	// Logger receives drops and permanent failures. Nil means the run's
+	// logger where the delivery was queued from a hook (LoggerFrom), else
+	// slog.Default().
 	Logger *slog.Logger
 
 	// Workers is how many background workers drain the queue. They start
@@ -344,26 +346,32 @@ func (w *Webhooks) Close(ctx context.Context) error {
 // dispatcher closed — rather than sent.
 func (w *Webhooks) Dropped() int64 { return w.dropped.Load() }
 
-// WithWebhooks attaches the dispatcher to an agent: every hook point is
+// WithWebhooks attaches the dispatcher to an agent by composing it into the
+// agent's hooks — nothing else: the agent holds no reference to the
+// dispatcher, and the dispatcher logs to its own WebhookConfig.Logger, or to
+// the run's logger (see LoggerFrom) where it has none. Every hook point is
 // wrapped so its firing is also delivered to the configured webhooks. The
 // agent's hooks set by an earlier WithHooks are composed in — a local hook
 // always decides first, and where one is set the webhook is notified
 // asynchronously and cannot override it; where none is set, a sync webhook
 // decides and an async one lets the step pass. Apply WithWebhooks after
 // WithHooks: options run in order, and a later WithHooks replaces the whole
-// set, webhooks included.
+// set, webhooks included. To combine webhooks with hooks in one WithHooks,
+// use Compose directly.
 func WithWebhooks(w *Webhooks) AgentOption {
 	return func(a *Agent) error {
 		if w == nil {
 			return errors.New("webhooks need a non-nil *Webhooks")
 		}
-		a.hooks = w.compose(a.hooks)
+		a.hooks = w.Compose(a.hooks)
 		return nil
 	}
 }
 
-// compose wraps every hook point of local with its webhook delivery.
-func (w *Webhooks) compose(local Hooks) Hooks {
+// Compose wraps every hook point of local with its webhook delivery, for a
+// consumer that attaches the dispatcher through WithHooks itself:
+// WithHooks(w.Compose(myHooks)).
+func (w *Webhooks) Compose(local Hooks) Hooks {
 	var out Hooks
 	run := ToolCallEffects{HookEffects: HookEffects{Run: true}}
 	out.BeforeRun = decideHook(w, EventRunBefore, local.BeforeRun, RunDecision{Pass: true}, DeliverySync)
@@ -403,7 +411,7 @@ func decideHook[Req, Res any](w *Webhooks, event WebhookEvent, local func(contex
 	if local == nil {
 		return func(ctx context.Context, req Req) (Res, error) {
 			if rd.mode == DeliveryAsync {
-				w.notify(event, rd, req)
+				w.notify(ctx, event, rd, req)
 				return allow, nil
 			}
 			body, err := w.callSync(ctx, rd, event, req)
@@ -415,7 +423,7 @@ func decideHook[Req, Res any](w *Webhooks, event WebhookEvent, local func(contex
 				err = derr
 			}
 			if rd.failPolicy == FailOpen {
-				w.logf("the %s webhook failed, failing open: %v", event, err)
+				w.logf(ctx, "the %s webhook failed, failing open: %v", event, err)
 				return allow, nil
 			}
 			return allow, fmt.Errorf("the %s webhook failed: %w", event, err)
@@ -423,7 +431,7 @@ func decideHook[Req, Res any](w *Webhooks, event WebhookEvent, local func(contex
 	}
 	return func(ctx context.Context, req Req) (Res, error) {
 		res, err := local(ctx, req)
-		w.notify(event, rd, req)
+		w.notify(ctx, event, rd, req)
 		return res, err
 	}
 }
@@ -441,11 +449,11 @@ func infoHook[Req any](w *Webhooks, event WebhookEvent, local func(context.Conte
 			local(ctx, req)
 		}
 		if rd.mode == DeliveryAsync {
-			w.notify(event, rd, req)
+			w.notify(ctx, event, rd, req)
 			return
 		}
 		if _, err := w.callSync(ctx, rd, event, req); err != nil {
-			w.logf("the %s webhook failed: %v", event, err)
+			w.logf(ctx, "the %s webhook failed: %v", event, err)
 		}
 	}
 }
@@ -558,6 +566,10 @@ type delivery struct {
 	seq   int64
 	rd    resolvedDelivery
 	data  []byte
+
+	// log is the logger the delivery was queued with: the run's when the
+	// firing hook's context carried one, else the dispatcher's own.
+	log *slog.Logger
 }
 
 // webhookEnvelope is the body of every POST. ID is the idempotency key a
@@ -572,21 +584,24 @@ type webhookEnvelope struct {
 }
 
 // notify queues one async delivery. It never blocks: a full queue or a closed
-// dispatcher drops the delivery and counts it in Dropped.
-func (w *Webhooks) notify(event WebhookEvent, rd resolvedDelivery, data any) {
+// dispatcher drops the delivery and counts it in Dropped. The delivery
+// carries the logger of the context it was queued from, so the worker logs to
+// the run's logger where the dispatcher has none of its own.
+func (w *Webhooks) notify(ctx context.Context, event WebhookEvent, rd resolvedDelivery, data any) {
 	if rd.url == "" {
 		return
 	}
-	raw, ok := w.marshalData(rd, event, data)
+	log := w.loggerFor(ctx)
+	raw, ok := w.marshalData(ctx, rd, event, data)
 	if !ok {
 		return
 	}
-	d := delivery{id: common.NewEventID(), event: event, seq: w.seq.Add(1), rd: rd, data: raw}
+	d := delivery{id: common.NewEventID(), event: event, seq: w.seq.Add(1), rd: rd, data: raw, log: log}
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
 		w.dropped.Add(1)
-		w.logf("webhook %s: dispatcher closed, delivery %s dropped", event, d.id)
+		w.logf(ctx, "webhook %s: dispatcher closed, delivery %s dropped", event, d.id)
 		return
 	}
 	w.ensureStartedLocked()
@@ -595,7 +610,7 @@ func (w *Webhooks) notify(event WebhookEvent, rd resolvedDelivery, data any) {
 	default:
 		w.mu.Unlock()
 		w.dropped.Add(1)
-		w.logf("webhook %s: queue full, delivery %s dropped", event, d.id)
+		w.logf(ctx, "webhook %s: queue full, delivery %s dropped", event, d.id)
 		return
 	}
 	w.mu.Unlock()
@@ -604,7 +619,7 @@ func (w *Webhooks) notify(event WebhookEvent, rd resolvedDelivery, data any) {
 // callSync delivers one event inline with ctx and returns the reply body of
 // the first 2xx response. Retries, backoff and the circuit breaker apply.
 func (w *Webhooks) callSync(ctx context.Context, rd resolvedDelivery, event WebhookEvent, data any) ([]byte, error) {
-	raw, ok := w.marshalData(rd, event, data)
+	raw, ok := w.marshalData(ctx, rd, event, data)
 	if !ok {
 		return nil, fmt.Errorf("the %s payload does not marshal", event)
 	}
@@ -640,17 +655,17 @@ func (w *Webhooks) callSync(ctx context.Context, rd resolvedDelivery, event Webh
 
 // marshalData redacts and marshals one payload, enforcing the size cap by
 // replacing an oversized payload with a truncation marker.
-func (w *Webhooks) marshalData(rd resolvedDelivery, event WebhookEvent, data any) ([]byte, bool) {
+func (w *Webhooks) marshalData(ctx context.Context, rd resolvedDelivery, event WebhookEvent, data any) ([]byte, bool) {
 	if rd.redact != nil {
 		data = rd.redact(event, data)
 	}
 	raw, err := json.Marshal(data)
 	if err != nil {
-		w.logf("webhook %s: payload does not marshal: %v", event, err)
+		w.logf(ctx, "webhook %s: payload does not marshal: %v", event, err)
 		return nil, false
 	}
 	if rd.maxPayload > 0 && len(raw) > rd.maxPayload {
-		w.logf("webhook %s: payload of %d bytes exceeds the cap of %d, truncating", event, len(raw), rd.maxPayload)
+		w.logf(ctx, "webhook %s: payload of %d bytes exceeds the cap of %d, truncating", event, len(raw), rd.maxPayload)
 		raw, _ = json.Marshal(map[string]any{"truncated": true, "original_bytes": len(raw)})
 	}
 	return raw, true
@@ -693,10 +708,15 @@ func (w *Webhooks) worker() {
 // fire-and-forget.
 func (w *Webhooks) process(d delivery) {
 	rd := d.rd
+	l := d.log
+	if l == nil {
+		l = slog.Default()
+	}
+	l.Debug("delivering webhook", "event", string(d.event), "delivery", d.id, "mode", rd.mode)
 	br := w.breakerFor(rd.url)
 	if !br.allow() {
 		w.dropped.Add(1)
-		w.logf("webhook %s: circuit open for %s, delivery %s dropped", d.event, rd.url, d.id)
+		logfDelivery(w.baseCtx, l, "webhook %s: circuit open for %s, delivery %s dropped", d.event, rd.url, d.id)
 		return
 	}
 	attempts := rd.maxRetries + 1
@@ -704,12 +724,13 @@ func (w *Webhooks) process(d delivery) {
 		status, _, retryAfter, err := w.attempt(w.baseCtx, rd, d.id, d.event, d.seq, attempt, d.data)
 		if err == nil && status >= 200 && status < 300 {
 			br.recordSuccess()
+			l.Debug("webhook delivered", "event", string(d.event), "delivery", d.id, "attempt", attempt, "status", status)
 			return
 		}
 		br.recordFailure()
 		if !retryable(status, err) || attempt == attempts {
 			w.dropped.Add(1)
-			w.logf("webhook %s: giving up on delivery %s after %d attempt(s), status %d, err %v", d.event, d.id, attempt, status, err)
+			logfDelivery(w.baseCtx, l, "webhook %s: giving up on delivery %s after %d attempt(s), status %d, err %v", d.event, d.id, attempt, status, err)
 			return
 		}
 		if !sleepCtx(w.baseCtx, sleepFor(rd, attempt, retryAfter)) {
@@ -901,12 +922,30 @@ func (w *Webhooks) newBreaker() *circuitBreaker {
 	return &circuitBreaker{threshold: w.breakerThreshold, cooldown: w.breakerCooldown}
 }
 
-func (w *Webhooks) logf(format string, args ...any) {
-	l := w.logger
-	if l == nil {
-		l = slog.Default()
+// loggerFor picks the logger a delivery logs to: the dispatcher's own where
+// WebhookConfig.Logger set one, then the run's logger carried on the hook's
+// context (tagged as a webhook), then the process default. A dispatcher
+// plugged in through the hooks alone has no other way to reach the agent's
+// logger.
+func (w *Webhooks) loggerFor(ctx context.Context) *slog.Logger {
+	if w.logger != nil {
+		return w.logger
 	}
-	l.Warn(fmt.Sprintf(format, args...))
+	if l := LoggerFrom(ctx); l != nil {
+		return l.With("component", "webhooks")
+	}
+	return slog.Default()
+}
+
+// logf logs a drop or failure at Warn on the logger the context calls for.
+func (w *Webhooks) logf(ctx context.Context, format string, args ...any) {
+	w.loggerFor(ctx).WarnContext(ctx, fmt.Sprintf(format, args...))
+}
+
+// logfDelivery logs a drop or failure of one queued delivery at Warn, on the
+// logger the delivery was queued with.
+func logfDelivery(ctx context.Context, l *slog.Logger, format string, args ...any) {
+	l.WarnContext(ctx, fmt.Sprintf(format, args...))
 }
 
 func knownWebhookEvent(e WebhookEvent) bool {

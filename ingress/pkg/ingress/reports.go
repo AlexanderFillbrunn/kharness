@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
@@ -70,16 +71,35 @@ type TaskReports struct {
 	source    common.EventSource
 	tasks     common.MetadataSource
 	enqueue   common.WorkEnqueuer
+
+	// logger receives the report path's records. Set with WithReportsLogger;
+	// nil becomes slog.Default() at build.
+	logger *slog.Logger
+}
+
+// ReportsOption configures a TaskReports.
+type ReportsOption func(*TaskReports)
+
+// WithReportsLogger gives the report path the logger its writes and refusals
+// report to: a persisted report and an enqueued arc at Info, a refused report
+// at Warn, a failed write at Error. Nil means slog.Default().
+func WithReportsLogger(logger *slog.Logger) ReportsOption {
+	return func(r *TaskReports) { r.logger = logger }
 }
 
 // NewTaskReports builds the inbound half over the parts it needs: where it
 // writes, where it reads the session's log, where the task kinds' metadata is
 // declared, and where it hands an arc it opened to the work queue.
-func NewTaskReports(persistor common.EventPersistor, source common.EventSource, tasks common.MetadataSource, enqueue common.WorkEnqueuer) (*TaskReports, error) {
+func NewTaskReports(persistor common.EventPersistor, source common.EventSource, tasks common.MetadataSource, enqueue common.WorkEnqueuer, options ...ReportsOption) (*TaskReports, error) {
 	if persistor == nil || source == nil || tasks == nil || enqueue == nil {
 		return nil, errors.New("reports need a persistor, a source, a task registry and a work queue")
 	}
-	return &TaskReports{persistor: persistor, source: source, tasks: tasks, enqueue: enqueue}, nil
+	r := &TaskReports{persistor: persistor, source: source, tasks: tasks, enqueue: enqueue}
+	for _, option := range options {
+		option(r)
+	}
+	r.logger = resolveLogger(r.logger).With("component", "ingress")
+	return r, nil
 }
 
 // Report records what a task said, and where the record opens an arc of its
@@ -96,41 +116,56 @@ func NewTaskReports(persistor common.EventPersistor, source common.EventSource, 
 // correlates to the task. A notification naming a class the kind has not
 // declared is refused, and nothing is logged.
 func (r *TaskReports) Report(ctx context.Context, ref common.TaskRef, agentID string, report TaskReport) error {
+	log := r.logger.With("session", ref.SessionID, "task", ref.ID, "kind", string(report.Kind))
+	if report.Kind == TaskReportNotification {
+		log = log.With("class", report.Class)
+	}
+	log.DebugContext(ctx, "report received")
 	if agentID == "" {
 		return fmt.Errorf("a report on task %s names no agent to work the arc it opens", ref.ID)
 	}
 
 	state, err := r.source.TaskState(ctx, ref.SessionID, ref.ID)
 	if err != nil {
+		log.ErrorContext(ctx, "could not read the task's state", "error", err)
 		return err
 	}
 	if state == nil || !state.Exists {
+		log.WarnContext(ctx, "report refused: the session holds no such task")
 		return fmt.Errorf("session %s holds no task %s", ref.SessionID, ref.ID)
 	}
 	if state.Settled {
 		// The task is settled — cancelled or finished — so a later report from
 		// its runner is refused rather than written over the outcome.
+		log.WarnContext(ctx, "report refused: the task is already settled", "status", string(state.Status))
 		return fmt.Errorf("task %s is already %s, so its report is refused", ref.ID, state.Status)
 	}
 	metadata, ok := r.tasks.Get(state.TaskName)
 	if !ok {
+		log.WarnContext(ctx, "report refused: the task's kind is not registered", "task_kind", state.TaskName)
 		return fmt.Errorf("task %s is of kind %s, which is not registered", ref.ID, state.TaskName)
 	}
 
 	ev, opensArc, err := reportEvent(ref, state, metadata, report)
 	if err != nil {
+		log.WarnContext(ctx, "report refused: it does not form an event", "error", err)
 		return err
 	}
 	stored, err := common.AsAgent(agentID, r.persistor).Persist(ctx, ev)
 	if err != nil {
+		log.ErrorContext(ctx, "could not persist the report's event; the report is lost", "type", string(ev.Typ), "error", err)
 		return err
 	}
+	log.InfoContext(ctx, "report persisted", "type", string(ev.Typ), "event", stored[0].ID, "seq", stored[0].Seq, "opens_arc", opensArc)
 	if opensArc {
 		// The item carries the event's seq as its trigger, so the worker
 		// fires the continuation hook for exactly this report.
-		if err := r.enqueue.Enqueue(ctx, common.ArcRef{SessionID: ref.SessionID, ArcID: *ev.CorrelationID}, agentID, stored[0].Seq); err != nil {
+		arcID := *ev.CorrelationID
+		if err := r.enqueue.Enqueue(ctx, common.ArcRef{SessionID: ref.SessionID, ArcID: arcID}, agentID, stored[0].Seq); err != nil {
+			log.ErrorContext(ctx, "could not enqueue the arc the report opened", "arc", arcID, "error", err)
 			return fmt.Errorf("enqueue the arc the report opened: %w", err)
 		}
+		log.InfoContext(ctx, "arc enqueued for the report", "arc", arcID, "trigger_seq", stored[0].Seq)
 	}
 	return nil
 }

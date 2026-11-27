@@ -152,6 +152,7 @@ func (a Agent) runWave(ctx context.Context, wave []*history.ToolCall, decisions 
 	if _, err := a.persistAndFold(ctx, state, dispatches...); err != nil {
 		return err
 	}
+	state.logger.DebugContext(ctx, "running a wave of calls", "calls", len(wave))
 
 	errs := make([]error, len(wave))
 	var wg sync.WaitGroup
@@ -188,6 +189,7 @@ func (a Agent) runCall(ctx context.Context, call *history.ToolCall, args any, st
 // reported on, without running it again. It is recorded as a failure, and the
 // text says that the tool may have done the work anyway.
 func (a Agent) abandonToolCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
+	state.logger.WarnContext(ctx, "abandoning a dispatched call that was never reported on", "tool", call.ToolName, "call", call.ID)
 	return a.settleCall(ctx, call, ToolOutcome{
 		IsError: true,
 		Result: fmt.Sprintf(
@@ -218,9 +220,15 @@ func (a Agent) invokeAndSettle(ctx context.Context, call *history.ToolCall, args
 
 	// A handler that returned has said what happened, whatever the context is
 	// doing by then, so the outcome is recorded even for a cancelled run.
+	state.logger.DebugContext(ctx, "invoking tool", "tool", call.ToolName, "call", call.ID)
 	outcome, err := a.tools.Invoke(ctx, call.ToolName, args)
 	if err != nil {
 		outcome = ToolOutcome{Result: err.Error(), IsError: true}
+	}
+	if outcome.IsError {
+		// The result text is the tool's own error and lands in the log; the
+		// log line says the call failed, not what it said.
+		state.logger.WarnContext(ctx, "tool call settled as an error", "tool", call.ToolName, "call", call.ID)
 	}
 
 	outcome, notes, herr := applyAfterToolCall(ctx, call, args, outcome, state)

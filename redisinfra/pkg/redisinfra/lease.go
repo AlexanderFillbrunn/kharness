@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -76,10 +77,21 @@ type keyLease struct {
 	client *redis.Client
 	ttl    time.Duration
 	renew  time.Duration
+
+	// logger receives the lease's records: acquisitions and releases at
+	// Debug, a lost heartbeat at Warn, unreachable Redis at Error. Set with
+	// WithLeaseLogger; nil becomes slog.Default() at build.
+	logger *slog.Logger
 }
 
 // LeaseOption configures a lease.
 type LeaseOption func(*keyLease)
+
+// WithLeaseLogger gives a lease the logger its acquisitions report to. Nil
+// means slog.Default().
+func WithLeaseLogger(logger *slog.Logger) LeaseOption {
+	return func(l *keyLease) { l.logger = logger }
+}
 
 // WithLeaseTTL sets how long a lease survives a holder that stops
 // heartbeating it. It should stay generous: shrinking it trades a rare
@@ -102,6 +114,7 @@ func newKeyLease(client *redis.Client, options ...LeaseOption) keyLease {
 	for _, option := range options {
 		option(&l)
 	}
+	l.logger = resolveLogger(l.logger).With("component", "lease")
 	return l
 }
 
@@ -125,11 +138,14 @@ func (l *keyLease) Acquire(ctx context.Context, key string) (func(), bool, error
 	}
 	ok, err := l.client.SetNX(ctx, key, token, l.ttl).Result()
 	if err != nil {
+		l.logger.ErrorContext(ctx, "could not reach the lease", "key", key, "error", err)
 		return nil, false, fmt.Errorf("could not reach the lease on %s: %w", key, err)
 	}
 	if !ok {
+		l.logger.DebugContext(ctx, "lease held by another holder", "key", key)
 		return nil, false, nil
 	}
+	l.logger.DebugContext(ctx, "lease acquired", "key", key, "ttl", l.ttl)
 	stopHeartbeat := l.startHeartbeat(ctx, key, token)
 	return func() {
 		stopHeartbeat()
@@ -142,7 +158,9 @@ func (l *keyLease) Acquire(ctx context.Context, key string) (func(), bool, error
 			// A release that cannot reach Redis leaves the key to expire
 			// on its TTL. That is the backstop the TTL exists for, and a
 			// caller has nothing left to do about it.
-			_ = err
+			l.logger.Warn("could not release the lease; the key expires on its TTL", "key", key, "error", err)
+		} else {
+			l.logger.Debug("lease released", "key", key)
 		}
 	}, true, nil
 }
@@ -177,6 +195,7 @@ func (l *keyLease) startHeartbeat(ctx context.Context, key, token string) (stop 
 					continue
 				}
 				if held == 0 {
+					l.logger.Warn("lease lost: another holder took the key after this holder's TTL expired; writes are unfenced", "key", key)
 					return
 				}
 			}

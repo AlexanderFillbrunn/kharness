@@ -21,6 +21,21 @@ const (
 	ArcStateClose     arcState = iota
 )
 
+func (s arcState) String() string {
+	switch s {
+	case ArcStateLLM:
+		return "llm"
+	case ArcStateToolCalls:
+		return "tool_calls"
+	case ArcStateDone:
+		return "done"
+	case ArcStateClose:
+		return "close"
+	default:
+		return "none"
+	}
+}
+
 // deriveArcState decides what the agent does next from the arc alone, so a run
 // picking up an arc another run left behind reaches the same decision.
 //

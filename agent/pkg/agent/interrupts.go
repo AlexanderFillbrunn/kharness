@@ -96,6 +96,7 @@ func (a Agent) raiseInterrupt(ctx context.Context, call *history.ToolCall, state
 	// which settles the call as a tool error instead — or answer it at once.
 	evs, settle, err := a.prepareInterrupt(ctx, req, call, state)
 	if err != nil {
+		state.logger.WarnContext(ctx, "the interrupt policy failed, so the interrupt was not raised", "tool", call.ToolName, "error", err)
 		// Fail closed: no interrupt, the call settles as an error.
 		settle = callResult(call, ToolOutcome{
 			IsError: true,
@@ -116,6 +117,7 @@ func (a Agent) raiseInterrupt(ctx context.Context, call *history.ToolCall, state
 	if err != nil {
 		return err
 	}
+	state.logger.InfoContext(ctx, "interrupt raised, arc held", "interrupt", stored[0].ID, "tool", call.ToolName)
 	notifyInterruptRaised(ctx, state, stored)
 	return nil
 }

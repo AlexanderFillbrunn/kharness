@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -43,11 +44,30 @@ type RedisCancels struct {
 	mu       sync.Mutex
 	watchers map[common.ArcRef]map[chan struct{}]struct{}
 	pubsub   *redis.PubSub
+
+	// logger receives the hub's records: announced cancels at Info,
+	// best-effort failures at Warn. Set with WithCancelsLogger; nil becomes
+	// slog.Default() at build.
+	logger *slog.Logger
+}
+
+// CancelsOption configures a RedisCancels.
+type CancelsOption func(*RedisCancels)
+
+// WithCancelsLogger gives a cancellation hub the logger its announcements
+// report to. Nil means slog.Default().
+func WithCancelsLogger(logger *slog.Logger) CancelsOption {
+	return func(c *RedisCancels) { c.logger = logger }
 }
 
 // NewRedisCancels builds a cancellation hub over a Redis client.
-func NewRedisCancels(client *redis.Client) *RedisCancels {
-	return &RedisCancels{client: client, watchers: map[common.ArcRef]map[chan struct{}]struct{}{}}
+func NewRedisCancels(client *redis.Client, options ...CancelsOption) *RedisCancels {
+	c := &RedisCancels{client: client, watchers: map[common.ArcRef]map[chan struct{}]struct{}{}}
+	for _, option := range options {
+		option(c)
+	}
+	c.logger = resolveLogger(c.logger).With("component", "cancels")
+	return c
 }
 
 var _ agent.CancelNotifier = (*RedisCancels)(nil)
@@ -65,8 +85,12 @@ func (c *RedisCancels) NotifyCancel(ctx context.Context, ref common.ArcRef) erro
 		return fmt.Errorf("could not announce the cancel of arc %s: %w", ref, err)
 	}
 	if err := c.client.Publish(ctx, cancelChannel(ref), payload).Err(); err != nil {
+		// The record is in the log and the guard stops the run at its next
+		// step whatever happens to the announcement, so this is a warning.
+		c.logger.WarnContext(ctx, "could not announce the cancel; the guard still stops the run", "session", ref.SessionID, "arc", ref.ArcID, "error", err)
 		return fmt.Errorf("could not announce the cancel of arc %s: %w", ref, err)
 	}
+	c.logger.InfoContext(ctx, "cancel announced", "session", ref.SessionID, "arc", ref.ArcID)
 	return nil
 }
 
@@ -83,6 +107,7 @@ func (c *RedisCancels) Watch(ctx context.Context, ref common.ArcRef) (<-chan str
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.subscribe(ctx, ref); err != nil {
+		c.logger.WarnContext(ctx, "could not subscribe to the arc's cancel channel; the guard still stops the run", "session", ref.SessionID, "arc", ref.ArcID, "error", err)
 		return cancelled, func() {}
 	}
 	if c.watchers[ref] == nil {
@@ -143,6 +168,6 @@ func (c *RedisCancels) unwatch(ref common.ArcRef, cancelled chan struct{}) {
 	if err := c.pubsub.Unsubscribe(unsubscribeCtx, cancelChannel(ref)); err != nil {
 		// A subscription that cannot be dropped costs a message nobody is
 		// waiting for, which is the cheapest failure this package has.
-		_ = err
+		c.logger.Debug("could not drop the cancel subscription", "session", ref.SessionID, "arc", ref.ArcID, "error", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -46,6 +47,14 @@ type Agent struct {
 	// hooks are the agent's extension points, consulted at the points the
 	// Hooks struct names. The zero value has no hooks and changes nothing.
 	hooks Hooks
+
+	// logger receives the run's lifecycle and failure records, tagged with
+	// the component and, per run, the arc, and travels on the run's context
+	// for hooks (see LoggerFrom). Set with WithLogging; nil leaves the agent
+	// without one, and Run then takes the logger from the run's context —
+	// the worker's, when the run came through ArcWorker.Work — discarding
+	// where there is none. See log.go for what is logged and what never is.
+	logger *slog.Logger
 }
 
 // RunOptions are the parts of a run that differ from one run to the next. The
@@ -125,7 +134,15 @@ type agentState struct {
 	// outcome is how the run ended, set by the admission check, the step
 	// loop and the failure path as they go, and read by the AfterRun hook.
 	outcome RunOutcome
+
+	// logger is the agent's logger tagged with this run's arc.
+	logger *slog.Logger
 }
+
+// discardLogger is the run's logger when neither the agent nor the incoming
+// context has one: a state built by Run always has a logger, so state.logger
+// is never nil on the run path.
+var discardLogger = slog.New(slog.DiscardHandler)
 
 // Run invokes the agent to complete an arc, i.e. a user message triggering the
 // agent.
@@ -153,6 +170,16 @@ func (a Agent) Run(ctx context.Context, run RunOptions) (err error) {
 		modes = history.DefaultModes()
 	}
 	hooks := a.hooks
+	// The run's logger: the agent's own where WithLogging set one, else the
+	// logger on the incoming context — the worker's when the run came
+	// through ArcWorker.Work — else discard. Tagged with the arc either way.
+	logger := a.logger
+	if logger == nil {
+		logger = LoggerFrom(ctx)
+	}
+	if logger == nil {
+		logger = discardLogger
+	}
 	state := &agentState{
 		history:         run.History,
 		arc:             arc,
@@ -164,7 +191,12 @@ func (a Agent) Run(ctx context.Context, run RunOptions) (err error) {
 		onCompactionDue: run.OnCompactionDue,
 		hooks:           hooks,
 		outcome:         RunFinished,
+		logger:          logger.With("arc", run.ArcID),
 	}
+	// The run's logger rides on the context every hook receives, so a hook
+	// implementation logs to the same place as the run (see LoggerFrom).
+	ctx = withLogger(ctx, state.logger)
+	state.logger.DebugContext(ctx, "run starting")
 
 	defer func() { fireAfterRun(ctx, state, run.ArcID, err) }()
 	// fail records how the run ended and closes the arc the agent could not
@@ -204,6 +236,9 @@ func (a Agent) admit(ctx context.Context, state *agentState) (bool, error) {
 	// built-in checks.
 	ok, err := a.applyBeforeRun(ctx, state)
 	if err != nil || !ok {
+		if err == nil {
+			state.logger.InfoContext(ctx, "run not admitted", "outcome", string(state.outcome))
+		}
 		return ok, err
 	}
 
@@ -231,6 +266,7 @@ func (a Agent) admit(ctx context.Context, state *agentState) (bool, error) {
 			return false, nil
 		}
 	}
+	state.logger.DebugContext(ctx, "run admitted")
 	return true, nil
 }
 
@@ -247,11 +283,13 @@ func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState
 	// A cancel reaches a run through its context or through a refused write,
 	// and neither is a failure to record.
 	if errors.Is(cause, context.Canceled) || errors.Is(cause, common.ErrCancelled) {
+		state.logger.InfoContext(ctx, "run cancelled, nothing recorded", "error", cause)
 		return cause
 	}
 	if errors.Is(cause, errSuspended) {
 		return nil
 	}
+	state.logger.ErrorContext(ctx, "run failed, recording a fatal error", "error", cause)
 
 	failure := &events.Event{
 		Typ:           events.ErrorEventType,
@@ -292,6 +330,7 @@ func (a Agent) step(ctx context.Context, state *agentState) (bool, error) {
 	if err != nil {
 		return true, err
 	}
+	state.logger.DebugContext(ctx, "round", "round", state.rounds+1, "arc_state", s)
 	switch s {
 	case ArcStateLLM:
 		return false, a.llmStep(ctx, state)
@@ -319,6 +358,7 @@ func (a Agent) closeArc(ctx context.Context, state *agentState) error {
 	}); err != nil {
 		return err
 	}
+	state.logger.InfoContext(ctx, "arc closed", "conclusion", last.ID)
 	fireAfterArcClosed(ctx, state)
 	return nil
 }
@@ -344,13 +384,19 @@ func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*ev
 	defer state.writeMu.Unlock()
 	stored, err := state.persistor.Persist(ctx, evs...)
 	if err != nil {
+		state.logger.ErrorContext(ctx, "persist failed", "types", eventTypes(evs), "error", err)
 		return nil, fmt.Errorf("error persisting %s: %w", eventTypes(evs), err)
 	}
 	state.written += len(stored)
 	for _, ev := range stored {
 		if err := state.history.Update(ev, state.foldState); err != nil {
+			state.logger.ErrorContext(ctx, "fold failed", "type", string(ev.Typ), "id", ev.ID, "seq", ev.Seq, "error", err)
 			return nil, fmt.Errorf("error folding %s event: %w", ev.Typ, err)
 		}
+	}
+	if len(stored) > 0 {
+		state.logger.DebugContext(ctx, "persisted events",
+			"types", eventTypes(evs), "count", len(stored), "first_seq", stored[0].Seq, "last_seq", stored[len(stored)-1].Seq)
 	}
 	return stored, nil
 }

@@ -343,10 +343,17 @@ func (a Agent) applyBeforeRun(ctx context.Context, state *agentState) (bool, err
 	return false, nil
 }
 
-// fireAfterRun hands the run's summary to AfterRun.
+// fireAfterRun logs the run's outcome and hands its summary to AfterRun.
 func fireAfterRun(ctx context.Context, state *agentState, arcID string, err error) {
+	sum := RunSummary{ArcID: arcID, Outcome: state.outcome, Err: err, Rounds: state.rounds, Written: state.written}
+	switch state.outcome {
+	case RunFailed:
+		state.logger.ErrorContext(ctx, "run failed", "outcome", string(sum.Outcome), "rounds", sum.Rounds, "written", sum.Written, "error", err)
+	default:
+		state.logger.InfoContext(ctx, "run ended", "outcome", string(sum.Outcome), "rounds", sum.Rounds, "written", sum.Written, "error", err)
+	}
 	if hook := state.hooks.AfterRun; hook != nil {
-		hook(ctx, RunSummary{ArcID: arcID, Outcome: state.outcome, Err: err, Rounds: state.rounds, Written: state.written})
+		hook(ctx, sum)
 	}
 }
 

@@ -78,6 +78,7 @@ func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 		arc:       h.Arcs[0],
 		foldState: history.FoldStateFromHistory(h),
 		persistor: persistor,
+		logger:    discardLogger,
 	}
 
 	vendorID := "chatcmpl-9"
@@ -518,6 +519,7 @@ func TestAReplyAndItsCallsAreOneWrite(t *testing.T) {
 		arc:       h.Arcs[0],
 		foldState: history.FoldStateFromHistory(h),
 		persistor: persistor,
+		logger:    discardLogger,
 	}
 
 	response := &LLMResponse{ModelID: "gpt-5", Content: "restarting", ToolCalls: []LLMToolCall{

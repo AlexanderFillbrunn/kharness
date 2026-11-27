@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
@@ -171,6 +172,8 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 	if shortCircuit != nil {
 		return a.recordResponse(ctx, shortCircuit, messageID, state)
 	}
+	state.logger.DebugContext(ctx, "calling model",
+		"message", messageID, "estimated_tokens", req.EstimatedTokens, "tools", len(tools))
 	response, err := a.llm.StreamResponse(ctx, req.Transcript, &LLMOptions{
 		SystemPrompt: req.SystemPrompt,
 		Tools:        toolList(tools),
@@ -181,6 +184,7 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 	// length stop — is recorded first, so the log holds what the model said.
 	var overflow *ContextOverflowError
 	if errors.As(err, &overflow) {
+		state.logger.WarnContext(ctx, "the provider rejected the transcript as over budget, recovering via compaction", "error", err)
 		if response != nil {
 			if rerr := a.recordResponse(ctx, response, messageID, state); rerr != nil {
 				return rerr
@@ -189,12 +193,29 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 		return a.recoverOverflow(ctx, state, overflow.Error())
 	}
 	if err != nil {
+		state.logger.ErrorContext(ctx, "model call failed", "message", messageID, "error", err)
 		return fmt.Errorf("error calling LLM: %w", err)
 	}
+	state.logger.DebugContext(ctx, "model replied",
+		"message", messageID, "model", response.ModelID, "stop_reason", response.StopReason,
+		"tool_calls", len(response.ToolCalls), "usage", usageAttrs(response.Usage))
 	if err := a.recordResponse(ctx, response, messageID, state); err != nil {
 		return err
 	}
 	return nil
+}
+
+// usageAttrs renders a reply's token cost as a log attribute, without the
+// content the tokens were spent on.
+func usageAttrs(usage *TokenUsage) slog.Attr {
+	if usage == nil {
+		return slog.Any("usage", nil)
+	}
+	return slog.Group("usage",
+		slog.Int("input", usage.Input),
+		slog.Int("cached_input", usage.CachedInput),
+		slog.Int("output", usage.Output),
+	)
 }
 
 // tokenSink labels the model's text with the message that will record it. A

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 
@@ -166,6 +167,7 @@ func (a Agent) checkCompaction(ctx context.Context, state *agentState, done bool
 // request standing for anyone to take.
 func (a Agent) ensureCompactionRequest(ctx context.Context, state *agentState) (string, error) {
 	if req := state.history.UnsatisfiedRequest(); req != nil {
+		state.logger.DebugContext(ctx, "compaction request already standing", "request", req.ID)
 		return req.ID, nil
 	}
 	stored, err := a.persistAndFold(ctx, state, &events.Event{
@@ -177,7 +179,9 @@ func (a Agent) ensureCompactionRequest(ctx context.Context, state *agentState) (
 		return "", err
 	}
 	requestID := stored[0].ID
+	state.logger.InfoContext(ctx, "compaction requested", "request", requestID, "watermark", state.history.Watermark())
 	if state.onCompactionDue != nil {
+		state.logger.DebugContext(ctx, "notifying the run's compaction listener", "request", requestID)
 		state.onCompactionDue(ctx, requestID)
 	}
 	return requestID, nil
@@ -186,6 +190,7 @@ func (a Agent) ensureCompactionRequest(ctx context.Context, state *agentState) (
 // suspendArc writes the ARC_SUSPENDED that pauses the arc, causally naming the
 // request it waits on.
 func (a Agent) suspendArc(ctx context.Context, state *agentState, requestID string) error {
+	state.logger.InfoContext(ctx, "arc suspended for compaction", "request", requestID)
 	_, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.ArcSuspendedEventType,
 		CorrelationID: &state.arc.ID,
@@ -203,6 +208,7 @@ func (a Agent) suspendArc(ctx context.Context, state *agentState, requestID stri
 // fatal.
 func (a Agent) recoverOverflow(ctx context.Context, state *agentState, reason string) error {
 	if hasResolvedSuspension(state.history, state.arc) {
+		state.logger.ErrorContext(ctx, "the provider rejected the transcript as over budget again after this arc recovered once")
 		return fmt.Errorf("the provider rejected the transcript as over budget again after this arc recovered once: %s", reason)
 	}
 	if _, err := a.persistAndFold(ctx, state, &events.Event{
@@ -437,11 +443,21 @@ type CompactionWorker struct {
 	// snapshots is when the worker reads through a stored fold snapshot and
 	// saves one. The zero value reads the whole log and never saves.
 	snapshots SnapshotPolicy
+
+	// logger receives the worker's lifecycle records. Set with
+	// WithCompactionLogger; nil becomes slog.Default() at build.
+	logger *slog.Logger
 }
 
 // CompactionWorkerOption configures parts of a compaction worker that not
 // every deployment sets.
 type CompactionWorkerOption func(*CompactionWorker)
+
+// WithCompactionLogger gives a compaction worker the logger its work reports
+// to. Nil means slog.Default().
+func WithCompactionLogger(logger *slog.Logger) CompactionWorkerOption {
+	return func(w *CompactionWorker) { w.logger = logger }
+}
 
 // WithCompactionSnapshotPolicy sets when the worker reads the session through
 // a stored fold snapshot and saves one at the end of a compaction. Without
@@ -471,6 +487,7 @@ func NewCompactionWorker(persistor common.EventPersistor, source common.EventSou
 	for _, option := range options {
 		option(worker)
 	}
+	worker.logger = resolveLogger(worker.logger).With("component", "compaction-worker")
 	return worker, nil
 }
 
@@ -489,16 +506,20 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 		return false, errors.New("a compaction item names no request")
 	}
 
+	log := w.logger.With("session", sessionID, "request", requestID)
 	release, ok, err := w.lease.Acquire(ctx, sessionID)
 	if err != nil {
+		log.ErrorContext(ctx, "could not take the session lease", "error", err)
 		return false, fmt.Errorf("could not take the session lease on %s: %w", sessionID, err)
 	}
 	if !ok {
 		// The lease is held: leave the item unacknowledged and let autoclaim
 		// re-offer it.
+		log.DebugContext(ctx, "session lease held by another worker, leaving the item")
 		return false, nil
 	}
 	defer release()
+	log.DebugContext(ctx, "compaction starting")
 
 	// One read under the lease: the watermark is fixed at this read and the
 	// summary computation afterwards cannot move the line.
@@ -540,8 +561,12 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 		},
 	})
 	if err != nil {
+		log.ErrorContext(ctx, "could not persist COMPACTED", "error", err)
 		return false, fmt.Errorf("persist COMPACTED for %s: %w", sessionID, err)
 	}
+	// The summary text stays in the log; the line carries only its shape.
+	log.InfoContext(ctx, "compaction computed", "through", through, "method", result.Method,
+		"model", result.ModelID, "summary_chars", len(result.Summary), "event", stored[0].ID, "seq", stored[0].Seq)
 
 	// The completion scan: enqueue every arc with a released, unresolved
 	// suspension the compaction just written covers.
@@ -552,8 +577,9 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 	// The save point of a compaction: the COMPACTED is folded, so h is at the
 	// log's head. Best-effort, like every snapshot save — a failure costs the
 	// next read a full replay, nothing more.
-	saveSnapshot(ctx, w.persistor, sessionID, h, snapInfo, w.snapshots)
+	saveSnapshot(ctx, log, w.persistor, sessionID, h, snapInfo, w.snapshots)
 	if w.enqueuer != nil {
+		requeued := 0
 		for _, arc := range h.Arcs {
 			for _, s := range arc.Suspensions {
 				if h.SuspensionStateOf(arc, s) == history.SuspensionReleased {
@@ -561,10 +587,15 @@ func (w *CompactionWorker) Work(ctx context.Context, sessionID, requestID, agent
 					// No single event caused this run — the compaction that
 					// landed did — so the item carries no trigger.
 					if err := w.enqueuer.Enqueue(ctx, ref, agentID, 0); err != nil {
+						log.ErrorContext(ctx, "completion scan could not requeue an arc", "arc", ref.ArcID, "error", err)
 						return true, fmt.Errorf("completion scan could not requeue arc %s: %w", ref, err)
 					}
+					requeued++
 				}
 			}
+		}
+		if requeued > 0 {
+			log.InfoContext(ctx, "completion scan requeued suspended arcs", "count", requeued)
 		}
 	}
 	return true, nil

@@ -153,7 +153,7 @@ func TestAsyncDeliveryEnvelopeAndSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "arc-1", Outcome: RunFinished, Rounds: 2})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "arc-1", Outcome: RunFinished, Rounds: 2})
 	closeWebhooks(t, w)
 
 	got := reqs()
@@ -221,9 +221,9 @@ func TestPerEventRoutingFallbackAndDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
-	w.notify(EventToolCallBefore, w.resolve(EventToolCallBefore, DeliverySync), ToolCallView{ToolName: "delete_pod"})
-	w.notify(EventAssistantBefore, w.resolve(EventAssistantBefore, DeliverySync), AssistantRequest{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventToolCallBefore, w.resolve(EventToolCallBefore, DeliverySync), ToolCallView{ToolName: "delete_pod"})
+	w.notify(context.Background(), EventAssistantBefore, w.resolve(EventAssistantBefore, DeliverySync), AssistantRequest{})
 	closeWebhooks(t, w)
 
 	if got := globalReqs(); len(got) != 1 || got[0].event != "run.after" {
@@ -250,7 +250,7 @@ func TestRetryOn5xxThenSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
 	closeWebhooks(t, w)
 
 	got := reqs()
@@ -282,7 +282,7 @@ func TestNoRetryOn400(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
 	closeWebhooks(t, w)
 	if got := reqs(); len(got) != 1 {
 		t.Fatalf("got %d requests, want 1", len(got))
@@ -309,7 +309,7 @@ func TestRetryAfterOn429(t *testing.T) {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
 	start := time.Now()
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
 	closeWebhooks(t, w)
 	if got := reqs(); len(got) != 2 {
 		t.Fatalf("got %d requests, want 2", len(got))
@@ -333,7 +333,7 @@ func TestAttemptTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
 	closeWebhooks(t, w)
 	if got := reqs(); len(got) != 1 {
 		t.Fatalf("got %d requests, want 1", len(got))
@@ -361,9 +361,9 @@ func TestCircuitBreaker(t *testing.T) {
 	w.breakerCooldown = 100 * time.Millisecond
 
 	rd := w.resolve(EventRunAfter, DeliveryAsync)
-	w.notify(EventRunAfter, rd, RunSummary{}) // failure 1
-	w.notify(EventRunAfter, rd, RunSummary{}) // failure 2, opens the breaker
-	w.notify(EventRunAfter, rd, RunSummary{}) // dropped, no request
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{}) // failure 1
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{}) // failure 2, opens the breaker
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{}) // dropped, no request
 	closeWebhooks(t, w)
 	if got := reqs(); len(got) != 2 {
 		t.Fatalf("got %d requests, want 2 (breaker failed the third fast)", len(got))
@@ -427,10 +427,10 @@ func TestQueueFullDropsNewest(t *testing.T) {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
 	rd := w.resolve(EventRunAfter, DeliveryAsync)
-	w.notify(EventRunAfter, rd, RunSummary{})
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{})
 	<-started // the single worker is busy inside the handler
-	w.notify(EventRunAfter, rd, RunSummary{})
-	w.notify(EventRunAfter, rd, RunSummary{}) // queue full: dropped
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{})
+	w.notify(context.Background(), EventRunAfter, rd, RunSummary{}) // queue full: dropped
 	close(release)
 	closeWebhooks(t, w)
 
@@ -460,7 +460,7 @@ func TestRedactAndPayloadCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "secret-arc"})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "secret-arc"})
 	closeWebhooks(t, w)
 
 	capSrv, capReqs := newWebhookServer(t, func(_ int, _ webhookRequest, _ http.ResponseWriter) (int, string) {
@@ -473,7 +473,7 @@ func TestRedactAndPayloadCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w2.notify(EventRunAfter, w2.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "a-very-long-arc-id-that-will-not-fit"})
+	w2.notify(context.Background(), EventRunAfter, w2.resolve(EventRunAfter, DeliveryAsync), RunSummary{ArcID: "a-very-long-arc-id-that-will-not-fit"})
 	closeWebhooks(t, w2)
 
 	red := redReqs()
@@ -512,7 +512,7 @@ func TestCloseDrainsAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWebhooks: %v", err)
 	}
-	w.notify(EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
+	w.notify(context.Background(), EventRunAfter, w.resolve(EventRunAfter, DeliveryAsync), RunSummary{})
 	closeWebhooks(t, w)
 	closeWebhooks(t, w) // second Close is a no-op
 	if got := reqs(); len(got) != 1 {

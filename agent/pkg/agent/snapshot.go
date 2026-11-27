@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
@@ -64,11 +65,15 @@ func (p SnapshotPolicy) due(info *common.SnapshotInfo, seq int, now time.Time) b
 // saveSnapshot stores the fold at its LastSeq when the policy says a snapshot
 // is due, given what the read found stored. It is the save point's whole job
 // and it is best-effort: a save that fails costs the next reader a full
-// replay, nothing more, so the error is dropped rather than failing the run
+// replay, nothing more, so the error is logged rather than failing the run
 // or compaction that just ended.
-func saveSnapshot(ctx context.Context, persistor common.EventPersistor, sessionID string, fold *history.History, info *common.SnapshotInfo, policy SnapshotPolicy) {
+func saveSnapshot(ctx context.Context, log *slog.Logger, persistor common.EventPersistor, sessionID string, fold *history.History, info *common.SnapshotInfo, policy SnapshotPolicy) {
 	if fold == nil || !policy.due(info, fold.LastSeq, time.Now().UTC()) {
 		return
 	}
-	_ = persistor.SaveSnapshot(ctx, sessionID, fold)
+	if err := persistor.SaveSnapshot(ctx, sessionID, fold); err != nil {
+		log.WarnContext(ctx, "could not save a snapshot; the next read replays the whole log", "session", sessionID, "error", err)
+		return
+	}
+	log.DebugContext(ctx, "snapshot saved", "session", sessionID, "seq", fold.LastSeq)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 	"fillbrunn.ai/kube-agent/proto/pkg/history"
@@ -74,10 +75,22 @@ type ArcWorker struct {
 	// snapshots is when the worker reads through a stored fold snapshot and
 	// saves one. The zero value reads the whole log and never saves.
 	snapshots SnapshotPolicy
+
+	// logger receives the worker's lifecycle records. Set with WithLogger;
+	// nil becomes slog.Default() at build.
+	logger *slog.Logger
 }
 
 // ArcWorkerOption configures parts of a worker that not every worker has.
 type ArcWorkerOption func(*ArcWorker)
+
+// WithLogger gives a worker the logger its work items report to, and the
+// logger its resolved agents inherit: a run of an agent built without
+// WithLogging logs to the worker's logger, carried on the run's context.
+// Nil means slog.Default().
+func WithLogger(logger *slog.Logger) ArcWorkerOption {
+	return func(w *ArcWorker) { w.logger = logger }
+}
 
 // WithTokenSink gives a worker somewhere to stream replies as they arrive.
 func WithTokenSink(tokens TokenSink) ArcWorkerOption {
@@ -140,6 +153,7 @@ func NewArcWorker(persistor common.EventPersistor, source common.EventSource, re
 	for _, option := range options {
 		option(worker)
 	}
+	worker.logger = resolveLogger(worker.logger).With("component", "arc-worker")
 	return worker, nil
 }
 
@@ -159,24 +173,34 @@ func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string,
 	if agentID == "" {
 		return false, errors.New("a work item names no agent")
 	}
+	// The worker's logger rides on the context, so the agent it resolves and
+	// the run it starts inherit it where the agent was built without one, and
+	// so the run's hooks and tools reach it with LoggerFrom.
+	ctx = withLogger(ctx, w.logger)
+	log := w.logger.With("session", ref.SessionID, "arc", ref.ArcID, "agent", agentID)
 	release, ok, err := w.lease.Acquire(ctx, ref)
 	if err != nil {
+		log.ErrorContext(ctx, "could not take the arc lease", "error", err)
 		return false, fmt.Errorf("could not take the lease on arc %s: %w", ref, err)
 	}
 	if !ok {
+		log.DebugContext(ctx, "arc lease held by another run, leaving the item")
 		return false, nil
 	}
 	defer release()
+	log.InfoContext(ctx, "working arc", "trigger_seq", triggerSeq)
 
 	ctx, stop := w.watchForCancel(ctx, ref)
 	defer stop()
 
 	agent, err := w.resolver.ResolveAgent(ctx, agentID)
 	if err != nil {
+		log.ErrorContext(ctx, "could not resolve the agent", "error", err)
 		return false, fmt.Errorf("resolve agent %s for arc %s: %w", agentID, ref, err)
 	}
 	h, snapInfo, folded, err := w.arcHistory(ctx, ref)
 	if err != nil {
+		log.ErrorContext(ctx, "could not read the arc's history", "error", err)
 		return false, err
 	}
 	// The event that caused this item fires its continuation hook — from
@@ -207,11 +231,12 @@ func (w *ArcWorker) Work(ctx context.Context, ref common.ArcRef, agentID string,
 		runOpts.Controller = common.InSession(ref.SessionID, w.tasks)
 	}
 	runErr := agent.Run(ctx, runOpts)
+	log.DebugContext(ctx, "work item done", "error", runErr)
 	// The save point of a work item: once the run is over, never inside it.
 	// The run folded into h as it went, so h is at the log's head now. A save
 	// that fails or is not due costs the next read a full replay, nothing
 	// more, so it does not touch the run's result.
-	saveSnapshot(ctx, w.persistor, ref.SessionID, h, snapInfo, w.snapshots)
+	saveSnapshot(ctx, log, w.persistor, ref.SessionID, h, snapInfo, w.snapshots)
 	return true, runErr
 }
 

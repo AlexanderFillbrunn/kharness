@@ -3,6 +3,7 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
@@ -71,6 +72,22 @@ func (c *AgentConfig) parallelCap() int {
 // AgentOption configures parts of an agent that not every agent has.
 type AgentOption func(*Agent) error
 
+// WithLogging gives an agent the logger its runs report to: lifecycle at
+// Info, per-round and per-event detail at Debug, recoverable degradation at
+// Warn, failures at Error. Each run's lines carry the arc as an attribute,
+// and the run's logger rides on the context every hook receives, so hooks
+// log to it with LoggerFrom(ctx). Nil leaves the agent without a logger: its
+// runs then take the logger from the run's context — the worker's when the
+// run came through ArcWorker.Work (see WithLogger) — and discard where there
+// is none. An agent given one logs to it even when the run arrives through a
+// worker with a logger of its own.
+func WithLogging(logger *slog.Logger) AgentOption {
+	return func(a *Agent) error {
+		a.logger = logger
+		return nil
+	}
+}
+
 // WithTasks gives an agent the set of task kinds its definition names: the
 // tool surface is built from it. Starting and reaching tasks is not the
 // agent's business — the worker hands each run a controller via
@@ -118,6 +135,13 @@ func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...Agent
 		if err := option(agent); err != nil {
 			return nil, err
 		}
+	}
+
+	// The logger is tagged where it was set: an agent built with WithLogging
+	// logs as the agent component, one without keeps nil and its runs take
+	// the logger from their context (see Run).
+	if agent.logger != nil {
+		agent.logger = agent.logger.With("component", "agent")
 	}
 
 	// The skills' load_skill tool is one more tool by name, so a tool

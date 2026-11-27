@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -149,6 +150,11 @@ type RedisWorkQueue struct {
 	blockTimeout time.Duration
 	// count bounds how many entries one read claims.
 	count int64
+
+	// logger receives the queue's records: enqueues, claims and settlements
+	// at Info or Debug, requeues and drops at Warn, failures at Error. Set
+	// with WithQueueLogger; nil becomes slog.Default() at build.
+	logger *slog.Logger
 }
 
 // QueueOption configures a RedisWorkQueue.
@@ -202,6 +208,12 @@ func WithBlockTimeout(timeout time.Duration) QueueOption {
 	return func(q *RedisWorkQueue) { q.blockTimeout = timeout }
 }
 
+// WithQueueLogger gives a queue the logger its items report to. Nil means
+// slog.Default().
+func WithQueueLogger(logger *slog.Logger) QueueOption {
+	return func(q *RedisWorkQueue) { q.logger = logger }
+}
+
 // NewRedisWorkQueue builds a queue over a Redis client. The consumer name
 // is minted per queue, so two queues in one process do not strand each
 // other's entries.
@@ -225,6 +237,7 @@ func NewRedisWorkQueue(client *redis.Client, options ...QueueOption) (*RedisWork
 	for _, option := range options {
 		option(q)
 	}
+	q.logger = resolveLogger(q.logger).With("component", "queue", "consumer", q.consumer)
 	return q, nil
 }
 
@@ -245,8 +258,10 @@ func (q *RedisWorkQueue) Enqueue(ctx context.Context, ref common.ArcRef, agentID
 		Stream: q.stream,
 		Values: map[string]any{"payload": string(mustMarshal(item))},
 	}).Err(); err != nil {
+		q.logger.ErrorContext(ctx, "could not enqueue a work item", "session", ref.SessionID, "arc", ref.ArcID, "agent", agentID, "error", err)
 		return fmt.Errorf("could not enqueue a run of arc %s: %w", ref, err)
 	}
+	q.logger.InfoContext(ctx, "work item enqueued", "session", ref.SessionID, "arc", ref.ArcID, "agent", agentID, "trigger_seq", triggerSeq)
 	return nil
 }
 
@@ -274,8 +289,10 @@ func (q *RedisWorkQueue) EnqueueCompaction(ctx context.Context, sessionID, reque
 		Stream: q.stream,
 		Values: map[string]any{"payload": string(mustMarshal(item))},
 	}).Err(); err != nil {
+		q.logger.ErrorContext(ctx, "could not enqueue a compaction item", "session", sessionID, "request", requestID, "error", err)
 		return fmt.Errorf("could not enqueue a compaction of session %s: %w", sessionID, err)
 	}
+	q.logger.InfoContext(ctx, "compaction item enqueued", "session", sessionID, "request", requestID, "agent", agentID)
 	return nil
 }
 
@@ -353,6 +370,7 @@ func (q *RedisWorkQueue) claimAbandoned(ctx context.Context, arcs ArcRunner, com
 			Count:    q.count,
 		}).Result()
 		if err != nil {
+			q.logger.ErrorContext(ctx, "could not claim abandoned entries", "stream", q.stream, "error", err)
 			return fmt.Errorf("could not claim abandoned entries on %s: %w", q.stream, err)
 		}
 		for _, msg := range claimed {
@@ -392,6 +410,7 @@ func (q *RedisWorkQueue) read(ctx context.Context, arcs ArcRunner, compactions C
 		if errors.Is(err, redis.Nil) {
 			return nil
 		}
+		q.logger.ErrorContext(ctx, "could not read the queue", "stream", q.stream, "error", err)
 		return fmt.Errorf("could not read the queue %s: %w", q.stream, err)
 	}
 	for _, stream := range streams {
@@ -425,10 +444,13 @@ func (q *RedisWorkQueue) work(ctx context.Context, arcs ArcRunner, compactions C
 		// An entry that cannot be read is moved to the dead stream
 		// rather than retried, since it will fail the same way on every
 		// consumer that claims it.
+		q.logger.ErrorContext(ctx, "entry carries an unreadable payload, moving it to the dead stream", "entry", msg.ID, "error", err)
 		q.moveToDead(ctx, msg, WorkItem{}, err)
 		return
 	}
+	log := q.logger.With("entry", msg.ID, "session", item.SessionID, "attempts", item.Attempts)
 	if item.NotBeforeMs > 0 && time.Now().UnixMilli() < item.NotBeforeMs {
+		log.DebugContext(ctx, "item's time has not come, leaving it pending")
 		return
 	}
 	if item.isCompaction() {
@@ -436,6 +458,7 @@ func (q *RedisWorkQueue) work(ctx context.Context, arcs ArcRunner, compactions C
 			// This consumer serves no compactions: leave the entry pending
 			// without counting an attempt, so autoclaim offers it to a
 			// consumer that has a compaction worker.
+			log.DebugContext(ctx, "no compaction worker on this consumer, leaving the item pending", "request", item.RequestID)
 			return
 		}
 		q.workItem(ctx, msg, item, func() (bool, error) {
@@ -451,17 +474,22 @@ func (q *RedisWorkQueue) work(ctx context.Context, arcs ArcRunner, compactions C
 // workItem runs one item's worker and settles the entry the outcome calls
 // for, as work documents.
 func (q *RedisWorkQueue) workItem(ctx context.Context, msg redis.XMessage, item WorkItem, run func() (bool, error)) {
+	log := q.logger.With("entry", msg.ID, "session", item.SessionID, "arc", item.ArcID, "request", item.RequestID, "agent", item.AgentID)
 	worked, err := run()
 	item.Attempts++
 	switch {
 	case err == nil && worked:
+		log.DebugContext(ctx, "item worked, acknowledging")
 		q.ack(ctx, msg.ID)
 	case err == nil:
+		log.WarnContext(ctx, "the run found its arc held, re-offering the item", "delay", q.contentionDelay)
 		q.requeue(ctx, item, q.contentionDelay)
 		q.ack(ctx, msg.ID)
 	case item.Attempts >= q.maxAttempts:
+		log.ErrorContext(ctx, "item failed too many times, moving it to the dead stream", "attempts", item.Attempts, "error", err)
 		q.moveToDead(ctx, msg, item, err)
 	default:
+		log.WarnContext(ctx, "item failed, re-offering it", "attempts", item.Attempts, "max_attempts", q.maxAttempts, "error", err)
 		q.requeue(ctx, item, q.contentionDelay)
 		q.ack(ctx, msg.ID)
 	}
@@ -495,7 +523,7 @@ func (q *RedisWorkQueue) requeue(ctx context.Context, item WorkItem, delay time.
 	if err != nil {
 		// The entry stays pending and is redelivered, which works the
 		// item again rather than losing it.
-		_ = err
+		q.logger.WarnContext(ctx, "could not requeue the item; the entry stays pending and will be redelivered", "session", item.SessionID, "error", err)
 	}
 }
 
@@ -518,9 +546,10 @@ func (q *RedisWorkQueue) moveToDead(ctx context.Context, msg redis.XMessage, ite
 	if err != nil {
 		// The entry stays pending and is redelivered, and the next pass
 		// tries the dead stream again.
-		_ = err
+		q.logger.ErrorContext(ctx, "could not write to the dead stream; the entry stays pending", "entry", msg.ID, "error", err)
 		return
 	}
+	q.logger.WarnContext(ctx, "item moved to the dead stream", "entry", msg.ID, "attempts", item.Attempts, "cause", cause)
 	q.ack(ctx, msg.ID)
 }
 
@@ -528,7 +557,9 @@ func (q *RedisWorkQueue) moveToDead(ctx context.Context, msg redis.XMessage, ite
 // the entry pending, and it is worked again: a duplicate run, which the
 // lease makes harmless.
 func (q *RedisWorkQueue) ack(ctx context.Context, id string) {
-	_ = q.client.XAck(ctx, q.stream, q.group, id).Err()
+	if err := q.client.XAck(ctx, q.stream, q.group, id).Err(); err != nil {
+		q.logger.WarnContext(ctx, "could not acknowledge the entry; it stays pending and will be redelivered", "entry", id, "error", err)
+	}
 }
 
 // mustMarshal encodes a value this package has constructed itself, which

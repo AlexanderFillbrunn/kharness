@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -35,8 +36,10 @@ When you need a decision or information from the user, call ask_user with one or
 
 // Run drives one devchat session: it opens the log, wires the agent to the
 // terminal and blocks until the interface leaves. The flags the command
-// takes are parsed in cmd/devchat; everything else lives here.
-func Run(storePath, settingsPath, userID string) error {
+// takes are parsed in cmd/devchat; everything else lives here. The logger is
+// what the command opened for the log file, handed to every library component
+// so their records land in one place.
+func Run(storePath, settingsPath, userID string, logger *slog.Logger) error {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("OPENAI_API_KEY is not set")
@@ -53,7 +56,7 @@ func Run(storePath, settingsPath, userID string) error {
 		return err
 	}
 
-	runner, err := newLocalTasks()
+	runner, err := newLocalTasks(ingress.WithCoalesceLogger(logger))
 	if err != nil {
 		return err
 	}
@@ -99,7 +102,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// "local" is the one task source this harness holds: the canned tasks
 	// compiled into it. Like the tools, a settings file may name no other.
 	taskSources := map[string]agent.TaskSource{"local": runner}
-	resolver := agent.NewFileResolver(settingsPath, sources, skillSources, taskSources, modelSources)
+	resolver := agent.NewFileResolver(settingsPath, sources, skillSources, taskSources, modelSources, agent.WithLogging(logger))
 
 	// The sinks report into the interface, and the interface cannot exist
 	// until the model is built, so they go through a sender that is pointed at
@@ -141,7 +144,8 @@ func Run(storePath, settingsPath, userID string) error {
 		agent.WithCompactionStarter(compactionStart),
 		agent.WithTaskController(runner),
 		agent.WithModes(modes),
-		agent.WithSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
+		agent.WithSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}),
+		agent.WithLogger(logger))
 	if err != nil {
 		return err
 	}
@@ -152,7 +156,8 @@ func Run(storePath, settingsPath, userID string) error {
 	// names no arc.
 	compactionWorker, err := agent.NewCompactionWorker(persistor, store, resolver,
 		agent.NewLocalSessionLease(), enqueuer, history.DefaultModes(),
-		agent.WithCompactionSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}))
+		agent.WithCompactionSnapshotPolicy(agent.SnapshotPolicy{Enabled: true}),
+		agent.WithCompactionLogger(logger))
 	if err != nil {
 		return err
 	}
@@ -181,7 +186,7 @@ func Run(storePath, settingsPath, userID string) error {
 	// The ingress resolves reports against the runner's own held kinds, not
 	// against the agent's resolver: the ingress and the agent are separate
 	// halves, and in a deployed tier each process resolves on its own.
-	reports, err := ingress.NewTaskReports(persistor, store, runner, enqueuer)
+	reports, err := ingress.NewTaskReports(persistor, store, runner, enqueuer, ingress.WithReportsLogger(logger))
 	if err != nil {
 		return err
 	}

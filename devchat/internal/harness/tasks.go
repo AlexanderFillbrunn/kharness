@@ -77,11 +77,11 @@ type localTask struct {
 // default settings name.
 const auditTaskName = "audit_namespaces"
 
-func newLocalTasks() (*localTasks, error) {
+func newLocalTasks(options ...ingress.CoalesceOption) (*localTasks, error) {
 	l := &localTasks{
 		running:   map[string]*localTask{},
 		defs:      map[string]common.TaskMetadata{},
-		coalescer: ingress.NewCoalescer(),
+		coalescer: ingress.NewCoalescer(options...),
 		meta:      common.NewTaskRegistry(),
 		starters:  map[string]func(common.TaskRef, any) error{},
 	}
