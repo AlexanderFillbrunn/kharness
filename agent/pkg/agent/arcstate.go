@@ -14,11 +14,12 @@ var (
 type arcState int
 
 const (
-	ArcStateNone      arcState = iota
-	ArcStateLLM       arcState = iota
-	ArcStateToolCalls arcState = iota
-	ArcStateDone      arcState = iota
-	ArcStateClose     arcState = iota
+	ArcStateNone        arcState = iota
+	ArcStateLLM         arcState = iota
+	ArcStateToolCalls   arcState = iota
+	ArcStateTaskLaunch  arcState = iota
+	ArcStateDone        arcState = iota
+	ArcStateClose       arcState = iota
 )
 
 func (s arcState) String() string {
@@ -27,6 +28,8 @@ func (s arcState) String() string {
 		return "llm"
 	case ArcStateToolCalls:
 		return "tool_calls"
+	case ArcStateTaskLaunch:
+		return "task_launch"
 	case ArcStateDone:
 		return "done"
 	case ArcStateClose:
@@ -41,8 +44,11 @@ func (s arcState) String() string {
 //
 // An arc closes when the agent has nothing synchronous left to do: a response
 // with no tool calls closes it, whatever tasks are unfinished. A running task
-// does not hold its arc open — its later events open arcs of their own.
-func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
+// does not hold its arc open — its later events open arcs of their own. A task
+// whose invoke is recorded but whose launch is not does hold it open one more
+// round, so the start runs before the arc is answered or closed.
+func (a Agent) deriveArcState(state *agentState) (arcState, error) {
+	arc := state.arc
 	if arc.Status() != history.ArcStatusPending {
 		return ArcStateDone, nil
 	}
@@ -62,11 +68,32 @@ func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
 		}
 	}
 
+	for _, task := range state.history.TasksOfArc(arc.ID) {
+		// A task with no meta and no settle is a launch not recorded yet. One
+		// with a result but no meta is a settled task from before meta events
+		// existed, and is not relaunched.
+		if task.MetaSeq == nil && task.FinishedSeq == nil {
+			return ArcStateTaskLaunch, nil
+		}
+	}
+
 	last := arc.Responses[len(arc.Responses)-1]
-	if len(last.ToolCalls) == 0 {
+	if len(last.ToolCalls) == 0 && !startedTasksIn(state.history.TasksOfArc(arc.ID), last.ID) {
 		return ArcStateClose, nil
 	}
 	return ArcStateLLM, nil
+}
+
+// startedTasksIn reports whether the named message started any tasks: a reply
+// that did gets one more model turn after its starts launch, the way a reply
+// with tool calls gets one after they settle.
+func startedTasksIn(tasks []*history.AsyncTask, messageID string) bool {
+	for _, task := range tasks {
+		if task.MessageID == messageID {
+			return true
+		}
+	}
+	return false
 }
 
 // knows reports whether a call by this name has somewhere to go: a registered

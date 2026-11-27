@@ -190,6 +190,13 @@ func TaskStateOf(sessionID, taskID string, log []*events.Event) *TaskState {
 				state.Settled = true
 				state.Status = statusOfOutcome(payload.Outcome)
 			}
+		case events.AsyncTaskMetaEventType:
+			// A launch that failed settles the task like a failed result:
+			// the RESULT event is reserved for work that actually started.
+			if payload, ok := ev.Payload.(events.AsyncTaskMetaPayload); ok && payload.CausationID == taskID && !payload.Launched {
+				state.Settled = true
+				state.Status = events.TaskStatusFailed
+			}
 		case events.CancelEventType:
 			if ev.CorrelationID != nil && *ev.CorrelationID == taskID {
 				state.Settled = true

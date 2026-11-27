@@ -136,13 +136,17 @@ func (l *localTasks) Get(name string) (common.TaskMetadata, bool) {
 
 // Start launches one kind of task and returns as soon as the work is under
 // way, the way a call to a job runner would. In this process the controller
-// runs the task directly and asynchronously.
-func (l *localTasks) Start(_ context.Context, name string, ref common.TaskRef, args any) error {
+// runs the task directly and asynchronously. The launch's external reference
+// is the task's own ID: the goroutine runs under it.
+func (l *localTasks) Start(_ context.Context, name string, ref common.TaskRef, args any) (*common.TaskLaunch, error) {
 	start, ok := l.starters[name]
 	if !ok {
-		return fmt.Errorf("task %s is not held by this source", name)
+		return nil, fmt.Errorf("task %s is not held by this source", name)
 	}
-	return start(ref, args)
+	if err := start(ref, args); err != nil {
+		return nil, err
+	}
+	return &common.TaskLaunch{ExternalRef: ref.ID}, nil
 }
 
 // attach gives the tasks somewhere to report to, once there is one, and names

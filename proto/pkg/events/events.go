@@ -24,6 +24,7 @@ const (
 	AsyncTaskEventEventType          EventType = "ASYNC_TASK_EVENT"
 	AsyncTaskInputRequestedEventType EventType = "ASYNC_TASK_INPUT_REQUESTED"
 	AsyncTaskInputProvidedEventType  EventType = "ASYNC_TASK_INPUT_PROVIDED"
+	AsyncTaskMetaEventType           EventType = "ASYNC_TASK_META"
 	ErrorEventType                   EventType = "ERROR"
 	GuardrailBlockedEventType        EventType = "GUARDRAIL_BLOCKED"
 	CancelEventType                  EventType = "CANCEL"

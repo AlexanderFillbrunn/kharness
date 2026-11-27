@@ -326,7 +326,7 @@ func (a Agent) steps(ctx context.Context, state *agentState) error {
 
 // Step performs one step in the agent loop.
 func (a Agent) step(ctx context.Context, state *agentState) (bool, error) {
-	s, err := a.deriveArcState(state.arc)
+	s, err := a.deriveArcState(state)
 	if err != nil {
 		return true, err
 	}
@@ -336,6 +336,8 @@ func (a Agent) step(ctx context.Context, state *agentState) (bool, error) {
 		return false, a.llmStep(ctx, state)
 	case ArcStateToolCalls:
 		return false, a.toolStep(ctx, state)
+	case ArcStateTaskLaunch:
+		return false, a.launchTasks(ctx, state)
 	case ArcStateClose:
 		return false, a.closeArc(ctx, state)
 	case ArcStateNone:

@@ -520,8 +520,9 @@ func TestWavesSoloCallsRunAlone(t *testing.T) {
 	}
 }
 
-// A BeforeTaskStart Block refuses the start without asking anyone: no task is
-// invoked, the call settles BLOCKED, and the run continues.
+// A BeforeTaskStart Block refuses the start without asking anyone: the
+// invoke is recorded, the meta event records the launch as failed, no task is
+// started, and the run continues.
 func TestBeforeTaskStartBlock(t *testing.T) {
 	controller := &fakeController{}
 	tasks := taskSourceWith(t, controller, "deploy_task")
@@ -552,12 +553,20 @@ func TestBeforeTaskStartBlock(t *testing.T) {
 	if len(controller.started) != 0 {
 		t.Errorf("started tasks = %v, want none", controller.started)
 	}
-	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 0 {
-		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want none", len(invokes))
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
 	}
-	call := h.Arcs[0].Responses[0].ToolCalls[0]
-	if call.Status != history.ToolCallStatusBlocked {
-		t.Errorf("call status = %s, want BLOCKED", call.Status)
+	metas := persistedOfType(persistor, events.AsyncTaskMetaEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_META events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskMetaPayload)
+	if meta.Launched || meta.CausationID != invokes[0].ID || meta.ExternalRef != invokes[0].ID {
+		t.Errorf("meta = %+v, want Launched=false with the invoke's ID as causation and external ref", meta)
+	}
+	if !strings.Contains(meta.Error, "task starts need a ticket") {
+		t.Errorf("meta error = %q, want the block message", meta.Error)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusDone {
 		t.Errorf("arc = %s, want DONE", h.Arcs[0].Status())
@@ -595,9 +604,12 @@ func TestBeforeTaskStartAskThenApprovalStartsTask(t *testing.T) {
 	if len(interrupts) != 1 {
 		t.Fatalf("persisted %d INTERRUPT events, want 1", len(interrupts))
 	}
-	call := h.Arcs[0].Responses[0].ToolCalls[0]
-	if pl := interrupts[0].Payload.(events.InterruptPayload); pl.CausationID != call.ID {
-		t.Errorf("interrupt causation = %q, want call %q", pl.CausationID, call.ID)
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	if pl := interrupts[0].Payload.(events.InterruptPayload); pl.CausationID != invokes[0].ID {
+		t.Errorf("interrupt causation = %q, want task %q", pl.CausationID, invokes[0].ID)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusInterrupted {
 		t.Fatalf("arc = %s, want INTERRUPTED", h.Arcs[0].Status())
@@ -625,6 +637,13 @@ func TestBeforeTaskStartAskThenApprovalStartsTask(t *testing.T) {
 	}
 	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 1 {
 		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	metas := persistedOfType(persistor, events.AsyncTaskMetaEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_META events, want 1", len(metas))
+	}
+	if meta := metas[0].Payload.(events.AsyncTaskMetaPayload); !meta.Launched || meta.CausationID != invokes[0].ID {
+		t.Errorf("meta = %+v, want Launched=true causated to the invoke", meta)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusDone {
 		t.Errorf("arc = %s, want DONE", h.Arcs[0].Status())

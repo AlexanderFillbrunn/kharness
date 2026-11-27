@@ -173,7 +173,7 @@ func (a Agent) runWave(ctx context.Context, wave []*history.ToolCall, decisions 
 func (a Agent) runCall(ctx context.Context, call *history.ToolCall, args any, state *agentState) error {
 	switch a.operation(call.ToolName) {
 	case opStart:
-		return a.startTask(ctx, call, args, state)
+		return a.legacyStartTask(ctx, call, args, state)
 	case opCancel:
 		return a.cancelTask(ctx, call, state)
 	case opProvideInput:
