@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -392,6 +393,64 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	// the only way it can answer the task or stop it later.
 	if text := projectedTaskResult(t, h, testArcID, task.ID).Content; !strings.Contains(text, task.ID) {
 		t.Errorf("projected start result = %q, want it to carry the task id", text)
+	}
+}
+
+// A task start round-trips as a call: the model's tool call is logged as the
+// task's invoke, and the projection renders the invoke back as the same call —
+// same name and args, under the invoke's ID — answered by the synthesized
+// start result.
+func TestTaskStartProjectsAsTheOriginalCall(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+
+	call := LLMToolCall{
+		VendorID: "call_1",
+		ToolName: "deploy_task",
+		Args:     map[string]any{"env": "prod", "region": "eu"},
+	}
+	h := userArcHistory(t)
+	persistor := runCallInArc(t, h, testArcID, tasks, call)
+
+	// call -> event: the invoke carries the request under a minted ID.
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	invoke := invokes[0]
+	pl := invoke.Payload.(events.AsyncTaskInvokePayload)
+	if pl.TaskName != call.ToolName || !reflect.DeepEqual(pl.Args, call.Args) {
+		t.Fatalf("invoke = %q %#v, want the call's %q %#v", pl.TaskName, pl.Args, call.ToolName, call.Args)
+	}
+
+	// event -> project -> call: the transcript's assistant message carries the
+	// call the invoke stands for.
+	transcript, err := h.Project(testArcID, history.DefaultModes())
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	var projected *history.ModelToolCall
+	for _, m := range transcript.Messages {
+		am, ok := m.(history.ModelAssistantMessage)
+		if !ok {
+			continue
+		}
+		for i := range am.ToolCalls {
+			if am.ToolCalls[i].ID == invoke.ID {
+				projected = &am.ToolCalls[i]
+			}
+		}
+	}
+	if projected == nil {
+		t.Fatalf("no projected call with the invoke's ID %q in the transcript", invoke.ID)
+	}
+	if projected.Name != call.ToolName || !reflect.DeepEqual(projected.Args, call.Args) {
+		t.Errorf("projected call = %+v, want name %q args %#v: the calls must match", *projected, call.ToolName, call.Args)
+	}
+
+	// The synthesized start result answers that same call.
+	if result := projectedTaskResult(t, h, testArcID, invoke.ID); result.ToolCallID != projected.ID {
+		t.Errorf("projected result answers call %q, want %q", result.ToolCallID, projected.ID)
 	}
 }
 
