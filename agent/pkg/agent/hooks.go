@@ -178,8 +178,6 @@ func (a Agent) decideCalls(ctx context.Context, calls []*history.ToolCall, state
 			continue
 		}
 		switch a.operation(call.ToolName) {
-		case opStart:
-			out[call] = a.decideTaskStart(ctx, call, state)
 		case opCancel:
 			out[call] = a.decideTaskCancel(ctx, call, state)
 		case opProvideInput:
@@ -232,32 +230,6 @@ func (a Agent) decideOrdinaryCall(ctx context.Context, call *history.ToolCall, s
 	d := callDecision{HookEffects: eff.HookEffects, solo: eff.Run && eff.Sequential}
 	if eff.Args != nil {
 		d.override = *eff.Args
-	}
-	return d
-}
-
-// decideTaskStart runs BeforeTaskStart over a call that starts a task and
-// returns its decision. A start's args reach the task, so the hook may
-// override them.
-func (a Agent) decideTaskStart(ctx context.Context, call *history.ToolCall, state *agentState) callDecision {
-	hook := state.hooks.BeforeTaskStart
-	if hook == nil {
-		return callDecision{HookEffects: HookEffects{Run: true}}
-	}
-	eff, err := hook(ctx, TaskStartView{
-		TaskName: call.ToolName,
-		Args:     taskArgsOf(call.Args),
-		CallMeta: callMetaOf(call, state),
-	})
-	if err != nil {
-		return callDecision{hookErr: err}
-	}
-	if err := eff.validate(); err != nil {
-		return callDecision{hookErr: err}
-	}
-	d := callDecision{HookEffects: eff.HookEffects}
-	if eff.Args != nil {
-		d.override = map[string]any(*eff.Args)
 	}
 	return d
 }
@@ -623,11 +595,11 @@ func (a Agent) raiseApprovals(ctx context.Context, asks []approvalAsk, state *ag
 // RunView is the snapshot of the arc a run is about to work, handed to
 // BeforeRun.
 type RunView struct {
-	ArcID               string
-	Content             string
-	OpenedByTask        string
-	Actor               *users.Actor
-	EstimatedTokens     int
+	ArcID           string
+	Content         string
+	OpenedByTask    string
+	Actor           *users.Actor
+	EstimatedTokens int
 }
 
 // RunDecision is what BeforeRun returns: pass, or refuse. Pass leaves the
@@ -793,11 +765,49 @@ type ToolCallEffects struct {
 	Args       *any
 }
 
-// TaskStartEffects are the effects of BeforeTaskStart: HookEffects plus an
-// args override, since a start's args reach the task.
+// TaskStartEffects are the effects of BeforeTaskStart, in task vocabulary:
+// exactly one of Run, Block, Ask, Result, or a LaunchResult alone. A Result
+// fakes the task's outcome — it is written verbatim as the task's
+// ASYNC_TASK_RESULT — and LaunchResult controls what the launch itself
+// reports: with IsError the text becomes the launch's Error and no task
+// result is written at all, otherwise it is the launch answer the model is
+// told the start call returned. A LaunchResult set alone leaves the task
+// result empty. Args overrides the args the task runs with.
 type TaskStartEffects struct {
-	HookEffects
-	Args *TaskArgs
+	Run          bool
+	Block        *BlockRequest
+	Ask          *AskRequest
+	Result       *events.TaskResult
+	LaunchResult *LaunchResult
+	Args         *TaskArgs
+}
+
+// validate requires exactly one of run/block/ask/result, or a launchResult
+// alone. A launchResult may ride with a result to override the text the model
+// is told, never with run/block/ask.
+func (e TaskStartEffects) validate() error {
+	n := 0
+	for _, set := range []bool{e.Run, e.Block != nil, e.Ask != nil, e.Result != nil} {
+		if set {
+			n++
+		}
+	}
+	if e.LaunchResult != nil && (e.Run || e.Block != nil || e.Ask != nil) {
+		return fmt.Errorf("a task start effect sets launchResult together with run/block/ask; launchResult only applies when the start is settled without the task running")
+	}
+	if n > 1 || (n == 0 && e.LaunchResult == nil) {
+		return fmt.Errorf("a task start effect sets %d of run/block/ask/result, want exactly one, or a launchResult alone", n)
+	}
+	return nil
+}
+
+// LaunchResult is what a BeforeTaskStart hook reports for the launch itself
+// when it settled the start without the task running: Text becomes the
+// launch's Error when IsError, and the launch answer the model is told
+// otherwise. Set alone, no task result is written.
+type LaunchResult struct {
+	Text    string
+	IsError bool
 }
 
 // TaskCancelEffects and TaskInputEffects are plain HookEffects: those calls

@@ -78,24 +78,24 @@ const (
 type WebhookEvent string
 
 const (
-	EventRunBefore                   WebhookEvent = "run.before"
-	EventRunAfter                    WebhookEvent = "run.after"
-	EventAssistantBefore             WebhookEvent = "assistant.before"
-	EventAssistantAfter              WebhookEvent = "assistant.after"
-	EventToolCallBefore              WebhookEvent = "tool_call.before"
-	EventToolCallAfter               WebhookEvent = "tool_call.after"
-	EventTaskStartBefore             WebhookEvent = "task.start.before"
-	EventTaskCancelBefore            WebhookEvent = "task.cancel.before"
-	EventTaskInputBefore             WebhookEvent = "task.input.before"
-	EventTaskResultAfter             WebhookEvent = "task.result.after"
-	EventTaskEventAfter              WebhookEvent = "task.event.after"
-	EventSkillLoadBefore             WebhookEvent = "skill.load.before"
-	EventSkillLoadAfter              WebhookEvent = "skill.load.after"
-	EventInterruptBefore             WebhookEvent = "interrupt.before"
-	EventInterruptAfter              WebhookEvent = "interrupt.after"
-	EventInterruptResponseBefore     WebhookEvent = "interrupt_response.before"
-	EventInterruptResponseAfter      WebhookEvent = "interrupt_response.after"
-	EventArcClosedAfter              WebhookEvent = "arc.closed.after"
+	EventRunBefore               WebhookEvent = "run.before"
+	EventRunAfter                WebhookEvent = "run.after"
+	EventAssistantBefore         WebhookEvent = "assistant.before"
+	EventAssistantAfter          WebhookEvent = "assistant.after"
+	EventToolCallBefore          WebhookEvent = "tool_call.before"
+	EventToolCallAfter           WebhookEvent = "tool_call.after"
+	EventTaskStartBefore         WebhookEvent = "task.start.before"
+	EventTaskCancelBefore        WebhookEvent = "task.cancel.before"
+	EventTaskInputBefore         WebhookEvent = "task.input.before"
+	EventTaskResultAfter         WebhookEvent = "task.result.after"
+	EventTaskEventAfter          WebhookEvent = "task.event.after"
+	EventSkillLoadBefore         WebhookEvent = "skill.load.before"
+	EventSkillLoadAfter          WebhookEvent = "skill.load.after"
+	EventInterruptBefore         WebhookEvent = "interrupt.before"
+	EventInterruptAfter          WebhookEvent = "interrupt.after"
+	EventInterruptResponseBefore WebhookEvent = "interrupt_response.before"
+	EventInterruptResponseAfter  WebhookEvent = "interrupt_response.after"
+	EventArcClosedAfter          WebhookEvent = "arc.closed.after"
 )
 
 // allWebhookEvents is every event name, for validating Events keys.
@@ -115,17 +115,17 @@ var allWebhookEvents = []WebhookEvent{
 // MaxRetries below zero means a single attempt, MaxPayloadBytes below zero
 // means no cap.
 const (
-	DefaultWebhookTimeout     = 10 * time.Second
-	DefaultWebhookMaxRetries  = 4
-	DefaultWebhookBackoffMin  = 500 * time.Millisecond
-	DefaultWebhookBackoffMax  = 30 * time.Second
-	DefaultWebhookWorkers     = 4
-	DefaultWebhookQueueSize   = 1024
-	DefaultMaxPayloadBytes    = 1 << 20
-	webhookUserAgent          = "kharness-webhooks/1.0"
-	maxResponseBodyBytes      = 1 << 20
-	breakerFailureThreshold   = 5
-	breakerCooldown           = 30 * time.Second
+	DefaultWebhookTimeout    = 10 * time.Second
+	DefaultWebhookMaxRetries = 4
+	DefaultWebhookBackoffMin = 500 * time.Millisecond
+	DefaultWebhookBackoffMax = 30 * time.Second
+	DefaultWebhookWorkers    = 4
+	DefaultWebhookQueueSize  = 1024
+	DefaultMaxPayloadBytes   = 1 << 20
+	webhookUserAgent         = "kharness-webhooks/1.0"
+	maxResponseBodyBytes     = 1 << 20
+	breakerFailureThreshold  = 5
+	breakerCooldown          = 30 * time.Second
 )
 
 // DeliveryConfig is the settings of one delivery: the global defaults when
@@ -380,7 +380,7 @@ func (w *Webhooks) Compose(local Hooks) Hooks {
 	out.AfterAssistant = decideHook(w, EventAssistantAfter, local.AfterAssistant, AssistantReplyChanges{}, DeliveryAsync)
 	out.BeforeToolCall = decideHook(w, EventToolCallBefore, local.BeforeToolCall, run, DeliverySync)
 	out.AfterToolCall = decideHook(w, EventToolCallAfter, local.AfterToolCall, ToolCallChanges{}, DeliveryAsync)
-	out.BeforeTaskStart = decideHook(w, EventTaskStartBefore, local.BeforeTaskStart, TaskStartEffects{HookEffects: HookEffects{Run: true}}, DeliverySync)
+	out.BeforeTaskStart = decideHook(w, EventTaskStartBefore, local.BeforeTaskStart, TaskStartEffects{Run: true}, DeliverySync)
 	out.BeforeTaskCancel = decideHook(w, EventTaskCancelBefore, local.BeforeTaskCancel, TaskCancelEffects{Run: true}, DeliverySync)
 	out.BeforeTaskInput = decideHook(w, EventTaskInputBefore, local.BeforeTaskInput, TaskInputEffects{Run: true}, DeliverySync)
 	out.AfterTaskResult = infoHook(w, EventTaskResultAfter, local.AfterTaskResult)

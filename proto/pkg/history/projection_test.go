@@ -2024,3 +2024,69 @@ func TestRenderChatShowsATaskOpenedArc(t *testing.T) {
 		}
 	}
 }
+
+// A task start is logged as an invoke plus a launch-result event, not as tool-call
+// events. The projection synthesizes the call and its result from the two, so
+// the model sees the start in the same shape it saw when starts were calls.
+func TestTaskStartProjectsAsCallAndResult(t *testing.T) {
+	log := newLogger()
+	log.user("arc-1", "audit the cluster")
+	log.assistant("arc-1", "m1", "starting")
+	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
+		TaskName: "auditor", Args: map[string]any{"namespace": "kube-system"}, MessageID: "m1", Actor: testActor})
+	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
+		CausationID: "task-1", ExternalRef: "srv-9", Launched: true, LLMVisibility: events.LLMVisibilityNone})
+	log.assistant("arc-1", "m2", "done")
+
+	transcript := project(t, log, "arc-1", DefaultModes())
+	var call *ModelToolCall
+	var result ModelToolMessage
+	for _, m := range transcript.Messages {
+		switch typed := m.(type) {
+		case ModelAssistantMessage:
+			for i, c := range typed.ToolCalls {
+				if c.ID == "task-1" {
+					call = &typed.ToolCalls[i]
+				}
+			}
+		case ModelToolMessage:
+			if typed.ToolCallID == "task-1" {
+				result = typed
+			}
+		}
+	}
+	if call == nil || call.Name != "auditor" {
+		t.Fatalf("no synthesized call for the task start, got %+v", call)
+	}
+	if result.Outcome != ModelToolOutcomeSuccess || !strings.Contains(result.Content, "id task-1") {
+		t.Errorf("synthesized result = %+v, want success naming the task id", result)
+	}
+}
+
+// A launch recorded as failed projects as the call's error result. The
+// ASYNC_TASK_RESULT event is for work that started; a failed launch is settled
+// by its launch-result event and writes none.
+func TestFailedLaunchProjectsAsErrorResult(t *testing.T) {
+	log := newLogger()
+	log.user("arc-1", "deploy")
+	log.assistant("arc-1", "m1", "starting")
+	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
+		TaskName: "deploy_task", MessageID: "m1", Actor: testActor})
+	// The dispatch marks the launch as handed to a runner, so the failure is
+	// a runner failure and the error text is shown.
+	log.add("disp-1", "arc-1", events.ToolDispatchedEventType, events.ToolDispatchedPayload{CausationID: "task-1"})
+	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
+		CausationID: "task-1", ExternalRef: "task-1", Launched: false, Error: "no runner", LLMVisibility: events.LLMVisibilityNone})
+	log.assistant("arc-1", "m2", "ok")
+
+	transcript := project(t, log, "arc-1", DefaultModes())
+	for _, m := range transcript.Messages {
+		if tm, ok := m.(ModelToolMessage); ok && tm.ToolCallID == "task-1" {
+			if tm.Outcome != ModelToolOutcomeFailed || !tm.IsError || !strings.Contains(tm.Content, "could not be started: no runner") {
+				t.Errorf("result = %+v, want a failed error result carrying the launch error", tm)
+			}
+			return
+		}
+	}
+	t.Error("no synthesized result for the failed launch")
+}

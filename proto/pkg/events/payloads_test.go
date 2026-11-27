@@ -42,3 +42,30 @@ func TestInterruptPayloadCausationRoundTrip(t *testing.T) {
 		t.Errorf("decoded arc-wide = %#v, want empty causation", got)
 	}
 }
+
+// The task meta payload round-trips with its guaranteed external_ref field.
+func TestAsyncTaskLaunchResultPayloadRoundTrip(t *testing.T) {
+	codec := JSONCodec{}
+
+	encoded, err := codec.Encode(AsyncTaskLaunchResultPayload{
+		CausationID: "t1", ExternalRef: "srv-9", Launched: true,
+		Response: map[string]any{"status": "working"}, LLMVisibility: LLMVisibilityNone,
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"external_ref":"srv-9"`) {
+		t.Errorf("encoded = %s, want external_ref", encoded)
+	}
+	decoded, err := codec.Decode(AsyncTaskLaunchResultEventType, encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := decoded.(AsyncTaskLaunchResultPayload)
+	if got.CausationID != "t1" || got.ExternalRef != "srv-9" || !got.Launched || got.LLMVisibility != LLMVisibilityNone {
+		t.Errorf("decoded = %#v", got)
+	}
+	if m, ok := got.Response.(map[string]any); !ok || m["status"] != "working" {
+		t.Errorf("response = %#v, want the runner's raw response kept", got.Response)
+	}
+}

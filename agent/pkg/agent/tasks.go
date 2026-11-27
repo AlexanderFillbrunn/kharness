@@ -207,69 +207,303 @@ func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
 	return last
 }
 
-// startTask records a task, starts it, and answers the call that asked for it.
-//
-// The dispatch and the invocation are written before the task starts, in one
-// write, because the record is what names the task. The invocation ID is
-// minted here so the task can be started under it, and the invoke records the
-// actor that started the task, which every event the task later emits carries.
-func (a Agent) startTask(ctx context.Context, call *history.ToolCall, args any, state *agentState) error {
-	if state.tasks == nil {
-		return a.noController(ctx, call, state)
+// launchTasks starts every task of the arc whose launch is not recorded yet:
+// an invoke without a launch-result event. One round of the loop launches them in log
+// order, then the arc goes back to the model or closes.
+func (a Agent) launchTasks(ctx context.Context, state *agentState) error {
+	for _, task := range state.history.TasksOfArc(state.arc.ID) {
+		if task.LaunchSeq != nil {
+			continue
+		}
+		if err := a.launchTask(ctx, task, state); err != nil {
+			return err
+		}
+		// The arc may have been cancelled or held mid-launch.
+		if state.arc.Status() != history.ArcStatusPending {
+			return nil
+		}
 	}
-	invocationID := common.NewEventID()
-	// The task kind's InResult trail settings ride on the invoke, so the fold
-	// carries them on the task record and every reader of the history sees
-	// them without the agent. Zero trail is unset and folds as the whole
-	// trail; zero chars means no character cap.
-	inResultTrail := 0
-	inResultTrailChars := 0
-	inResultTrailHeader := false
-	if meta, ok := a.tasks.Get(call.ToolName); ok {
-		inResultTrail = meta.InResultTrail
-		inResultTrailChars = meta.InResultTrailChars
-		inResultTrailHeader = meta.InResultTrailHeader
+	return nil
+}
+
+// launchTask runs one task's launch: the BeforeTaskStart decision, then the
+// controller's Start, then the launch-result event recording how the launch went. The
+// dispatch is written before Start so a run that stops mid-launch leaves the
+// marker, and the launch-result event after Start so it says what became of the work.
+func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *agentState) error {
+	// A previous run handed this launch off and stopped before recording it.
+	// The launch is not retried: whether the task took hold is not known.
+	if task.DispatchedSeq != nil {
+		return a.recordLaunch(ctx, task, nil, launchOutcome{reason: "a run stopped before it recorded the launch of this task; whether it took hold is not " +
+			"known, so check before starting it again"}, state)
 	}
-	invoke := &events.Event{
-		ID:            invocationID,
-		Typ:           events.AsyncTaskInvokeEventType,
+
+	d := a.decideLaunch(ctx, task, state)
+	switch {
+	case d.hookErr != nil:
+		// The hook's error goes to the log's Error field only; the model is
+		// never shown a raw error, so the projection renders a generic
+		// policy message for a start refused before any runner was reached.
+		return a.recordLaunch(ctx, task, nil, launchOutcome{
+			reason: fmt.Sprintf("the task policy failed, so the task was not started: %v", d.hookErr),
+		}, state)
+	case d.block != nil:
+		state.logger.WarnContext(ctx, "task start blocked by policy", "task", task.ID, "kind", task.TaskName)
+		// The guardrail event names the task by its invoke ID; the
+		// launch-result event written beside it settles the task.
+		return a.recordLaunch(ctx, task, nil, launchOutcome{reason: d.block.Message}, state,
+			&events.Event{
+				Typ:           events.GuardrailBlockedEventType,
+				CorrelationID: &state.arc.ID,
+				Payload:       events.GuardrailBlockedPayload{CausationID: task.ID, Message: d.block.Message},
+			})
+	case d.ask != nil:
+		return a.raiseTaskAsk(ctx, task, d.ask, state)
+	case d.result != nil || d.launchResult != nil:
+		// Policy settled the start without the task running. A Result fakes
+		// the task's outcome and is written verbatim as its ASYNC_TASK_RESULT
+		// in the same batch, the way a tool call's Answer becomes its tool
+		// result — unless the launch result is an error: then the error alone
+		// settles the task and no result is written at all. LaunchResult
+		// controls what the launch itself reports: with IsError its text
+		// becomes the launch's Error, otherwise it is the launch answer the
+		// model is told the start call returned. Set alone, the task result
+		// stays empty.
+		out := launchOutcome{result: d.result}
+		if d.launchResult != nil {
+			out.launchResultText = d.launchResult.Text
+			if d.launchResult.IsError {
+				out.reason = d.launchResult.Text
+				out.result = nil
+			}
+		}
+		var extras []*events.Event
+		if out.result != nil {
+			outcome := events.AsyncTaskOutcomeSuccess
+			if out.result.IsError {
+				outcome = events.AsyncTaskOutcomeFailed
+			}
+			extras = append(extras, &events.Event{
+				Typ:           events.AsyncTaskResultEventType,
+				CorrelationID: &task.ID,
+				Payload: events.AsyncTaskResultPayload{
+					CausationID:   task.ID,
+					Result:        out.result.Result,
+					Outcome:       outcome,
+					LLMVisibility: events.LLMVisibilityNone,
+				},
+			})
+		}
+		return a.recordLaunch(ctx, task, nil, out, state, extras...)
+	}
+
+	controller := a.controllerFor(state)
+	if controller == nil {
+		return a.recordLaunch(ctx, task, nil, launchOutcome{
+			reason: "this run has no task controller bound to it, so the task could not be started",
+		}, state)
+	}
+	if _, err := a.persistAndFold(ctx, state, &events.Event{
+		Typ:           events.ToolDispatchedEventType,
 		CorrelationID: &state.arc.ID,
-		Payload: events.AsyncTaskInvokePayload{
-			TaskName:            call.ToolName,
-			Args:                args,
-			Actor:               taskActor(state.arc),
-			InResultTrail:       inResultTrail,
-			InResultTrailChars:  inResultTrailChars,
-			InResultTrailHeader: inResultTrailHeader,
-		},
-	}
-	invoke.Actor = taskActor(state.arc)
-	if _, err := a.persistAndFold(ctx, state,
-		&events.Event{
-			Typ:           events.ToolDispatchedEventType,
-			CorrelationID: &state.arc.ID,
-			Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
-		},
-		invoke,
-	); err != nil {
+		Payload:       events.ToolDispatchedPayload{CausationID: task.ID},
+	}); err != nil {
 		return err
 	}
 
 	// The session is filled in by the task source the run was given, which
 	// the worker binds to the session it is working; the agent addresses the
-	// task by ID alone.
-	ref := common.TaskRef{ID: invocationID}
-	if err := state.tasks.Start(ctx, call.ToolName, ref, args); err != nil {
-		return a.settleUnstartedTask(ctx, call, ref, err, state)
+	// task by ID alone. Args the decision pass overrode are the ones that run;
+	// the log keeps the ones the model asked for.
+	args := task.Args
+	if d.override != nil {
+		args = d.override
 	}
+	ref := common.TaskRef{ID: task.ID}
+	state.logger.DebugContext(ctx, "task launch handed to controller", "task", task.ID, "kind", task.TaskName)
+	launch, err := controller.Start(ctx, task.TaskName, ref, args)
+	if err != nil {
+		state.logger.WarnContext(ctx, "task launch failed", "task", task.ID, "kind", task.TaskName, "error", err)
+	}
+	out := launchOutcome{launched: err == nil}
+	if err != nil {
+		out.reason = err.Error()
+	}
+	return a.recordLaunch(ctx, task, launch, out, state)
+}
 
-	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
-		"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
-			"Anything it says reaches you as a turn of its own, a question included, so there is "+
-			"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
-			"it yourself with %s, or put the question to the user first and then answer with %s "+
-			"once you have their reply; stop it with %s. All take that id.",
-		call.ToolName, ref.ID, events.ProvideTaskInputToolName, events.ProvideTaskInputToolName, events.CancelTaskToolName)}, state)
+// launchOutcome is what one launch produced: the verdict, and — when the
+// launch did not happen — the reason (written to Error only when there is an
+// actual error), the policy-supplied result (the launch answer, also written
+// verbatim as the task's result), and the text the model is told the start
+// call returned when the hook overrode it.
+type launchOutcome struct {
+	launched         bool
+	reason           string
+	result           *events.TaskResult
+	launchResultText string
+}
+
+// recordLaunch writes the one launch-result event a launch produces: the launch
+// verdict, the external reference the runner assigned (the task's own ID
+// where the runner assigned none), and the runner's raw response. A launch
+// that did not happen and carries no result settles the task here:
+// ASYNC_TASK_RESULT is for the outcome of work that started, or of a policy
+// answer, which rides the launch result as its Result.
+func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, out launchOutcome, state *agentState, extra ...*events.Event) error {
+	externalRef := task.ID
+	var response any
+	if launch != nil {
+		if launch.ExternalRef != "" {
+			externalRef = launch.ExternalRef
+		}
+		response = launch.Response
+	}
+	launchResult := &events.Event{
+		Typ:           events.AsyncTaskLaunchResultEventType,
+		CorrelationID: &task.ID,
+		Payload: events.AsyncTaskLaunchResultPayload{
+			CausationID:   task.ID,
+			ExternalRef:   externalRef,
+			Launched:      out.launched,
+			Response:      response,
+			Error:         out.reason,
+			Result:        out.result,
+			LaunchResult:  out.launchResultText,
+			LLMVisibility: events.LLMVisibilityNone,
+		},
+	}
+	if _, err := a.persistAndFold(ctx, state, append([]*events.Event{launchResult}, extra...)...); err != nil {
+		return err
+	}
+	switch {
+	case out.launched:
+		state.logger.InfoContext(ctx, "task launched", "task", task.ID, "kind", task.TaskName, "external_ref", externalRef)
+	case out.result != nil && out.reason == "":
+		state.logger.InfoContext(ctx, "task start answered by policy, not launched", "task", task.ID, "kind", task.TaskName)
+	case out.launchResultText != "":
+		state.logger.InfoContext(ctx, "task start launch result set by policy, not launched", "task", task.ID, "kind", task.TaskName)
+	default:
+		state.logger.InfoContext(ctx, "task not launched", "task", task.ID, "kind", task.TaskName, "reason", out.reason)
+	}
+	return nil
+}
+
+// launchDecision is what the BeforeTaskStart pass over one unlaunched task
+// returned.
+type launchDecision struct {
+	hookErr      error
+	block        *BlockRequest
+	ask          *AskRequest
+	result       *events.TaskResult
+	launchResult *LaunchResult
+	override     map[string]any
+}
+
+// decideLaunch runs BeforeTaskStart over one unlaunched task. A task whose
+// start was already asked of a human and answered runs without asking again;
+// a rejection refuses the start.
+func (a Agent) decideLaunch(ctx context.Context, task *history.AsyncTask, state *agentState) launchDecision {
+	if task.Interrupt != nil && task.Interrupt.ResolvedSeq != nil {
+		if task.Interrupt.Status == history.InterruptRejected {
+			return launchDecision{block: &BlockRequest{Message: "a human refused this task start"}}
+		}
+		return launchDecision{}
+	}
+	hook := state.hooks.BeforeTaskStart
+	if hook == nil {
+		return launchDecision{}
+	}
+	eff, err := hook(ctx, TaskStartView{
+		TaskName: task.TaskName,
+		Args:     taskArgsOf(task.Args),
+		CallMeta: CallMeta{CallID: task.ID, MessageID: task.MessageID, ArcID: state.arc.ID},
+	})
+	if err != nil {
+		return launchDecision{hookErr: err}
+	}
+	if err := eff.validate(); err != nil {
+		return launchDecision{hookErr: err}
+	}
+	d := launchDecision{launchResult: eff.LaunchResult}
+	switch {
+	case eff.Run:
+	case eff.Block != nil:
+		d.block = eff.Block
+	case eff.Ask != nil:
+		d.ask = eff.Ask
+	case eff.Result != nil:
+		d.result = eff.Result
+	}
+	if eff.Args != nil {
+		d.override = map[string]any(*eff.Args)
+	}
+	return d
+}
+
+// raiseTaskAsk holds a task's start for a human: one INTERRUPT causated to the
+// task, which the fold hangs off the task and the arc, so the arc reads as
+// interrupted until the answer lands. A BeforeInterrupt block or policy
+// failure refuses the start instead, recorded as a failed launch.
+func (a Agent) raiseTaskAsk(ctx context.Context, task *history.AsyncTask, ask *AskRequest, state *agentState) error {
+	req := InterruptRequest{ToolName: task.TaskName, CallID: task.ID, ArcID: state.arc.ID, Reason: ask.Reason, Context: ask.Context}
+	changes := InterruptChanges{}
+	if hook := state.hooks.BeforeInterrupt; hook != nil {
+		c, err := hook(ctx, req)
+		if err != nil {
+			return a.recordLaunch(ctx, task, nil, launchOutcome{reason: fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err)}, state)
+		}
+		changes = c
+	}
+	if changes.Block != nil {
+		return a.recordLaunch(ctx, task, nil, launchOutcome{reason: changes.Block.Message}, state)
+	}
+	reason, context := req.Reason, req.Context
+	if changes.Reason != nil {
+		reason = *changes.Reason
+	}
+	if changes.Context != nil {
+		context = *changes.Context
+	}
+	interrupt := &events.Event{
+		ID:            common.NewEventID(),
+		Typ:           events.InterruptEventType,
+		CorrelationID: &state.arc.ID,
+		Payload:       events.InterruptPayload{CausationID: task.ID, Reason: reason, Context: context},
+	}
+	evs := []*events.Event{interrupt}
+	if changes.AutoAnswer != nil {
+		answer := *changes.AutoAnswer
+		evs = append(evs, &events.Event{
+			Typ:           events.InterruptResponseEventType,
+			CorrelationID: &state.arc.ID,
+			Payload: events.InterruptResponsePayload{
+				CausationID: interrupt.ID,
+				Response:    answer.Response,
+				IsRejected:  answer.IsRejected,
+			},
+		})
+	}
+	stored, err := a.persistAndFold(ctx, state, evs...)
+	if err != nil {
+		return err
+	}
+	state.logger.InfoContext(ctx, "task start held for a human", "task", task.ID, "interrupt", stored[0].ID)
+	notifyInterruptRaised(ctx, state, stored)
+	return nil
+}
+
+// controllerFor returns the controller a launch or task operation goes
+// through: the run's, or — where the agent's task set is itself a source, as
+// one built with an option like WithA2A — the agent's own.
+func (a Agent) controllerFor(state *agentState) common.TaskController {
+	if state.tasks != nil {
+		return state.tasks
+	}
+	if src, ok := a.tasks.(common.TaskController); ok {
+		return src
+	}
+	return nil
 }
 
 // taskActor is the actor a task's events carry: the one whose message opened
@@ -279,33 +513,6 @@ func taskActor(arc *history.Arc) users.Actor {
 		return *arc.Actor
 	}
 	return users.Actor{}
-}
-
-// settleUnstartedTask closes off a task whose launch failed. The task and its
-// call are settled as failed, since nothing will report on them, and the text
-// says the work may be running anyway.
-//
-// The settle is written with None visibility, correlated to the task: the run
-// that is still in flight reports the failure to the model through the call's
-// own result, so the settle opens no arc.
-func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, ref common.TaskRef, cause error, state *agentState) error {
-	reason := fmt.Sprintf(
-		"task %s could not be started: %s. Whether it took hold before the failure is not known, "+
-			"so check before starting it again.", call.ToolName, cause)
-
-	if _, err := a.persistAndFold(ctx, state, &events.Event{
-		Typ:           events.AsyncTaskResultEventType,
-		CorrelationID: &ref.ID,
-		Payload: events.AsyncTaskResultPayload{
-			CausationID:   ref.ID,
-			Result:        reason,
-			Outcome:       events.AsyncTaskOutcomeFailed,
-			LLMVisibility: events.LLMVisibilityNone,
-		},
-	}); err != nil {
-		return err
-	}
-	return a.settleCall(ctx, call, ToolOutcome{Result: reason, IsError: true}, state)
 }
 
 // cancelTask asks a running task to stop. The cancel is written as a CANCEL

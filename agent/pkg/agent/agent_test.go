@@ -728,6 +728,8 @@ func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
 		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
+		{ID: "am-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskLaunchResultEventType, CorrelationID: ptr("a-1"), Actor: actor,
+			Payload: events.AsyncTaskLaunchResultPayload{CausationID: "a-1", ExternalRef: "a-1", Launched: true, LLMVisibility: events.LLMVisibilityNone}},
 		{ID: "ar-1", Seq: resultSeq, Timestamp: at, Typ: events.AsyncTaskResultEventType, CorrelationID: &resultArc, Actor: actor,
 			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess, LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
@@ -782,7 +784,7 @@ func TestATaskResultAfterTheLastReplyClosesTheOriginArc(t *testing.T) {
 // AC2: the arc a result opens is a work item of its own. Worked, the model gets
 // a turn over it — its opening bubble is the task's result, composed per D9.
 func TestAResultOpenedArcGetsTheModelATurn(t *testing.T) {
-	h := awaitedTaskArc(t, 3)
+	h := awaitedTaskArc(t, 6)
 	persistor := &fakePersistor{next: 10}
 	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
 		{ModelID: "gpt-5", Content: "the audit found 3 things"},
@@ -823,6 +825,8 @@ func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
 		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", Actor: actor}},
+		{ID: "am-1", Seq: 3, Timestamp: at, Typ: events.AsyncTaskLaunchResultEventType, CorrelationID: ptr("a-1"), Actor: actor,
+			Payload: events.AsyncTaskLaunchResultPayload{CausationID: "a-1", ExternalRef: "a-1", Launched: true, LLMVisibility: events.LLMVisibilityNone}},
 		{ID: "aq-1", Seq: askSeq, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &askArc, Actor: actor,
 			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "a-1", Message: "which namespace?", LLMVisibility: events.LLMVisibilityAsMessage}},
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,

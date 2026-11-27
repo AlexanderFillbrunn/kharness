@@ -608,10 +608,10 @@ func (s *selectedTasks) Get(name string) (common.TaskMetadata, bool) {
 
 // Start launches one kind on the source that holds it, and remembers which
 // source that was, so the task's later cancels and answers are routed back.
-func (s *selectedTasks) Start(ctx context.Context, name string, ref common.TaskRef, args any) error {
+func (s *selectedTasks) Start(ctx context.Context, name string, ref common.TaskRef, args any) (*common.TaskLaunch, error) {
 	source, ok := s.byName[name]
 	if !ok {
-		return fmt.Errorf("task not selected: %s", name)
+		return nil, fmt.Errorf("task not selected: %s", name)
 	}
 	s.mu.Lock()
 	s.byTask[ref.ID] = source

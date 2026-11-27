@@ -6,6 +6,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"fillbrunn.ai/kube-agent/proto/pkg/events"
 )
 
 // This file defines the provider-agnostic shape a History is projected into
@@ -579,21 +581,28 @@ func (p *projector) keepSpanningArc(arc *Arc) {
 	}
 	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: role, Content: p.history.OpeningContent(arc)})
 
+	tasks := p.history.TasksOfArc(arc.ID)
 	for _, message := range arc.Responses {
 		if message.Seq <= p.floor {
 			// The spent prefix: the reply's text and its results are dropped —
 			// the summary covers that region once, in prose — and the calls
-			// stay, so the model can see what was tried.
+			// stay, so the model can see what was tried. A task this message
+			// started stays as its call, synthesized from the invoke.
 			assistant := ModelAssistantMessage{}
 			for _, call := range message.ToolCalls {
 				assistant.ToolCalls = append(assistant.ToolCalls, modelToolCall(call))
+			}
+			for _, task := range tasks {
+				if task.MessageID == message.ID {
+					assistant.ToolCalls = append(assistant.ToolCalls, modelTaskCall(task))
+				}
 			}
 			if len(assistant.ToolCalls) > 0 {
 				p.emit(message.Seq, 0, assistant)
 			}
 			continue
 		}
-		p.projectResponse(message, false)
+		p.projectResponse(message, tasks, false)
 	}
 	p.projectErrors(arc)
 	p.projectTasks(arc, 0, false)
@@ -674,11 +683,12 @@ func (p *projector) keepArc(arc *Arc) {
 	// an unanswered call under it means: not "no result yet" but "no result,
 	// and none is coming".
 	stoppedSeq, stopped := arcEnd(arc)
+	tasks := p.history.TasksOfArc(arc.ID)
 	for _, message := range arc.Responses {
 		if p.aboveCeiling(message.Seq) {
 			continue
 		}
-		p.projectResponse(message, stopped)
+		p.projectResponse(message, tasks, stopped)
 	}
 	for _, interrupt := range arc.Interrupts {
 		if p.aboveCeiling(interrupt.Seq) {
@@ -696,8 +706,10 @@ func (p *projector) aboveCeiling(seq int) bool {
 }
 
 // projectResponse emits one assistant message with its calls, their results
-// and any notes its calls produced.
-func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) {
+// and any notes its calls produced. A task the message started is rendered as
+// the call it was to the model: the invoke carries the request and the meta
+// event carries the launch's outcome, so no tool-call events exist for it.
+func (p *projector) projectResponse(message *AssistantMessage, tasks []*AsyncTask, arcStopped bool) {
 	assistant := ModelAssistantMessage{Content: message.Content}
 	var results []ModelMessage
 	var notes []ModelMessage
@@ -738,10 +750,22 @@ func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) 
 		}
 	}
 
+	// Task starts are not tool calls in the log, so they are rendered here
+	// from the task table, as the call and result the model saw them as.
+	synthesized := 0
+	for _, task := range tasks {
+		if task.MessageID != message.ID {
+			continue
+		}
+		synthesized++
+		assistant.ToolCalls = append(assistant.ToolCalls, modelTaskCall(task))
+		results = append(results, p.taskStartResult(task, arcStopped))
+	}
+
 	// A provider that takes reasoning back validates it against the message it
 	// is sent with. A message that lost a call to a mode is no longer that
 	// message, so its reasoning is dropped.
-	if len(assistant.ToolCalls) == len(message.ToolCalls) {
+	if len(assistant.ToolCalls) == len(message.ToolCalls)+synthesized {
 		assistant.Reasoning = message.Reasoning
 	}
 
@@ -983,6 +1007,107 @@ func lastResponseSeq(arc *Arc) int {
 // without the log.
 func modelToolCall(call *ToolCall) ModelToolCall {
 	return ModelToolCall{ID: call.ID, VendorID: call.VendorID, Name: call.ToolName, Args: call.Args}
+}
+
+// modelTaskCall renders a task's invoke as the tool call the model made to
+// start it: same name, same args, the task's ID as the call ID.
+func modelTaskCall(task *AsyncTask) ModelToolCall {
+	return ModelToolCall{ID: task.ID, Name: task.TaskName, Args: task.Args}
+}
+
+// taskStartResult renders a task's launch as the tool result the model saw
+// for that call, synthesized from the task's launch-result event: the launch verdict
+// and the task ID the later task tools take.
+func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolMessage {
+	if task.LaunchSeq == nil {
+		content := "[this task start has not been recorded as launched yet]"
+		if arcStopped {
+			if task.DispatchedSeq != nil {
+				content = "[this task was handed to its runner and then stopped before the launch was recorded. Whether it took hold is not known.]"
+			} else {
+				content = "[this task was never started: the request it belonged to ended first]"
+			}
+		}
+		return ModelToolMessage{ToolCallID: task.ID, Outcome: ModelToolOutcomePending, Content: content}
+	}
+	if task.BlockedMessage != "" {
+		return ModelToolMessage{
+			ToolCallID: task.ID,
+			Outcome:    ModelToolOutcomeBlocked,
+			Content:    refusalText("a policy refused this task start, without asking anyone", task.BlockedMessage),
+		}
+	}
+	if !task.Launched {
+		// A policy answer settled the start without the task running: the log
+		// says so, and the model gets the answer as the call's result, the way
+		// a tool call's Answer becomes its tool result — unless the hook
+		// overrode the text, to hide that the task never launched.
+		if task.LaunchAnswer != nil {
+			outcome := ModelToolOutcomeSuccess
+			if task.LaunchAnswer.IsError {
+				outcome = ModelToolOutcomeFailed
+			}
+			content := task.LaunchResultText
+			if content == "" {
+				content = fmt.Sprintf("[this task start was intercepted by policy; the task did not run. Result: %s]",
+					resultText(task.LaunchAnswer.Result))
+			}
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    outcome,
+				IsError:    task.LaunchAnswer.IsError,
+				Content:    content,
+			}
+		}
+		if task.LaunchResultText != "" {
+			// A launch result without a task result: the hook told the model
+			// what the start call returned, and the task itself settled with
+			// an empty result. An error launch result fails the call, a plain
+			// one does not.
+			isErr := resultText(task.Result) != ""
+			outcome := ModelToolOutcomeSuccess
+			if isErr {
+				outcome = ModelToolOutcomeFailed
+			}
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    outcome,
+				IsError:    isErr,
+				Content:    task.LaunchResultText,
+			}
+		}
+		if task.DispatchedSeq != nil {
+			// The launch reached a runner: the error is real and whether it
+			// took hold before the failure is genuinely not known.
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    ModelToolOutcomeFailed,
+				IsError:    true,
+				Content: fmt.Sprintf("task %s could not be started: %s. Whether it took hold before the failure is not known, so check before starting it again.",
+					task.TaskName, resultText(task.Result)),
+			}
+		}
+		// Refused before any runner was reached — a hook error or policy
+		// failure. The raw error stays in the log; the model gets the generic
+		// message.
+		return ModelToolMessage{
+			ToolCallID: task.ID,
+			Outcome:    ModelToolOutcomeFailed,
+			IsError:    true,
+			Content:    "the task start was refused by policy",
+		}
+	}
+	return ModelToolMessage{
+		ToolCallID: task.ID,
+		Outcome:    ModelToolOutcomeSuccess,
+		Content: fmt.Sprintf(
+			"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
+				"Anything it says reaches you as a turn of its own, a question included, so there is "+
+				"nothing here to wait for and nothing to poll. When it asks a question, you may answer "+
+				"it yourself with %s, or put the question to the user first and then answer with %s "+
+				"once you have their reply; stop it with %s. All take that id.",
+			task.TaskName, task.ID, events.ProvideTaskInputToolName, events.ProvideTaskInputToolName, events.CancelTaskToolName),
+	}
 }
 
 // toolResult renders a settled call's outcome, thinned to the configured cap.

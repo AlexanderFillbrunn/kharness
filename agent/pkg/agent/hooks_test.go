@@ -520,8 +520,9 @@ func TestWavesSoloCallsRunAlone(t *testing.T) {
 	}
 }
 
-// A BeforeTaskStart Block refuses the start without asking anyone: no task is
-// invoked, the call settles BLOCKED, and the run continues.
+// A BeforeTaskStart Block refuses the start without asking anyone: the
+// invoke is recorded, the launch-result event records the launch as failed, no task is
+// started, and the run continues.
 func TestBeforeTaskStartBlock(t *testing.T) {
 	controller := &fakeController{}
 	tasks := taskSourceWith(t, controller, "deploy_task")
@@ -537,7 +538,7 @@ func TestBeforeTaskStartBlock(t *testing.T) {
 			if v.Args["env"] != "prod" || v.CallID == "" || v.ArcID != testArcID {
 				t.Errorf("hook saw args %v, call %q, arc %q", v.Args, v.CallID, v.ArcID)
 			}
-			return TaskStartEffects{HookEffects: HookEffects{Block: &BlockRequest{Message: "task starts need a ticket"}}}, nil
+			return TaskStartEffects{Block: &BlockRequest{Message: "task starts need a ticket"}}, nil
 		},
 	}))
 	if err != nil {
@@ -552,12 +553,36 @@ func TestBeforeTaskStartBlock(t *testing.T) {
 	if len(controller.started) != 0 {
 		t.Errorf("started tasks = %v, want none", controller.started)
 	}
-	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 0 {
-		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want none", len(invokes))
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
 	}
-	call := h.Arcs[0].Responses[0].ToolCalls[0]
-	if call.Status != history.ToolCallStatusBlocked {
-		t.Errorf("call status = %s, want BLOCKED", call.Status)
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.CausationID != invokes[0].ID || meta.ExternalRef != invokes[0].ID {
+		t.Errorf("launch result = %+v, want Launched=false with the invoke's ID as causation and external ref", meta)
+	}
+	if !strings.Contains(meta.Error, "task starts need a ticket") {
+		t.Errorf("launch result error = %q, want the block message", meta.Error)
+	}
+	// The guardrail event names the task by its invoke event's ID.
+	guardrails := persistedOfType(persistor, events.GuardrailBlockedEventType)
+	if len(guardrails) != 1 {
+		t.Fatalf("persisted %d GUARDRAIL_BLOCKED events, want 1", len(guardrails))
+	}
+	if pl := guardrails[0].Payload.(events.GuardrailBlockedPayload); pl.CausationID != invokes[0].ID {
+		t.Errorf("guardrail causation = %q, want the task invoke %q", pl.CausationID, invokes[0].ID)
+	}
+	if task := h.Tasks[invokes[0].ID]; task == nil || task.BlockedMessage != "task starts need a ticket" {
+		t.Errorf("task blocked message = %v, want the refusal recorded on the task", task)
+	}
+	// The projection renders the blocked start as a blocked call result.
+	result := projectedTaskResult(t, h, testArcID, invokes[0].ID)
+	if result.Outcome != history.ModelToolOutcomeBlocked {
+		t.Errorf("projected outcome = %s, want BLOCKED", result.Outcome)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusDone {
 		t.Errorf("arc = %s, want DONE", h.Arcs[0].Status())
@@ -575,7 +600,7 @@ func TestBeforeTaskStartAskThenApprovalStartsTask(t *testing.T) {
 	}}
 	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
 		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
-			return TaskStartEffects{HookEffects: HookEffects{Ask: &AskRequest{Reason: "start deploy_task?"}}}, nil
+			return TaskStartEffects{Ask: &AskRequest{Reason: "start deploy_task?"}}, nil
 		},
 	}))
 	if err != nil {
@@ -595,9 +620,12 @@ func TestBeforeTaskStartAskThenApprovalStartsTask(t *testing.T) {
 	if len(interrupts) != 1 {
 		t.Fatalf("persisted %d INTERRUPT events, want 1", len(interrupts))
 	}
-	call := h.Arcs[0].Responses[0].ToolCalls[0]
-	if pl := interrupts[0].Payload.(events.InterruptPayload); pl.CausationID != call.ID {
-		t.Errorf("interrupt causation = %q, want call %q", pl.CausationID, call.ID)
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	if pl := interrupts[0].Payload.(events.InterruptPayload); pl.CausationID != invokes[0].ID {
+		t.Errorf("interrupt causation = %q, want task %q", pl.CausationID, invokes[0].ID)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusInterrupted {
 		t.Fatalf("arc = %s, want INTERRUPTED", h.Arcs[0].Status())
@@ -625,6 +653,13 @@ func TestBeforeTaskStartAskThenApprovalStartsTask(t *testing.T) {
 	}
 	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 1 {
 		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	if meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload); !meta.Launched || meta.CausationID != invokes[0].ID {
+		t.Errorf("launch result = %+v, want Launched=true causated to the invoke", meta)
 	}
 	if h.Arcs[0].Status() != history.ArcStatusDone {
 		t.Errorf("arc = %s, want DONE", h.Arcs[0].Status())
@@ -930,7 +965,7 @@ func (l *capturingLLM) StreamResponse(ctx context.Context, t *history.ModelTrans
 // the log.
 func TestBeforeAssistantReshapesRequest(t *testing.T) {
 	registry := parallelRegistry(t, true, map[string]mcp.ToolHandler{
-		"read_a": func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return textResult("a"), nil },
+		"read_a":  func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return textResult("a"), nil },
 		"write_b": func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return textResult("b"), nil },
 	})
 	llm := &capturingLLM{scriptedLLM: &scriptedLLM{replies: []*LLMResponse{finalReply("done")}}}
@@ -1233,15 +1268,33 @@ func TestEveryHookFiresTheExpectedNumberOfTimes(t *testing.T) {
 			counts["AfterToolCall"]++
 			return ToolCallChanges{}, nil
 		},
-		BeforeTaskStart:  func(context.Context, TaskStartView) (TaskStartEffects, error) { counts["BeforeTaskStart"]++; return TaskStartEffects{HookEffects: HookEffects{Run: true}}, nil },
-		BeforeTaskCancel: func(context.Context, TaskCancelView) (TaskCancelEffects, error) { counts["BeforeTaskCancel"]++; return HookEffects{Run: true}, nil },
-		BeforeTaskInput:  func(context.Context, TaskInputView) (TaskInputEffects, error) { counts["BeforeTaskInput"]++; return HookEffects{Run: true}, nil },
-		AfterTaskResult:  func(context.Context, TaskResultView) { counts["AfterTaskResult"]++ },
-		AfterTaskEvent:   func(context.Context, TaskEventView) { counts["AfterTaskEvent"]++ },
-		BeforeSkillLoad:  func(context.Context, ToolCallView) (ToolCallEffects, error) { counts["BeforeSkillLoad"]++; return ToolCallEffects{HookEffects: HookEffects{Run: true}}, nil },
-		AfterSkillLoad:   func(context.Context, ToolCallResult) (ToolCallChanges, error) { counts["AfterSkillLoad"]++; return ToolCallChanges{}, nil },
-		BeforeInterrupt:  func(context.Context, InterruptRequest) (InterruptChanges, error) { counts["BeforeInterrupt"]++; return InterruptChanges{}, nil },
-		AfterInterrupt:   func(context.Context, InterruptView) { counts["AfterInterrupt"]++ },
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			counts["BeforeTaskStart"]++
+			return TaskStartEffects{Run: true}, nil
+		},
+		BeforeTaskCancel: func(context.Context, TaskCancelView) (TaskCancelEffects, error) {
+			counts["BeforeTaskCancel"]++
+			return HookEffects{Run: true}, nil
+		},
+		BeforeTaskInput: func(context.Context, TaskInputView) (TaskInputEffects, error) {
+			counts["BeforeTaskInput"]++
+			return HookEffects{Run: true}, nil
+		},
+		AfterTaskResult: func(context.Context, TaskResultView) { counts["AfterTaskResult"]++ },
+		AfterTaskEvent:  func(context.Context, TaskEventView) { counts["AfterTaskEvent"]++ },
+		BeforeSkillLoad: func(context.Context, ToolCallView) (ToolCallEffects, error) {
+			counts["BeforeSkillLoad"]++
+			return ToolCallEffects{HookEffects: HookEffects{Run: true}}, nil
+		},
+		AfterSkillLoad: func(context.Context, ToolCallResult) (ToolCallChanges, error) {
+			counts["AfterSkillLoad"]++
+			return ToolCallChanges{}, nil
+		},
+		BeforeInterrupt: func(context.Context, InterruptRequest) (InterruptChanges, error) {
+			counts["BeforeInterrupt"]++
+			return InterruptChanges{}, nil
+		},
+		AfterInterrupt:         func(context.Context, InterruptView) { counts["AfterInterrupt"]++ },
 		AfterInterruptResponse: func(context.Context, InterruptResponseView) { counts["AfterInterruptResponse"]++ },
 		AfterArcClosed:         func(context.Context, ArcSummary) { counts["AfterArcClosed"]++ },
 	}
@@ -1512,3 +1565,268 @@ func TestTriggerSwallowedByAnotherArcsSnapshotGetsAFullRead(t *testing.T) {
 }
 
 // DecideInterruptResponse is what an answering side calls before persisting:
+
+// A BeforeTaskStart Result fakes the task's outcome without the task running:
+// the launch result records Launched=false with an empty Error, the result is
+// written verbatim as the task's ASYNC_TASK_RESULT, and the model is told by
+// default that the start was intercepted.
+func TestBeforeTaskStartResultRecordsTaskResult(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", map[string]any{"env": "prod"}),
+		finalReply("answered"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{Result: &events.TaskResult{Result: "not needed"}}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched {
+		t.Errorf("launch result = %+v, want Launched=false: nothing ran", meta)
+	}
+	if meta.Error != "" {
+		t.Errorf("launch result error = %q, want empty: a policy result is not an error", meta.Error)
+	}
+	if meta.Result == nil || meta.Result.Result != "not needed" {
+		t.Errorf("launch result result = %+v, want the hook's result: what says the hook intercepted and provided an outcome", meta.Result)
+	}
+	results := persistedOfType(persistor, events.AsyncTaskResultEventType)
+	if len(results) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_RESULT events, want 1 carrying the result", len(results))
+	}
+	if pl := results[0].Payload.(events.AsyncTaskResultPayload); pl.Result != "not needed" || pl.Outcome != events.AsyncTaskOutcomeSuccess {
+		t.Errorf("task result = %+v, want the result verbatim as a success", pl)
+	}
+	task := h.TasksInOrder()[0]
+	if task.Status != history.AsyncTaskSuccess {
+		t.Errorf("task status = %s, want SUCCESS settled by the result event", task.Status)
+	}
+	// By default the model is told the start was intercepted, with the result.
+	result := projectedTaskResult(t, h, testArcID, task.ID)
+	if result.Outcome != history.ModelToolOutcomeSuccess || result.IsError ||
+		!strings.Contains(result.Content, "intercepted by policy") || !strings.Contains(result.Content, "not needed") {
+		t.Errorf("projected result = %+v, want the default intercepted message carrying the result", result)
+	}
+}
+
+// LaunchResult overrides what the model is told the start call returned, so the
+// LLM need not know the task was not actually launched.
+func TestBeforeTaskStartLaunchResultOverridesModelMessage(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				Result:       &events.TaskResult{Result: "not needed"},
+				LaunchResult: &LaunchResult{Text: "not needed"},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Error != "" || meta.Result == nil || meta.LaunchResult != "not needed" {
+		t.Errorf("launch result = %+v, want Error empty, the result, and LaunchResult %q", meta, "not needed")
+	}
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Content != "not needed" {
+		t.Errorf("projected result = %q, want exactly the override text, no interception note", result.Content)
+	}
+}
+
+// A LaunchResult marked IsError becomes the launch's Error, and no task
+// result is written at all: the error alone settles the task as failed, and
+// the model sees a failed start call with that text.
+func TestBeforeTaskStartLaunchResultIsError(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				LaunchResult: &LaunchResult{Text: "quota exceeded", IsError: true},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.Error != "quota exceeded" || meta.Result != nil || meta.LaunchResult != "quota exceeded" {
+		t.Errorf("launch result = %+v, want Launched=false, Error=%q, no Result, LaunchResult=%q", meta, "quota exceeded", "quota exceeded")
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: an error launch result writes no task result", len(results))
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED settled by the launch error", task.Status)
+	}
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Content != "quota exceeded" || result.Outcome != history.ModelToolOutcomeFailed || !result.IsError {
+		t.Errorf("projected result = %+v, want the error text as a failed result", result)
+	}
+}
+
+// Even with a Result set, an IsError launch result suppresses the task result:
+// the launch error alone settles the task.
+func TestBeforeTaskStartLaunchResultIsErrorSuppressesResult(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				Result:       &events.TaskResult{Result: "nope", IsError: true},
+				LaunchResult: &LaunchResult{Text: "quota exceeded", IsError: true},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Error != "quota exceeded" || meta.Result != nil {
+		t.Errorf("launch result = %+v, want Error=%q and no Result: the IsError launch result wins", meta, "quota exceeded")
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none", len(results))
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED", task.Status)
+	}
+}
+
+// A LaunchResult set alone reports the launch without faking a task outcome:
+// no ASYNC_TASK_RESULT is written and the task settles with an empty result,
+// while the model is told exactly the launch result text.
+func TestBeforeTaskStartLaunchResultAloneLeavesEmptyResult(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{
+				LaunchResult: &LaunchResult{Text: "already deployed"},
+			}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.Error != "" || meta.Result != nil || meta.LaunchResult != "already deployed" {
+		t.Errorf("launch result = %+v, want Launched=false, Error empty, no Result, LaunchResult=%q", meta, "already deployed")
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: no result was faked", len(results))
+	}
+	task := h.TasksInOrder()[0]
+	if task.Status != history.AsyncTaskFailed || task.Result != "" {
+		t.Errorf("task = status %s result %v, want FAILED with an empty result", task.Status, task.Result)
+	}
+	result := projectedTaskResult(t, h, testArcID, task.ID)
+	if result.Content != "already deployed" || result.Outcome != history.ModelToolOutcomeSuccess || result.IsError {
+		t.Errorf("projected result = %+v, want the launch result text as a successful result", result)
+	}
+}
+
+// A BeforeTaskStart error return goes to the launch result's Error in the log,
+// but the model is never shown the raw error: the projection renders the
+// generic policy message, and no task result is written.
+func TestBeforeTaskStartErrorNotShownToModel(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{}, errors.New("policy backend unreachable")
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || !strings.Contains(meta.Error, "policy backend unreachable") || meta.Result != nil {
+		t.Errorf("launch result = %+v, want Launched=false with the hook error in Error and no result", meta)
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none", len(results))
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED", task.Status)
+	}
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Outcome != history.ModelToolOutcomeFailed || !result.IsError ||
+		result.Content != "the task start was refused by policy" {
+		t.Errorf("projected result = %+v, want the generic policy message, not the raw error", result)
+	}
+}

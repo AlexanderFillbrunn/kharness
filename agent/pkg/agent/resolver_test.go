@@ -571,7 +571,7 @@ func TestSelectedTasksRouteCancelToTheStartingSource(t *testing.T) {
 	}
 
 	ref := common.TaskRef{SessionID: "s", ID: "task-1"}
-	if err := selected.Start(context.Background(), "tb", ref, nil); err != nil {
+	if _, err := selected.Start(context.Background(), "tb", ref, nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if err := selected.Cancel(context.Background(), ref, "done"); err != nil {

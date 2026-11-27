@@ -43,7 +43,7 @@ func (s *sessionController) fill(ref TaskRef) TaskRef {
 	return ref
 }
 
-func (s *sessionController) Start(ctx context.Context, name string, ref TaskRef, args any) error {
+func (s *sessionController) Start(ctx context.Context, name string, ref TaskRef, args any) (*TaskLaunch, error) {
 	return s.controller.Start(ctx, name, s.fill(ref), args)
 }
 
@@ -53,6 +53,19 @@ func (s *sessionController) Cancel(ctx context.Context, ref TaskRef, reason stri
 
 func (s *sessionController) ProvideInput(ctx context.Context, ref TaskRef, requestID, input string) error {
 	return s.controller.ProvideInput(ctx, s.fill(ref), requestID, input)
+}
+
+// TaskLaunch is what a controller's Start returned for the invocation: what
+// the runner sent back when the work was handed to it. It is recorded in the
+// task's ASYNC_TASK_LAUNCH_RESULT event, not shown to the model.
+type TaskLaunch struct {
+	// ExternalRef is the ID the runner assigned the task, for a runner that
+	// assigns its own. Empty means the runner took the caller's ref.ID as
+	// the task's ID, and the writer falls back to it.
+	ExternalRef string
+
+	// Response is the runner's raw reply to the invocation, kept as it came.
+	Response any
 }
 
 // TaskController starts tasks and reaches the ones already running. It says
@@ -72,8 +85,11 @@ func (s *sessionController) ProvideInput(ctx context.Context, ref TaskRef, reque
 type TaskController interface {
 	// Start launches one kind of task, named as the model named it, and
 	// returns as soon as the work is under way. It is handed the reference
-	// the task reports back under.
-	Start(ctx context.Context, name string, ref TaskRef, args any) error
+	// the task reports back under, and returns what the runner said about
+	// the launch — an error means the launch failed, which is not the same
+	// as the task never having started, since the work may be running
+	// anyway.
+	Start(ctx context.Context, name string, ref TaskRef, args any) (*TaskLaunch, error)
 
 	// Cancel asks a task to stop. It does not settle the task: what became of
 	// work under way is the runner's to report.

@@ -59,6 +59,9 @@ func (JSONCodec) Decode(t EventType, data []byte) (EventPayload, error) {
 	case AsyncTaskInputProvidedEventType:
 		var p AsyncTaskInputProvidedPayload
 		return p, json.Unmarshal(data, &p)
+	case AsyncTaskLaunchResultEventType:
+		var p AsyncTaskLaunchResultPayload
+		return p, json.Unmarshal(data, &p)
 	case ErrorEventType:
 		var p ErrorPayload
 		return p, json.Unmarshal(data, &p)

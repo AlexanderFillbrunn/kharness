@@ -177,6 +177,8 @@ func LLMVisibilityOf(p EventPayload) LLMVisibility {
 		return typed.LLMVisibility
 	case AsyncTaskResultPayload:
 		return typed.LLMVisibility
+	case AsyncTaskLaunchResultPayload:
+		return typed.LLMVisibility
 	}
 	return ""
 }
@@ -192,6 +194,8 @@ func TaskCausation(p EventPayload) (string, bool) {
 	case AsyncTaskInputProvidedPayload:
 		return typed.CausationID, true
 	case AsyncTaskResultPayload:
+		return typed.CausationID, true
+	case AsyncTaskLaunchResultPayload:
 		return typed.CausationID, true
 	}
 	return "", false
@@ -215,6 +219,10 @@ type AsyncTaskInvokePayload struct {
 	TaskName string      `json:"task_name"`
 	Args     any         `json:"args"`
 	Actor    users.Actor `json:"actor"`
+
+	// MessageID names the assistant message that requested the start, so the
+	// projection can render the start as the call it was to the model.
+	MessageID string `json:"message_id,omitempty"`
 
 	// InResultTrail is how many InResult events the task's result message
 	// carries, or -1 for the whole trail, copied from the task kind's
@@ -334,6 +342,69 @@ func (AsyncTaskInputProvidedPayload) EventType() EventType {
 	return AsyncTaskInputProvidedEventType
 }
 func (AsyncTaskInputProvidedPayload) eventPayload() {}
+
+// AsyncTaskLaunchResultPayload records what became of a task's launch: whether it was
+// launched at all, and the reference the runner assigned it. It is written
+// once per invoke, after the controller returned, and settles the task when
+// the launch failed — ASYNC_TASK_RESULT is reserved for the outcome of work
+// that actually started. It is always written with None visibility: the
+// launch record is routing and replay metadata, never model-facing, and the
+// model sees the start as a synthesized call and result in the projection.
+type AsyncTaskLaunchResultPayload struct {
+	CausationID string `json:"causation_id"`
+
+	// ExternalRef is the ID the task's runner assigned it, guaranteed
+	// non-empty: the writer falls back to CausationID — the task ID the
+	// caller sent the runner — when the runner returned none. A report or
+	// callback naming this ID routes to the task.
+	ExternalRef string `json:"external_ref"`
+
+	// Launched says whether the task was started. When false and no Result is
+	// present, the task is settled as failed and Error carries the reason.
+	Launched bool `json:"launched"`
+
+	// Response is the runner's raw response to the invocation, kept for replay
+	// and for outbound calls that need the runner's own IDs. Nil on failure.
+	Response any `json:"response,omitempty"`
+
+	// Error is set only when there is an actual error: a hook's error return,
+	// a runner failure, a policy block, a launch never recorded, or a
+	// LaunchResult the hook marked as an error. Empty when the task launched
+	// and for a policy answer that is not an error. The log keeps it; the
+	// model is never shown a raw error — the projection renders policy
+	// failures as a generic message.
+	Error string `json:"error,omitempty"`
+
+	// Result is the launch answer: the outcome a policy hook supplied when it
+	// intercepted the start without the task running. The log still records
+	// Launched=false — nothing ran — and the answer is also written verbatim
+	// as the task's ASYNC_TASK_RESULT. The projection renders it as the start
+	// call's result, the way a tool call's Answer becomes its tool result.
+	// Nil when the hook reported the launch itself as an error (Error carries
+	// the text and no RESULT event is written) or set the launch result alone.
+	Result *TaskResult `json:"result,omitempty"`
+
+	// LaunchResult is what the model is told the launch call returned when a
+	// policy hook settled the start without the task running. Empty means the
+	// default: a note that the start was intercepted, with the Result
+	// alongside. Set it to hide from the model that the task never launched,
+	// or without a Result to leave the task result empty.
+	LaunchResult string `json:"launch_result,omitempty"`
+
+	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
+}
+
+// TaskResult is a policy hook's supplied outcome for a task start, as recorded
+// in the log.
+type TaskResult struct {
+	Result  any  `json:"result"`
+	IsError bool `json:"is_error,omitempty"`
+}
+
+func (AsyncTaskLaunchResultPayload) EventType() EventType {
+	return AsyncTaskLaunchResultEventType
+}
+func (AsyncTaskLaunchResultPayload) eventPayload() {}
 
 type ErrorPayload struct {
 	Message     string  `json:"message"`

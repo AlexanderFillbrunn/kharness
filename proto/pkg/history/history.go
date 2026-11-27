@@ -197,10 +197,49 @@ type AsyncTask struct {
 	// CorrelationID is the arc that started this task: the task's origin arc.
 	CorrelationID string `json:"correlation_id"`
 
+	// MessageID names the assistant message that requested the start, so the
+	// projection can render the start as the tool call it was to the model.
+	MessageID string `json:"message_id,omitempty"`
+
 	TaskName string          `json:"task_name"`
 	Status   AsyncTaskStatus `json:"status"`
 	Args     any             `json:"args,omitempty"`
 	Result   any             `json:"result,omitempty"`
+
+	// ExternalRef is the ID the task's runner assigned it, recorded on the
+	// task's ASYNC_TASK_LAUNCH_RESULT event; empty until that event is folded. A
+	// report or callback naming it routes to this task.
+	ExternalRef string `json:"external_ref,omitempty"`
+
+	// Response is the runner's raw response to the invocation, from the same
+	// event. Nil when the launch failed or the event is not folded yet.
+	Response any `json:"response,omitempty"`
+
+	// Launched says whether the launch succeeded; LaunchSeq is the launch-result event's
+	// seq. LaunchSeq nil means no launch was recorded yet: the task is starting
+	// or its launch record was lost with a stopped run.
+	Launched  bool `json:"launched,omitempty"`
+	LaunchSeq *int `json:"meta_seq,omitempty"`
+
+	// DispatchedSeq is set when a run handed the launch to the controller,
+	// before the launch-result event came back. An invoke with a dispatch but no launch result
+	// is a launch whose fate a stopped run never recorded: it is not retried.
+	DispatchedSeq *int `json:"dispatched_seq,omitempty"`
+
+	// Interrupt is the human decision this task's start is held up for, if
+	// one was asked and is pending or resolved.
+	Interrupt *Interrupt `json:"-"`
+
+	// BlockedMessage is the guardrail's refusal, recorded when a policy
+	// blocked the launch; the launch-result event beside it settles the task.
+	BlockedMessage string `json:"blocked_message,omitempty"`
+
+	// LaunchAnswer is the outcome a policy hook supplied when it intercepted
+	// the start without the task running; the projection renders it as the
+	// start call's result. LaunchResultText overrides the text the model is
+	// told, so a hook can hide that the task never launched.
+	LaunchAnswer     *events.TaskResult `json:"launch_answer,omitempty"`
+	LaunchResultText string             `json:"launch_result_text,omitempty"`
 
 	// Actor is who started the task, recorded on the invoke and copied
 	// forward onto every event the task emits. It records who started the
@@ -702,6 +741,7 @@ var applyFuncs = map[events.EventType]applyFunc{
 	events.AsyncTaskEventEventType:          (*History).applyAsyncTaskEvent,
 	events.AsyncTaskInputRequestedEventType: (*History).applyAsyncTaskInputRequested,
 	events.AsyncTaskInputProvidedEventType:  (*History).applyAsyncTaskInputProvided,
+	events.AsyncTaskLaunchResultEventType:   (*History).applyAsyncTaskLaunchResult,
 	events.ErrorEventType:                   (*History).applyError,
 	events.GuardrailBlockedEventType:        (*History).applyGuardrailBlocked,
 	events.CancelEventType:                  (*History).applyCancel,
@@ -815,7 +855,16 @@ func (h *History) applyToolDispatched(ev *events.Event, state *FoldState) error 
 	}
 	tc, ok := state.toolCalls[pl.CausationID]
 	if !ok {
-		return fmt.Errorf("no tool call with ID=%s found for tool dispatch", pl.CausationID)
+		// A dispatch naming a task rather than a call marks the launch as
+		// handed off: the launch-result event that follows records how it ended.
+		task, isTask := state.asyncTasks[pl.CausationID]
+		if !isTask {
+			return fmt.Errorf("no tool call with ID=%s found for tool dispatch", pl.CausationID)
+		}
+		if task.DispatchedSeq == nil {
+			task.DispatchedSeq = &ev.Seq
+		}
+		return nil
 	}
 	tc.Dispatches++
 	if tc.DispatchedSeq == nil {
@@ -904,6 +953,21 @@ func (h *History) applyInterrupt(ev *events.Event, state *FoldState) error {
 		return nil
 	}
 
+	if task, isTask := state.asyncTasks[pl.CausationID]; isTask {
+		// An interrupt holding up a task's start: it hangs off the task and
+		// off the arc, so the arc reads as interrupted while it is pending.
+		arc, ok := state.arcs[*ev.CorrelationID]
+		if !ok {
+			return fmt.Errorf("no arc with ID=%s found for interrupt", *ev.CorrelationID)
+		}
+		if task.Interrupt != nil {
+			return fmt.Errorf("task %s already has interrupt %s", task.ID, task.Interrupt.ID)
+		}
+		task.Interrupt = interrupt
+		arc.Interrupts = append(arc.Interrupts, interrupt)
+		state.interrupts[interrupt.ID] = interrupt
+		return nil
+	}
 	call, ok := state.toolCalls[pl.CausationID]
 	if !ok {
 		return fmt.Errorf("no tool call with ID=%s found for interrupt", pl.CausationID)
@@ -946,6 +1010,20 @@ func (h *History) applyInterruptResponse(ev *events.Event, state *FoldState) err
 		interrupt.Response = pl.Response
 		interrupt.ResolvedSeq = &ev.Seq
 		interrupt.Status = InterruptAnswered
+		return nil
+	}
+
+	if _, isTask := state.asyncTasks[interrupt.CausationID]; isTask {
+		// A task start held for a human: a rejection refuses the start, which
+		// the launch step records as a failed launch.
+		interrupt.Responder = &pl.Actor
+		interrupt.Response = pl.Response
+		interrupt.ResolvedSeq = &ev.Seq
+		if pl.IsRejected {
+			interrupt.Status = InterruptRejected
+		} else {
+			interrupt.Status = InterruptApproved
+		}
 		return nil
 	}
 
@@ -999,6 +1077,7 @@ func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error
 		ID:                  ev.ID,
 		Seq:                 ev.Seq,
 		CorrelationID:       *ev.CorrelationID,
+		MessageID:           pl.MessageID,
 		TaskName:            pl.TaskName,
 		Status:              AsyncTaskPending,
 		Args:                pl.Args,
@@ -1100,6 +1179,47 @@ func taskAskContent(task *AsyncTask, message string) string {
 	return fmt.Sprintf("Task %s with id %s (asks a question)\n"+
 		"[background task, not the user — answer it with %s, or ask the user first and then call %s with their answer]\n%s",
 		task.TaskName, task.ID, TaskInputToolName, TaskInputToolName, message)
+}
+
+// applyAsyncTaskLaunchResult records the outcome of a task's launch: the external
+// reference the runner assigned and the runner's raw response. A launch-result event
+// saying the launch failed settles the task as failed — ASYNC_TASK_RESULT is
+// reserved for the outcome of work that actually started — so no later
+// report about the task is accepted. The event is written with None
+// visibility and correlates to the task, so it opens no arc.
+func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState) error {
+	pl, ok := ev.Payload.(events.AsyncTaskLaunchResultPayload)
+	if !ok {
+		return errors.New("expected payload type to be AsyncTaskLaunchResultPayload")
+	}
+	if !pl.LLMVisibility.Valid() {
+		return fmt.Errorf("async task meta for %s carries no valid visibility", pl.CausationID)
+	}
+	if _, err := h.routeTaskEvent(ev, state, pl.CausationID); err != nil {
+		return err
+	}
+	task := state.asyncTasks[pl.CausationID]
+	if task.LaunchSeq != nil {
+		// One launch record per invoke: the first sticks.
+		return nil
+	}
+	task.ExternalRef = pl.ExternalRef
+	task.Response = pl.Response
+	task.Launched = pl.Launched
+	task.LaunchAnswer = pl.Result
+	task.LaunchResultText = pl.LaunchResult
+	task.LaunchSeq = &ev.Seq
+	// A launch that was not launched and not answered settles the task as
+	// failed here. One answered by policy does not: the RESULT event written
+	// beside it settles the task with the answer, the way a tool call's
+	// Answer settles the call.
+	if !pl.Launched && pl.Result == nil && task.FinishedSeq == nil {
+		task.Result = pl.Error
+		task.FinishedAt = &ev.Timestamp
+		task.FinishedSeq = &ev.Seq
+		task.Status = AsyncTaskFailed
+	}
+	return nil
 }
 
 // applyAsyncTaskResult settles a running task as successful or failed. A
@@ -1279,7 +1399,15 @@ func (h *History) applyGuardrailBlocked(ev *events.Event, state *FoldState) erro
 	}
 	tc, ok := state.toolCalls[pl.CausationID]
 	if !ok {
-		return fmt.Errorf("no tool call with ID=%s found for tool call", pl.CausationID)
+		// A guardrail naming a task rather than a call refuses that task's
+		// launch: the message is recorded on the task, and the launch-result
+		// event written beside this one settles it.
+		task, isTask := state.asyncTasks[pl.CausationID]
+		if !isTask {
+			return fmt.Errorf("no tool call with ID=%s found for tool call", pl.CausationID)
+		}
+		task.BlockedMessage = pl.Message
+		return nil
 	}
 	if tc.Status != ToolCallStatusPending {
 		return nil

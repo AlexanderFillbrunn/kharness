@@ -239,8 +239,8 @@ func (c *recordingController) ProvideInput(context.Context, common.TaskRef, stri
 	return nil
 }
 
-func (c *recordingController) Start(context.Context, string, common.TaskRef, any) error {
-	return nil
+func (c *recordingController) Start(context.Context, string, common.TaskRef, any) (*common.TaskLaunch, error) {
+	return nil, nil
 }
 
 // cancelledTaskArc is an arc with a task still running and a cancel recorded

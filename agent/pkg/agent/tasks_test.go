@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fillbrunn.ai/kube-agent/proto/pkg/common"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -27,15 +28,16 @@ type fakeController struct {
 	refs         []common.TaskRef
 	failure      error
 	startFailure error
+	externalRef  string
 }
 
-func (c *fakeController) Start(_ context.Context, name string, ref common.TaskRef, _ any) error {
+func (c *fakeController) Start(_ context.Context, name string, ref common.TaskRef, _ any) (*common.TaskLaunch, error) {
 	if c.startFailure != nil {
-		return c.startFailure
+		return nil, c.startFailure
 	}
 	c.started = append(c.started, name)
 	c.startedRefs = append(c.startedRefs, ref)
-	return nil
+	return &common.TaskLaunch{ExternalRef: c.externalRef}, nil
 }
 
 func (c *fakeController) Cancel(_ context.Context, ref common.TaskRef, _ string) error {
@@ -171,11 +173,13 @@ func TestTheModelIsOfferedToolsAndTasksTogether(t *testing.T) {
 // An agent with no tasks offers what it always offered, and every name is an
 // ordinary tool's.
 // The tool surface comes from the agent's task metadata, but a run with no
-// controller cannot start anything: the call is settled as an error and no
-// invoke is written.
+// controller cannot start anything: the invoke is recorded, the launch-result event
+// records the launch as failed, and no tool call or result is written.
 func TestATaskCallOnARunWithoutControllerFails(t *testing.T) {
-	controller := &fakeController{}
-	tasks := taskSourceWith(t, controller, "auditor")
+	tasks := common.NewTaskRegistry()
+	if err := tasks.RegisterTask(common.TaskMetadata{Name: "auditor", Description: "audits"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 	llm := &scriptedLLM{replies: []*LLMResponse{
 		toolCallReply("call_1", "auditor", map[string]any{"scope": "cluster"}),
 		finalReply("cannot"),
@@ -190,15 +194,23 @@ func TestATaskCallOnARunWithoutControllerFails(t *testing.T) {
 	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(controller.started) != 0 {
-		t.Errorf("started tasks = %v, want none", controller.started)
+	if calls := persistedOfType(persistor, events.ToolCallEventType); len(calls) != 0 {
+		t.Errorf("persisted %d TOOL_CALL events, want none for a task start", len(calls))
 	}
-	if invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType); len(invokes) != 0 {
-		t.Errorf("persisted %d ASYNC_TASK_INVOKE events, want none", len(invokes))
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
 	}
-	call := h.Arcs[0].Responses[0].ToolCalls[0]
-	if call.Status != history.ToolCallStatusFailed {
-		t.Errorf("call status = %s, want FAILED", call.Status)
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || !strings.Contains(meta.Error, "no task controller") {
+		t.Errorf("launch result = %+v, want Launched=false naming the missing controller", meta)
+	}
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none for a failed launch", len(results))
 	}
 }
 
@@ -321,6 +333,24 @@ func resultText(t *testing.T, call *history.ToolCall) string {
 	return text
 }
 
+// projectedTaskResult returns the tool result the projection synthesizes for
+// a task's start — the call and result the model saw for it, since the log
+// holds no tool-call events for a start.
+func projectedTaskResult(t *testing.T, h *history.History, arcID, taskID string) history.ModelToolMessage {
+	t.Helper()
+	transcript, err := h.Project(arcID, history.DefaultModes())
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	for _, m := range transcript.Messages {
+		if tm, ok := m.(history.ModelToolMessage); ok && tm.ToolCallID == taskID {
+			return tm
+		}
+	}
+	t.Fatalf("no tool result for task %s in the projection of %s", taskID, arcID)
+	return history.ModelToolMessage{}
+}
+
 // The invocation is written before the task is started, because the record is
 // what names the task and that name is what the task reports back under.
 func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
@@ -336,7 +366,7 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 	}
 	started := controller.startedRefs[0]
 
-	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, ASYNC_TASK_INVOKE, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
+	want := "ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, TOOL_DISPATCHED, ASYNC_TASK_LAUNCH_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
 	if got := typesOf(persistor.persisted); got != want {
 		t.Fatalf("wrote %s, want %s", got, want)
 	}
@@ -359,10 +389,68 @@ func TestStartingATaskNamesItBeforeItRuns(t *testing.T) {
 		}
 	}
 
-	// The model is told the id, because it is the only way it can answer the
-	// task or stop it later.
-	if text := resultText(t, lastCallIn(t, h, testArcID)); !strings.Contains(text, task.ID) {
-		t.Errorf("result = %q, want it to carry the task id", text)
+	// The model is told the id in the synthesized start result, because it is
+	// the only way it can answer the task or stop it later.
+	if text := projectedTaskResult(t, h, testArcID, task.ID).Content; !strings.Contains(text, task.ID) {
+		t.Errorf("projected start result = %q, want it to carry the task id", text)
+	}
+}
+
+// A task start round-trips as a call: the model's tool call is logged as the
+// task's invoke, and the projection renders the invoke back as the same call —
+// same name and args, under the invoke's ID — answered by the synthesized
+// start result.
+func TestTaskStartProjectsAsTheOriginalCall(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+
+	call := LLMToolCall{
+		VendorID: "call_1",
+		ToolName: "deploy_task",
+		Args:     map[string]any{"env": "prod", "region": "eu"},
+	}
+	h := userArcHistory(t)
+	persistor := runCallInArc(t, h, testArcID, tasks, call)
+
+	// call -> event: the invoke carries the request under a minted ID.
+	invokes := persistedOfType(persistor, events.AsyncTaskInvokeEventType)
+	if len(invokes) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_INVOKE events, want 1", len(invokes))
+	}
+	invoke := invokes[0]
+	pl := invoke.Payload.(events.AsyncTaskInvokePayload)
+	if pl.TaskName != call.ToolName || !reflect.DeepEqual(pl.Args, call.Args) {
+		t.Fatalf("invoke = %q %#v, want the call's %q %#v", pl.TaskName, pl.Args, call.ToolName, call.Args)
+	}
+
+	// event -> project -> call: the transcript's assistant message carries the
+	// call the invoke stands for.
+	transcript, err := h.Project(testArcID, history.DefaultModes())
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	var projected *history.ModelToolCall
+	for _, m := range transcript.Messages {
+		am, ok := m.(history.ModelAssistantMessage)
+		if !ok {
+			continue
+		}
+		for i := range am.ToolCalls {
+			if am.ToolCalls[i].ID == invoke.ID {
+				projected = &am.ToolCalls[i]
+			}
+		}
+	}
+	if projected == nil {
+		t.Fatalf("no projected call with the invoke's ID %q in the transcript", invoke.ID)
+	}
+	if projected.Name != call.ToolName || !reflect.DeepEqual(projected.Args, call.Args) {
+		t.Errorf("projected call = %+v, want name %q args %#v: the calls must match", *projected, call.ToolName, call.Args)
+	}
+
+	// The synthesized start result answers that same call.
+	if result := projectedTaskResult(t, h, testArcID, invoke.ID); result.ToolCallID != projected.ID {
+		t.Errorf("projected result answers call %q, want %q", result.ToolCallID, projected.ID)
 	}
 }
 
@@ -407,7 +495,8 @@ func TestTheStartResultOffersBothWaysToAnswerAnAsk(t *testing.T) {
 	h := userArcHistory(t)
 	runCallInArc(t, h, testArcID, tasks, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
-	text := resultText(t, lastCallIn(t, h, testArcID))
+	task := h.TasksInOrder()[0]
+	text := projectedTaskResult(t, h, testArcID, task.ID).Content
 	for _, want := range []string{"put the question to the user first", events.ProvideTaskInputToolName, events.CancelTaskToolName} {
 		if !strings.Contains(text, want) {
 			t.Errorf("start result = %q, want it to mention %q", text, want)
@@ -442,15 +531,19 @@ func TestATaskThatCouldNotBeStartedIsSettledAsUnknown(t *testing.T) {
 	h := userArcHistory(t)
 	persistor := runCallInArc(t, h, testArcID, tasks, LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
 
-	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, ASYNC_TASK_INVOKE, ASYNC_TASK_RESULT, TOOL_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
+	want := "ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, TOOL_DISPATCHED, ASYNC_TASK_LAUNCH_RESULT, ASSISTANT_MESSAGE, ARC_CLOSED"
 	if got := typesOf(persistor.persisted); got != want {
 		t.Fatalf("wrote %s, want %s", got, want)
 	}
-	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
-		t.Errorf("task is %s, want it settled", task.Status)
+	if results := persistedOfType(persistor, events.AsyncTaskResultEventType); len(results) != 0 {
+		t.Errorf("persisted %d ASYNC_TASK_RESULT events, want none: a failed launch is settled by its launch-result event", len(results))
 	}
-	if text := resultText(t, lastCallIn(t, h, testArcID)); !strings.Contains(text, "not known") {
-		t.Errorf("result = %q, want it to say the effect is unknown", text)
+	task := h.TasksInOrder()[0]
+	if task.Status != history.AsyncTaskFailed {
+		t.Errorf("task is %s, want it settled as failed by the launch-result event", task.Status)
+	}
+	if text := projectedTaskResult(t, h, testArcID, task.ID).Content; !strings.Contains(text, "not known") {
+		t.Errorf("projected start result = %q, want it to say the effect is unknown", text)
 	}
 }
 
@@ -640,5 +733,87 @@ func settleTask(t *testing.T, h *history.History, taskID string) {
 	}
 	if err := h.Update(ev, history.FoldStateFromHistory(h)); err != nil {
 		t.Fatalf("fold: %v", err)
+	}
+}
+
+// The launch-result event carries the runner's own ID when it assigned one, so a
+// callback naming it can be routed to the task; where the runner assigned
+// none, the field falls back to the task ID the caller sent.
+func TestTaskMetaCarriesTheRunnersExternalRef(t *testing.T) {
+	withRef := &fakeController{externalRef: "srv-42"}
+	h := userArcHistory(t)
+	persistor := runCallInArc(t, h, testArcID, taskSourceWith(t, withRef, "auditor"), LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if !meta.Launched || meta.ExternalRef != "srv-42" {
+		t.Errorf("launch result = %+v, want Launched with the runner's external ref srv-42", meta)
+	}
+	if task := h.TasksInOrder()[0]; task.ExternalRef != "srv-42" {
+		t.Errorf("folded external ref = %q, want srv-42", task.ExternalRef)
+	}
+
+	withoutRef := &fakeController{}
+	h2 := userArcHistory(t)
+	persistor2 := runCallInArc(t, h2, testArcID, taskSourceWith(t, withoutRef, "auditor"), LLMToolCall{VendorID: "call_1", ToolName: "auditor"})
+	meta2 := persistedOfType(persistor2, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	invokes := persistedOfType(persistor2, events.AsyncTaskInvokeEventType)
+	if meta2.ExternalRef != invokes[0].ID {
+		t.Errorf("meta external ref = %q, want the task id %q as the fallback", meta2.ExternalRef, invokes[0].ID)
+	}
+}
+
+// A launch a stopped run handed to the controller but never recorded is not
+// retried on re-entry: whether it took hold is not known, so the run settles
+// it as failed in the launch-result event and does not call Start again.
+func TestAHandedOffLaunchIsNotRetried(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "auditor")
+
+	h := userArcHistory(t)
+	persistor := &fakePersistor{next: 10}
+	arc := testArcID
+	actor := users.Actor{UserID: "alice", TenantID: "acme"}
+	seed := []*events.Event{
+		{SessionID: testSessionID, ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting"}},
+		{SessionID: testSessionID, ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor", MessageID: "msg-1", Actor: actor}},
+		{SessionID: testSessionID, ID: "disp-1", Typ: events.ToolDispatchedEventType, CorrelationID: &arc,
+			Payload: events.ToolDispatchedPayload{CausationID: "task-1"}},
+	}
+	stored, err := persistor.Persist(context.Background(), seed...)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, ev := range stored {
+		if err := h.Update(ev, history.FoldStateFromHistory(h)); err != nil {
+			t.Fatalf("fold: %v", err)
+		}
+	}
+
+	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{finalReply("noted")}}, WithTasks(tasks))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: arc, Controller: common.InSession(testSessionID, tasks)}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none: the launch was handed off already", controller.started)
+	}
+	metas := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)
+	if len(metas) != 1 {
+		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
+	}
+	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.CausationID != "task-1" || !strings.Contains(meta.Error, "not known") {
+		t.Errorf("launch result = %+v, want Launched=false saying the outcome is not known", meta)
+	}
+	if task := h.Tasks["task-1"]; task == nil || task.Status != history.AsyncTaskFailed {
+		t.Errorf("task = %+v, want it settled failed by the launch-result event", task)
 	}
 }
