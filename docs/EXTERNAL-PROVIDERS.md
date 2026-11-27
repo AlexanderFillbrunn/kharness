@@ -48,9 +48,13 @@ The controller speaks A2A through the SDK's client (JSON-RPC transport,
 `message/send`, `tasks/cancel`). Each skill's tool takes an envelope
 `{contextId?, args}`: the controller sends the inner `args` as a message part
 (a data part when it is a JSON object) with **our task ID as the A2A
-`taskId`**, and `contextId` only when the model passed one — omit it to start
-a new conversation, pass the context id a previous task returned to continue
-that conversation with a new task. The server's launch response (its task
+`taskId`**, and `contextId` only when the model passed one. The context id
+names the conversation at the remote agent: tasks sharing it share that
+agent's conversation state, so a follow-up task sees what earlier tasks in the
+conversation did. Omit it to start a new conversation (the agent assigns a
+fresh id, returned in the launch response); pass the context id a previous
+task returned to continue that conversation with a new task — each task gets
+its own task id regardless. The server's launch response (its task
 object, carrying the context id whether or not we sent one) is recorded on
 the `ASYNC_TASK_LAUNCH_RESULT` event and rendered as the start call's result,
 so the context id reaches the model. If the server answers with a task of its

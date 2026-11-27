@@ -127,11 +127,18 @@ func TestWithA2AStartsRemoteTasks(t *testing.T) {
 		t.Fatalf("research input schema = %#v, want the launch envelope object", meta.InputSchema)
 	}
 	props, _ := schema["properties"].(map[string]any)
-	if _, ok := props["contextId"]; !ok {
-		t.Errorf("launch envelope properties = %v, want a contextId property", props)
+	cid, ok := props["contextId"].(map[string]any)
+	if !ok {
+		t.Fatalf("launch envelope properties = %v, want a contextId property", props)
 	}
 	if _, ok := props["args"]; !ok {
 		t.Errorf("launch envelope properties = %v, want an args property", props)
+	}
+	desc, _ := cid["description"].(string)
+	for _, want := range []string{"conversation", "follow-up", "launch response"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("contextId description = %q, want it to explain the %q", desc, want)
+		}
 	}
 
 	persistor := &fakePersistor{next: 1}

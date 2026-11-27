@@ -177,16 +177,22 @@ func connectA2A(cfg A2AConfig) (TaskSource, error) {
 func a2aLaunchSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
+		"description": "Launch arguments for one task of this remote agent: the conversation " +
+			"context to run it in (optional) and the task's actual arguments.",
 		"properties": map[string]any{
 			"contextId": map[string]any{
 				"type": "string",
-				"description": "The conversation context to run this task in. Omit to start a new " +
-					"context; pass the context id a previous task of this agent returned to " +
-					"continue that conversation with a new task.",
+				"description": "The conversation at the remote agent this task belongs to. Tasks started " +
+					"with the same context id share that agent's conversation state, so a follow-up task " +
+					"sees what earlier tasks in the conversation did and said. Omit it to start a new " +
+					"conversation — the agent then assigns a fresh context id, which comes back in the " +
+					"launch response. To continue an existing conversation with a new task, pass the " +
+					"context id a previous task of this agent returned. Every task gets its own task id " +
+					"regardless of the context.",
 			},
 			"args": map[string]any{
 				"type":        "object",
-				"description": "The task's actual arguments.",
+				"description": "The task's actual arguments, sent to the remote agent as the task's input.",
 			},
 		},
 		"required": []any{"args"},
