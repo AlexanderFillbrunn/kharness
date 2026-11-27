@@ -359,7 +359,7 @@ type AsyncTaskLaunchResultPayload struct {
 	// callback naming this ID routes to the task.
 	ExternalRef string `json:"external_ref"`
 
-	// Launched says whether the task was started. When false and no Answer is
+	// Launched says whether the task was started. When false and no Result is
 	// present, the task is settled as failed and Error carries the reason.
 	Launched bool `json:"launched"`
 
@@ -367,24 +367,33 @@ type AsyncTaskLaunchResultPayload struct {
 	// and for outbound calls that need the runner's own IDs. Nil on failure.
 	Launch any `json:"launch,omitempty"`
 
-	// Error is set only when there is an actual error: a runner failure, a
-	// policy block, a hook-emitted error answer, a launch never recorded.
-	// Empty when the task launched, and for a policy answer that is not an
-	// error — the Answer field, not Error, says the hook intercepted the
-	// launch and provided a result.
+	// Error is set only when there is an actual error: a hook's error return,
+	// a runner failure, a policy block, a launch never recorded, or a
+	// LaunchResult the hook marked as an error. Empty when the task launched
+	// and for a policy answer that is not an error. The log keeps it; the
+	// model is never shown a raw error — the projection renders policy
+	// failures as a generic message.
 	Error string `json:"error,omitempty"`
 
-	// Answer is the policy hook's answer when it settled the start without
-	// the task running. The log still records Launched=false — nothing ran —
-	// and the projection renders the answer as the start call's result, the
-	// way a tool call's Answer becomes its tool result.
-	Answer *TaskAnswer `json:"answer,omitempty"`
+	// Result is the launch answer: the outcome a policy hook supplied when it
+	// intercepted the start without the task running. The log still records
+	// Launched=false — nothing ran — and the answer is also written verbatim
+	// as the task's ASYNC_TASK_RESULT. The projection renders it as the start
+	// call's result, the way a tool call's Answer becomes its tool result.
+	Result *TaskResult `json:"result,omitempty"`
+
+	// LaunchResult overrides what the model is told the launch call returned.
+	// Empty means the default: a note that the start was intercepted, with the
+	// Result alongside. Set it to hide from the model that the task never
+	// launched.
+	LaunchResult string `json:"launch_result,omitempty"`
 
 	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
 }
 
-// TaskAnswer is a policy hook's answer to a call, as recorded in the log.
-type TaskAnswer struct {
+// TaskResult is a policy hook's supplied outcome for a task start, as recorded
+// in the log.
+type TaskResult struct {
 	Result  any  `json:"result"`
 	IsError bool `json:"is_error,omitempty"`
 }

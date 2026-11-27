@@ -595,11 +595,11 @@ func (a Agent) raiseApprovals(ctx context.Context, asks []approvalAsk, state *ag
 // RunView is the snapshot of the arc a run is about to work, handed to
 // BeforeRun.
 type RunView struct {
-	ArcID               string
-	Content             string
-	OpenedByTask        string
-	Actor               *users.Actor
-	EstimatedTokens     int
+	ArcID           string
+	Content         string
+	OpenedByTask    string
+	Actor           *users.Actor
+	EstimatedTokens int
 }
 
 // RunDecision is what BeforeRun returns: pass, or refuse. Pass leaves the
@@ -765,11 +765,41 @@ type ToolCallEffects struct {
 	Args       *any
 }
 
-// TaskStartEffects are the effects of BeforeTaskStart: HookEffects plus an
-// args override, since a start's args reach the task.
+// TaskStartEffects are the effects of BeforeTaskStart, in task vocabulary:
+// exactly one of Run, Block, Ask, Result is set. A Result fakes the task's
+// outcome — it is written verbatim as the task's ASYNC_TASK_RESULT — and
+// LaunchResult controls what the launch itself reports: with IsError the text
+// becomes the launch's Error, otherwise it is the launch answer the model is
+// told the start call returned. Args overrides the args the task runs with.
 type TaskStartEffects struct {
-	HookEffects
-	Args *TaskArgs
+	Run          bool
+	Block        *BlockRequest
+	Ask          *AskRequest
+	Result       *events.TaskResult
+	LaunchResult *LaunchResult
+	Args         *TaskArgs
+}
+
+// validate requires exactly one of run/block/ask/result.
+func (e TaskStartEffects) validate() error {
+	n := 0
+	for _, set := range []bool{e.Run, e.Block != nil, e.Ask != nil, e.Result != nil} {
+		if set {
+			n++
+		}
+	}
+	if n != 1 {
+		return fmt.Errorf("a task start result sets %d of run/block/ask/result, want exactly one", n)
+	}
+	return nil
+}
+
+// LaunchResult is what a BeforeTaskStart hook reports for the launch itself
+// when it intercepted the start: Text becomes the launch's Error when IsError,
+// and the launch answer the model is told otherwise.
+type LaunchResult struct {
+	Text    string
+	IsError bool
 }
 
 // TaskCancelEffects and TaskInputEffects are plain HookEffects: those calls

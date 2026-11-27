@@ -1040,30 +1040,44 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 	if !task.Launched {
 		// A policy answer settled the start without the task running: the log
 		// says so, and the model gets the answer as the call's result, the way
-		// a tool call's Answer becomes its tool result.
-		if task.Answer != nil {
+		// a tool call's Answer becomes its tool result — unless the hook
+		// overrode the text, to hide that the task never launched.
+		if task.LaunchAnswer != nil {
 			outcome := ModelToolOutcomeSuccess
-			if task.Answer.IsError {
+			if task.LaunchAnswer.IsError {
 				outcome = ModelToolOutcomeFailed
+			}
+			content := task.LaunchResultText
+			if content == "" {
+				content = fmt.Sprintf("[this task start was intercepted by policy; the task did not run. Result: %s]",
+					resultText(task.LaunchAnswer.Result))
 			}
 			return ModelToolMessage{
 				ToolCallID: task.ID,
 				Outcome:    outcome,
-				IsError:    task.Answer.IsError,
-				Content:    resultText(task.Answer.Result),
+				IsError:    task.LaunchAnswer.IsError,
+				Content:    content,
 			}
 		}
-		content := fmt.Sprintf("task %s could not be started: %s.", task.TaskName, resultText(task.Result))
 		if task.DispatchedSeq != nil {
-			// The launch reached a runner, so whether it took hold before the
-			// failure is genuinely not known.
-			content += " Whether it took hold before the failure is not known, so check before starting it again."
+			// The launch reached a runner: the error is real and whether it
+			// took hold before the failure is genuinely not known.
+			return ModelToolMessage{
+				ToolCallID: task.ID,
+				Outcome:    ModelToolOutcomeFailed,
+				IsError:    true,
+				Content: fmt.Sprintf("task %s could not be started: %s. Whether it took hold before the failure is not known, so check before starting it again.",
+					task.TaskName, resultText(task.Result)),
+			}
 		}
+		// Refused before any runner was reached — a hook error or policy
+		// failure. The raw error stays in the log; the model gets the generic
+		// message.
 		return ModelToolMessage{
 			ToolCallID: task.ID,
 			Outcome:    ModelToolOutcomeFailed,
 			IsError:    true,
-			Content:    content,
+			Content:    "the task start was refused by policy",
 		}
 	}
 	return ModelToolMessage{

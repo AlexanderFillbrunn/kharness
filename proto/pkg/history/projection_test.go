@@ -2072,6 +2072,9 @@ func TestFailedLaunchProjectsAsErrorResult(t *testing.T) {
 	log.assistant("arc-1", "m1", "starting")
 	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
 		TaskName: "deploy_task", MessageID: "m1", Actor: testActor})
+	// The dispatch marks the launch as handed to a runner, so the failure is
+	// a runner failure and the error text is shown.
+	log.add("disp-1", "arc-1", events.ToolDispatchedEventType, events.ToolDispatchedPayload{CausationID: "task-1"})
 	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
 		CausationID: "task-1", ExternalRef: "task-1", Launched: false, Error: "no runner", LLMVisibility: events.LLMVisibilityNone})
 	log.assistant("arc-1", "m2", "ok")

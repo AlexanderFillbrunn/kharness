@@ -218,8 +218,8 @@ type AsyncTask struct {
 	// Launched says whether the launch succeeded; LaunchSeq is the launch-result event's
 	// seq. LaunchSeq nil means no launch was recorded yet: the task is starting
 	// or its launch record was lost with a stopped run.
-	Launched bool `json:"launched,omitempty"`
-	LaunchSeq  *int `json:"meta_seq,omitempty"`
+	Launched  bool `json:"launched,omitempty"`
+	LaunchSeq *int `json:"meta_seq,omitempty"`
 
 	// DispatchedSeq is set when a run handed the launch to the controller,
 	// before the launch-result event came back. An invoke with a dispatch but no launch result
@@ -234,9 +234,12 @@ type AsyncTask struct {
 	// blocked the launch; the launch-result event beside it settles the task.
 	BlockedMessage string `json:"blocked_message,omitempty"`
 
-	// Answer is a policy hook's answer that settled the start without the
-	// task running; the projection renders it as the start call's result.
-	Answer *events.TaskAnswer `json:"answer,omitempty"`
+	// LaunchAnswer is the outcome a policy hook supplied when it intercepted
+	// the start without the task running; the projection renders it as the
+	// start call's result. LaunchResultText overrides the text the model is
+	// told, so a hook can hide that the task never launched.
+	LaunchAnswer     *events.TaskResult `json:"launch_answer,omitempty"`
+	LaunchResultText string             `json:"launch_result_text,omitempty"`
 
 	// Actor is who started the task, recorded on the invoke and copied
 	// forward onto every event the task emits. It records who started the
@@ -738,7 +741,7 @@ var applyFuncs = map[events.EventType]applyFunc{
 	events.AsyncTaskEventEventType:          (*History).applyAsyncTaskEvent,
 	events.AsyncTaskInputRequestedEventType: (*History).applyAsyncTaskInputRequested,
 	events.AsyncTaskInputProvidedEventType:  (*History).applyAsyncTaskInputProvided,
-	events.AsyncTaskLaunchResultEventType:           (*History).applyAsyncTaskLaunchResult,
+	events.AsyncTaskLaunchResultEventType:   (*History).applyAsyncTaskLaunchResult,
 	events.ErrorEventType:                   (*History).applyError,
 	events.GuardrailBlockedEventType:        (*History).applyGuardrailBlocked,
 	events.CancelEventType:                  (*History).applyCancel,
@@ -1203,13 +1206,14 @@ func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState)
 	task.ExternalRef = pl.ExternalRef
 	task.Launch = pl.Launch
 	task.Launched = pl.Launched
-	task.Answer = pl.Answer
+	task.LaunchAnswer = pl.Result
+	task.LaunchResultText = pl.LaunchResult
 	task.LaunchSeq = &ev.Seq
 	// A launch that was not launched and not answered settles the task as
 	// failed here. One answered by policy does not: the RESULT event written
 	// beside it settles the task with the answer, the way a tool call's
 	// Answer settles the call.
-	if !pl.Launched && pl.Answer == nil && task.FinishedSeq == nil {
+	if !pl.Launched && pl.Result == nil && task.FinishedSeq == nil {
 		task.Result = pl.Error
 		task.FinishedAt = &ev.Timestamp
 		task.FinishedSeq = &ev.Seq
