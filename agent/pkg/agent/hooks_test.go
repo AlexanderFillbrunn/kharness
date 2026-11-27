@@ -1582,11 +1582,14 @@ func TestBeforeTaskStartAnswerRecordsTaskResult(t *testing.T) {
 		t.Fatalf("persisted %d ASYNC_TASK_LAUNCH_RESULT events, want 1", len(metas))
 	}
 	meta := metas[0].Payload.(events.AsyncTaskLaunchResultPayload)
-	if meta.Launched || !strings.Contains(meta.Error, "answered by policy") {
-		t.Errorf("launch result = %+v, want Launched=false with the policy answer as the reason", meta)
+	if meta.Launched {
+		t.Errorf("launch result = %+v, want Launched=false: nothing ran", meta)
+	}
+	if meta.Error != "" {
+		t.Errorf("launch result error = %q, want empty: a policy answer is not an error", meta.Error)
 	}
 	if meta.Answer == nil || meta.Answer.Result != "not needed" {
-		t.Errorf("launch result answer = %+v, want the hook's answer carried for the projection", meta.Answer)
+		t.Errorf("launch result answer = %+v, want the hook's answer: the field that says the hook intercepted and provided a result", meta.Answer)
 	}
 	results := persistedOfType(persistor, events.AsyncTaskResultEventType)
 	if len(results) != 1 {
@@ -1603,5 +1606,47 @@ func TestBeforeTaskStartAnswerRecordsTaskResult(t *testing.T) {
 	result := projectedTaskResult(t, h, testArcID, task.ID)
 	if result.Content != "not needed" || result.Outcome != history.ModelToolOutcomeSuccess || result.IsError {
 		t.Errorf("projected result = %+v, want the answer as a success result", result)
+	}
+}
+
+// A BeforeTaskStart Answer with IsError sets Error on the launch result: the
+// hook emitted an error, and the task settles failed with it.
+func TestBeforeTaskStartErrorAnswerSetsLaunchError(t *testing.T) {
+	controller := &fakeController{}
+	tasks := taskSourceWith(t, controller, "deploy_task")
+	llm := &scriptedLLM{replies: []*LLMResponse{
+		toolCallReply("call_1", "deploy_task", nil),
+		finalReply("ok"),
+	}}
+	agent, err := NewAgent(&AgentConfig{}, NewToolRegistry(), llm, WithTasks(tasks), WithHooks(Hooks{
+		BeforeTaskStart: func(context.Context, TaskStartView) (TaskStartEffects, error) {
+			return TaskStartEffects{HookEffects: HookEffects{Answer: &Answer{Result: "quota exceeded", IsError: true}}}, nil
+		},
+	}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	persistor := &fakePersistor{next: 1}
+	h := userArcHistory(t)
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID, Controller: tasks}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(controller.started) != 0 {
+		t.Errorf("started tasks = %v, want none", controller.started)
+	}
+	meta := persistedOfType(persistor, events.AsyncTaskLaunchResultEventType)[0].Payload.(events.AsyncTaskLaunchResultPayload)
+	if meta.Launched || meta.Error != "quota exceeded" || meta.Answer == nil || !meta.Answer.IsError {
+		t.Errorf("launch result = %+v, want Launched=false, Error=%q from the hook's error answer", meta, "quota exceeded")
+	}
+	results := persistedOfType(persistor, events.AsyncTaskResultEventType)
+	if len(results) != 1 || results[0].Payload.(events.AsyncTaskResultPayload).Outcome != events.AsyncTaskOutcomeFailed {
+		t.Errorf("task results = %v, want one FAILED result", results)
+	}
+	if task := h.TasksInOrder()[0]; task.Status != history.AsyncTaskFailed {
+		t.Errorf("task status = %s, want FAILED", task.Status)
+	}
+	result := projectedTaskResult(t, h, testArcID, h.TasksInOrder()[0].ID)
+	if result.Content != "quota exceeded" || result.Outcome != history.ModelToolOutcomeFailed || !result.IsError {
+		t.Errorf("projected result = %+v, want the error answer as a failed result", result)
 	}
 }

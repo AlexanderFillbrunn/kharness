@@ -234,7 +234,7 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	// A previous run handed this launch off and stopped before recording it.
 	// The launch is not retried: whether the task took hold is not known.
 	if task.DispatchedSeq != nil {
-		return a.recordLaunch(ctx, task, nil,
+		return a.recordLaunch(ctx, task, nil, false,
 			"a run stopped before it recorded the launch of this task; whether it took hold is not "+
 				"known, so check before starting it again", nil, state)
 	}
@@ -242,13 +242,13 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	d := a.decideLaunch(ctx, task, state)
 	switch {
 	case d.hookErr != nil:
-		return a.recordLaunch(ctx, task, nil,
+		return a.recordLaunch(ctx, task, nil, false,
 			fmt.Sprintf("the task policy failed, so the task was not started: %v", d.hookErr), nil, state)
 	case d.block != nil:
 		state.logger.WarnContext(ctx, "task start blocked by policy", "task", task.ID, "kind", task.TaskName)
 		// The guardrail event names the task by its invoke ID; the
 		// launch-result event written beside it settles the task.
-		return a.recordLaunch(ctx, task, nil, d.block.Message, nil, state,
+		return a.recordLaunch(ctx, task, nil, false, d.block.Message, nil, state,
 			&events.Event{
 				Typ:           events.GuardrailBlockedEventType,
 				CorrelationID: &state.arc.ID,
@@ -266,8 +266,14 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 		if d.answer.IsError {
 			outcome = events.AsyncTaskOutcomeFailed
 		}
-		return a.recordLaunch(ctx, task, nil,
-			"the task start was answered by policy without the task starting",
+		// Error stays empty unless the hook emitted an error answer; the
+		// Answer field is what says the hook intercepted and provided a
+		// result.
+		reason := ""
+		if d.answer.IsError {
+			reason = fmt.Sprintf("%v", d.answer.Result)
+		}
+		return a.recordLaunch(ctx, task, nil, false, reason,
 			&events.TaskAnswer{Result: d.answer.Result, IsError: d.answer.IsError}, state,
 			&events.Event{
 				Typ:           events.AsyncTaskResultEventType,
@@ -283,7 +289,7 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 
 	controller := a.controllerFor(state)
 	if controller == nil {
-		return a.recordLaunch(ctx, task, nil,
+		return a.recordLaunch(ctx, task, nil, false,
 			"this run has no task controller bound to it, so the task could not be started", nil, state)
 	}
 	if _, err := a.persistAndFold(ctx, state, &events.Event{
@@ -312,17 +318,19 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	if err != nil {
 		reason = err.Error()
 	}
-	return a.recordLaunch(ctx, task, launch, reason, nil, state)
+	return a.recordLaunch(ctx, task, launch, err == nil, reason, nil, state)
 }
 
 // recordLaunch writes the one launch-result event a launch produces: the launch
 // verdict, the external reference the runner assigned (the task's own ID
-// where the runner assigned none), and the runner's raw response. An empty
-// reason means the launch succeeded; any other reason — a failure, a policy
-// block, a policy answer, a handed-off launch never recorded — means it did
-// not, and settles the task: ASYNC_TASK_RESULT is reserved for work that
-// actually started, and no result event is written for a launch that did not.
-func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, reason string, answer *events.TaskAnswer, state *agentState, extra ...*events.Event) error {
+// where the runner assigned none), and the runner's raw response. Launched says
+// whether the task was started; reason is written to Error only when there is
+// an actual error — a runner failure, a policy block, a hook-emitted error
+// answer, a handed-off launch never recorded — and is empty otherwise, e.g.
+// for a policy answer that is not an error. A launch that did not happen and
+// carries no answer settles the task here: ASYNC_TASK_RESULT is for the
+// outcome of work that started, or of a policy answer.
+func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, launched bool, reason string, answer *events.TaskAnswer, state *agentState, extra ...*events.Event) error {
 	externalRef := task.ID
 	var response any
 	if launch != nil {
@@ -337,7 +345,7 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 		Payload: events.AsyncTaskLaunchResultPayload{
 			CausationID:   task.ID,
 			ExternalRef:   externalRef,
-			Launched:      reason == "",
+			Launched:      launched,
 			Launch:        response,
 			Error:         reason,
 			Answer:        answer,
@@ -347,9 +355,12 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 	if _, err := a.persistAndFold(ctx, state, append([]*events.Event{launchResult}, extra...)...); err != nil {
 		return err
 	}
-	if reason == "" {
+	switch {
+	case launched:
 		state.logger.InfoContext(ctx, "task launched", "task", task.ID, "kind", task.TaskName, "external_ref", externalRef)
-	} else {
+	case answer != nil && reason == "":
+		state.logger.InfoContext(ctx, "task start answered by policy, not launched", "task", task.ID, "kind", task.TaskName)
+	default:
 		state.logger.InfoContext(ctx, "task not launched", "task", task.ID, "kind", task.TaskName, "reason", reason)
 	}
 	return nil
@@ -416,12 +427,12 @@ func (a Agent) raiseTaskAsk(ctx context.Context, task *history.AsyncTask, ask *A
 	if hook := state.hooks.BeforeInterrupt; hook != nil {
 		c, err := hook(ctx, req)
 		if err != nil {
-			return a.recordLaunch(ctx, task, nil, fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err), nil, state)
+			return a.recordLaunch(ctx, task, nil, false, fmt.Sprintf("the interrupt policy failed, so the task was not started: %v", err), nil, state)
 		}
 		changes = c
 	}
 	if changes.Block != nil {
-		return a.recordLaunch(ctx, task, nil, changes.Block.Message, nil, state)
+		return a.recordLaunch(ctx, task, nil, false, changes.Block.Message, nil, state)
 	}
 	reason, context := req.Reason, req.Context
 	if changes.Reason != nil {

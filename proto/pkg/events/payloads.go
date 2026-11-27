@@ -359,17 +359,19 @@ type AsyncTaskLaunchResultPayload struct {
 	// callback naming this ID routes to the task.
 	ExternalRef string `json:"external_ref"`
 
-	// Launched says whether the launch succeeded. When false, Error carries
-	// the reason and the task is settled as failed.
+	// Launched says whether the task was started. When false and no Answer is
+	// present, the task is settled as failed and Error carries the reason.
 	Launched bool `json:"launched"`
 
 	// Launch is the runner's raw response to the invocation, kept for replay
 	// and for outbound calls that need the runner's own IDs. Nil on failure.
 	Launch any `json:"launch,omitempty"`
 
-	// Error is why the task was not launched — a runner failure, a policy
-	// block, a policy answer, a launch never recorded. Empty when Launched
-	// is true.
+	// Error is set only when there is an actual error: a runner failure, a
+	// policy block, a hook-emitted error answer, a launch never recorded.
+	// Empty when the task launched, and for a policy answer that is not an
+	// error — the Answer field, not Error, says the hook intercepted the
+	// launch and provided a result.
 	Error string `json:"error,omitempty"`
 
 	// Answer is the policy hook's answer when it settled the start without
