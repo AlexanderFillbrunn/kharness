@@ -45,13 +45,19 @@ kinds are offered to the model exactly like local task kinds — one tool per
 kind plus the cancel/answer tools.
 
 The controller speaks A2A through the SDK's client (JSON-RPC transport,
-`message/send`, `tasks/cancel`). A start sends the args as a message part —
-a data part when the args are a JSON object — with **our task ID as the A2A
-`taskId` and our session as the `contextId`**, so the server's callbacks echo
-them back. If the server answers with a task of its own ID, that ID becomes
-the launch's `ExternalRef`, recorded in the `ASYNC_TASK_LAUNCH_RESULT` event
-(falling back to our task ID when the server assigned none) — that field is
-what routes the server's callbacks to the task: index it in the log store
+`message/send`, `tasks/cancel`). Each skill's tool takes an envelope
+`{contextId?, args}`: the controller sends the inner `args` as a message part
+(a data part when it is a JSON object) with **our task ID as the A2A
+`taskId`**, and `contextId` only when the model passed one — omit it to start
+a new conversation, pass the context id a previous task returned to continue
+that conversation with a new task. The server's launch response (its task
+object, carrying the context id whether or not we sent one) is recorded on
+the `ASYNC_TASK_LAUNCH_RESULT` event and rendered as the start call's result,
+so the context id reaches the model. If the server answers with a task of its
+own ID, that ID becomes the launch's `ExternalRef`, recorded in the
+`ASYNC_TASK_LAUNCH_RESULT` event (falling back to our task ID when the server
+assigned none) — that field is what routes the server's callbacks to the
+task: index it in the log store
 (e.g. a jsonb path index over `ASYNC_TASK_LAUNCH_RESULT` in Postgres, or a
 secondary key maintained at persist time in Redis), and the callback
 component resolves `external_ref` → `TaskRef{SessionID, ID}` before calling

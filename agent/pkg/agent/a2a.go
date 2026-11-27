@@ -26,12 +26,15 @@ import (
 // source, when the run has none — see controllerFor) starts them like any
 // other task.
 //
-// The launch carries our task ID as the A2A taskId and our session as the
-// contextId, so the server echoes them back; when the server answers with a
-// task of its own, that ID becomes the launch's ExternalRef and the
-// ASYNC_TASK_LAUNCH_RESULT event records it, which is what routes the server's
-// later callbacks to the task. Reports from the remote agent reach the log
-// through the ingress, as for any runner.
+// The launch carries our task ID as the A2A taskId; the contextId comes from
+// the launch args' contextId envelope (empty starts a new context the server
+// generates), so conversations the model wants to continue are named by the
+// model, per task. The launch response — the server's task object — is recorded
+// on the ASYNC_TASK_LAUNCH_RESULT event and rendered as the start call's
+// result, so the context id it carries reaches the model. When the server
+// answers with a task of its own ID, that ID becomes the launch's ExternalRef,
+// which is what routes the server's later callbacks to the task. Reports from
+// the remote agent reach the log through the ingress, as for any runner.
 //
 // Logging follows docs/LOGGING.md: lines carry IDs, methods and outcomes only,
 // never task arguments or input text.
@@ -144,6 +147,7 @@ func connectA2A(cfg A2AConfig) (TaskSource, error) {
 		if err := registry.RegisterTask(common.TaskMetadata{
 			Name:        name,
 			Description: description,
+			InputSchema: a2aLaunchSchema(),
 		}); err != nil {
 			return nil, fmt.Errorf("A2A agent %s: %w", cfg.Name, err)
 		}
@@ -163,6 +167,48 @@ func connectA2A(cfg A2AConfig) (TaskSource, error) {
 	return &a2aSource{set: registry, controller: &a2aController{
 		client: client, timeout: timeout, logger: logger, byTask: map[string]string{},
 	}}, nil
+}
+
+// a2aLaunchSchema is the model-facing args schema of an A2A skill: an
+// envelope carrying the optional conversation context and the actual args.
+// The context id is A2A-specific bookkeeping the model manages — pass the one
+// a previous task of this agent returned to continue that conversation, omit
+// it to start a new one — so it lives in the args, not in the task model.
+func a2aLaunchSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"contextId": map[string]any{
+				"type": "string",
+				"description": "The conversation context to run this task in. Omit to start a new " +
+					"context; pass the context id a previous task of this agent returned to " +
+					"continue that conversation with a new task.",
+			},
+			"args": map[string]any{
+				"type":        "object",
+				"description": "The task's actual arguments.",
+			},
+		},
+		"required": []any{"args"},
+	}
+}
+
+// a2aLaunchArgs unwraps the launch envelope {contextId?, args}: the context id
+// the model passed to continue a conversation (empty for a new one), and the
+// actual task args. Args that are not the envelope are taken as they are.
+func a2aLaunchArgs(args any) (contextID string, payload any) {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return "", args
+	}
+	inner, ok := m["args"]
+	if !ok {
+		return "", args
+	}
+	if cid, ok := m["contextId"].(string); ok {
+		contextID = cid
+	}
+	return contextID, inner
 }
 
 // a2aSource is one remote A2A agent as a TaskSource: the card's skills as the
@@ -204,12 +250,13 @@ type a2aController struct {
 func (c *a2aController) Start(ctx context.Context, name string, ref common.TaskRef, args any) (*common.TaskLaunch, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	contextID, payload := a2aLaunchArgs(args)
 	res, err := c.client.SendMessage(ctx, &a2a.MessageSendParams{Message: &a2a.Message{
 		ID:        a2a.NewMessageID(),
 		Role:      a2a.MessageRoleUser,
 		TaskID:    a2a.TaskID(ref.ID),
-		ContextID: ref.SessionID,
-		Parts:     a2aParts(args),
+		ContextID: contextID,
+		Parts:     a2aParts(payload),
 	}})
 	if err != nil {
 		return nil, err
@@ -237,17 +284,18 @@ func (c *a2aController) Cancel(ctx context.Context, ref common.TaskRef, reason s
 }
 
 // ProvideInput answers a waiting remote task with a message on the same task,
-// the request ID carried in the message metadata for the server to correlate.
+// addressed by the vendor task ID alone — A2A needs no context id once the
+// task exists. The request ID rides in the message metadata for the server to
+// correlate.
 func (c *a2aController) ProvideInput(ctx context.Context, ref common.TaskRef, requestID, input string) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	_, err := c.client.SendMessage(ctx, &a2a.MessageSendParams{Message: &a2a.Message{
-		ID:        a2a.NewMessageID(),
-		Role:      a2a.MessageRoleUser,
-		TaskID:    a2a.TaskID(c.vendorID(ref)),
-		ContextID: ref.SessionID,
-		Metadata:  map[string]any{"request_id": requestID},
-		Parts:     a2a.ContentParts{a2a.TextPart{Text: input}},
+		ID:       a2a.NewMessageID(),
+		Role:     a2a.MessageRoleUser,
+		TaskID:   a2a.TaskID(c.vendorID(ref)),
+		Metadata: map[string]any{"request_id": requestID},
+		Parts:    a2a.ContentParts{a2a.TextPart{Text: input}},
 	}})
 	return err
 }

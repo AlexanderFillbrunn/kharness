@@ -102,14 +102,15 @@ func newA2AFixture(t *testing.T) *a2aFixture {
 func TestWithA2AStartsRemoteTasks(t *testing.T) {
 	fx := newA2AFixture(t)
 	agent, err := NewAgent(nil, NewToolRegistry(), &scriptedLLM{replies: []*LLMResponse{
-		toolCallReply("call_1", "research", map[string]any{"topic": "kubernetes"}),
+		toolCallReply("call_1", "research", map[string]any{"args": map[string]any{"topic": "kubernetes"}}),
 		finalReply("started"),
 	}}, WithA2A(A2AConfig{Name: "remote", BaseURL: fx.server.URL}))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	// The skill is offered as a task kind on the model-facing surface.
+	// The skill is offered as a task kind on the model-facing surface, with
+	// the launch envelope {contextId?, args} as its args schema.
 	names := toolNames(taskToolSet{agent.tasks}.All())
 	found := false
 	for _, n := range names {
@@ -119,6 +120,18 @@ func TestWithA2AStartsRemoteTasks(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("task tools = %v, want the card's research skill", names)
+	}
+	meta, _ := agent.tasks.Get("research")
+	schema, ok := meta.InputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("research input schema = %#v, want the launch envelope object", meta.InputSchema)
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if _, ok := props["contextId"]; !ok {
+		t.Errorf("launch envelope properties = %v, want a contextId property", props)
+	}
+	if _, ok := props["args"]; !ok {
+		t.Errorf("launch envelope properties = %v, want an args property", props)
 	}
 
 	persistor := &fakePersistor{next: 1}
@@ -146,12 +159,30 @@ func TestWithA2AStartsRemoteTasks(t *testing.T) {
 	calls := append([]string(nil), fx.calls...)
 	fx.mu.Unlock()
 	// The run had no controller of its own, so the agent's source stood in
-	// without a session binding: the taskId is ours, the contextId is empty.
+	// without a session binding: the taskId is ours, no contextId is sent, and
+	// the parts carry the envelope's inner args only.
 	if send["taskId"] != invokes[0].ID {
 		t.Errorf("message/send carried taskId=%v, want our task id %s", send["taskId"], invokes[0].ID)
 	}
+	if _, ok := send["contextId"]; ok {
+		t.Errorf("message/send carried contextId=%v, want none: the server generates a new context", send["contextId"])
+	}
+	parts, _ := send["parts"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("message parts = %v, want the one data part", send["parts"])
+	}
+	part, _ := parts[0].(map[string]any)
+	if data, _ := part["data"].(map[string]any); data["topic"] != "kubernetes" || len(data) != 1 {
+		t.Errorf("message part = %v, want only the inner args, no envelope keys", part)
+	}
 	if len(calls) == 0 || calls[0] != "message/send" {
 		t.Errorf("RPC calls = %v, want message/send first", calls)
+	}
+
+	// The synthesized start result carries the launch response, so the
+	// server-generated context id reaches the model to reuse for follow-ups.
+	if text := projectedTaskResult(t, h, testArcID, invokes[0].ID).Content; !strings.Contains(text, "ctx-1") {
+		t.Errorf("projected start result = %q, want it to carry the launch response's context id ctx-1", text)
 	}
 }
 
@@ -171,13 +202,29 @@ func TestWithA2ACancelAndInputUseVendorID(t *testing.T) {
 	}
 
 	ref := common.TaskRef{SessionID: testSessionID, ID: "task-1"}
-	launch, err := controller.Start(context.Background(), "research", ref, map[string]any{"topic": "x"})
+	launch, err := controller.Start(context.Background(), "research", ref,
+		map[string]any{"contextId": "ctx-9", "args": map[string]any{"topic": "x"}})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if launch.ExternalRef != "srv-task-1" {
 		t.Fatalf("launch external ref = %q, want srv-task-1", launch.ExternalRef)
 	}
+
+	fx.mu.Lock()
+	start := fx.lastSend
+	fx.mu.Unlock()
+	if start["contextId"] != "ctx-9" {
+		t.Errorf("start message contextId = %v, want the envelope's ctx-9", start["contextId"])
+	}
+	parts, _ := start["parts"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("start message parts = %v, want the one data part", start["parts"])
+	}
+	if data, _ := parts[0].(map[string]any)["data"].(map[string]any); data["topic"] != "x" || len(data) != 1 {
+		t.Errorf("start message part = %v, want only the inner args, no contextId", parts[0])
+	}
+
 	if err := controller.Cancel(context.Background(), ref, "no longer needed"); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
@@ -193,8 +240,8 @@ func TestWithA2ACancelAndInputUseVendorID(t *testing.T) {
 	if fx.lastSend["taskId"] != "srv-task-1" {
 		t.Errorf("input message taskId = %v, want the vendor id", fx.lastSend["taskId"])
 	}
-	if fx.lastSend["contextId"] != testSessionID {
-		t.Errorf("input message contextId = %v, want the session the ref names", fx.lastSend["contextId"])
+	if _, ok := fx.lastSend["contextId"]; ok {
+		t.Errorf("input message carried contextId=%v, want none: the vendor task id addresses the task", fx.lastSend["contextId"])
 	}
 	if fx.auth != "Bearer secret" || fx.tenant != "acme" {
 		t.Errorf("RPC saw auth=%q tenant=%q, want the configured credentials", fx.auth, fx.tenant)
