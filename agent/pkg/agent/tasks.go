@@ -366,7 +366,7 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 			CausationID:   task.ID,
 			ExternalRef:   externalRef,
 			Launched:      out.launched,
-			Launch:        response,
+			Response:      response,
 			Error:         out.reason,
 			Result:        out.result,
 			LaunchResult:  out.launchResultText,

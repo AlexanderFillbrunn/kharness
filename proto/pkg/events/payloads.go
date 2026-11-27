@@ -363,9 +363,9 @@ type AsyncTaskLaunchResultPayload struct {
 	// present, the task is settled as failed and Error carries the reason.
 	Launched bool `json:"launched"`
 
-	// Launch is the runner's raw response to the invocation, kept for replay
+	// Response is the runner's raw response to the invocation, kept for replay
 	// and for outbound calls that need the runner's own IDs. Nil on failure.
-	Launch any `json:"launch,omitempty"`
+	Response any `json:"response,omitempty"`
 
 	// Error is set only when there is an actual error: a hook's error return,
 	// a runner failure, a policy block, a launch never recorded, or a

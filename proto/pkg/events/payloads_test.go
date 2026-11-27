@@ -49,7 +49,7 @@ func TestAsyncTaskLaunchResultPayloadRoundTrip(t *testing.T) {
 
 	encoded, err := codec.Encode(AsyncTaskLaunchResultPayload{
 		CausationID: "t1", ExternalRef: "srv-9", Launched: true,
-		Launch: map[string]any{"status": "working"}, LLMVisibility: LLMVisibilityNone,
+		Response: map[string]any{"status": "working"}, LLMVisibility: LLMVisibilityNone,
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -65,7 +65,7 @@ func TestAsyncTaskLaunchResultPayloadRoundTrip(t *testing.T) {
 	if got.CausationID != "t1" || got.ExternalRef != "srv-9" || !got.Launched || got.LLMVisibility != LLMVisibilityNone {
 		t.Errorf("decoded = %#v", got)
 	}
-	if m, ok := got.Launch.(map[string]any); !ok || m["status"] != "working" {
-		t.Errorf("launch = %#v, want the runner's raw response kept", got.Launch)
+	if m, ok := got.Response.(map[string]any); !ok || m["status"] != "working" {
+		t.Errorf("response = %#v, want the runner's raw response kept", got.Response)
 	}
 }

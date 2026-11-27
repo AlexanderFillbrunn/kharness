@@ -69,7 +69,7 @@ func ProjectedText(ev *events.Event) string {
 		if pl.Result != nil {
 			answer = resultText(pl.Result.Result)
 		}
-		return pl.ExternalRef + " " + pl.Error + " " + resultText(pl.Launch) + " " + answer + " " + pl.LaunchResult
+		return pl.ExternalRef + " " + pl.Error + " " + resultText(pl.Response) + " " + answer + " " + pl.LaunchResult
 	case events.ErrorPayload:
 		return pl.Message
 	case events.GuardrailBlockedPayload:

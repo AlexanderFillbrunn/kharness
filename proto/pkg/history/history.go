@@ -211,9 +211,9 @@ type AsyncTask struct {
 	// report or callback naming it routes to this task.
 	ExternalRef string `json:"external_ref,omitempty"`
 
-	// Launch is the runner's raw response to the invocation, from the same
+	// Response is the runner's raw response to the invocation, from the same
 	// event. Nil when the launch failed or the event is not folded yet.
-	Launch any `json:"launch,omitempty"`
+	Response any `json:"response,omitempty"`
 
 	// Launched says whether the launch succeeded; LaunchSeq is the launch-result event's
 	// seq. LaunchSeq nil means no launch was recorded yet: the task is starting
@@ -1204,7 +1204,7 @@ func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState)
 		return nil
 	}
 	task.ExternalRef = pl.ExternalRef
-	task.Launch = pl.Launch
+	task.Response = pl.Response
 	task.Launched = pl.Launched
 	task.LaunchAnswer = pl.Result
 	task.LaunchResultText = pl.LaunchResult
