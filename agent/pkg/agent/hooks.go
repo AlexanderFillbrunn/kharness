@@ -178,8 +178,6 @@ func (a Agent) decideCalls(ctx context.Context, calls []*history.ToolCall, state
 			continue
 		}
 		switch a.operation(call.ToolName) {
-		case opStart:
-			out[call] = a.decideTaskStart(ctx, call, state)
 		case opCancel:
 			out[call] = a.decideTaskCancel(ctx, call, state)
 		case opProvideInput:
@@ -232,32 +230,6 @@ func (a Agent) decideOrdinaryCall(ctx context.Context, call *history.ToolCall, s
 	d := callDecision{HookEffects: eff.HookEffects, solo: eff.Run && eff.Sequential}
 	if eff.Args != nil {
 		d.override = *eff.Args
-	}
-	return d
-}
-
-// decideTaskStart runs BeforeTaskStart over a call that starts a task and
-// returns its decision. A start's args reach the task, so the hook may
-// override them.
-func (a Agent) decideTaskStart(ctx context.Context, call *history.ToolCall, state *agentState) callDecision {
-	hook := state.hooks.BeforeTaskStart
-	if hook == nil {
-		return callDecision{HookEffects: HookEffects{Run: true}}
-	}
-	eff, err := hook(ctx, TaskStartView{
-		TaskName: call.ToolName,
-		Args:     taskArgsOf(call.Args),
-		CallMeta: callMetaOf(call, state),
-	})
-	if err != nil {
-		return callDecision{hookErr: err}
-	}
-	if err := eff.validate(); err != nil {
-		return callDecision{hookErr: err}
-	}
-	d := callDecision{HookEffects: eff.HookEffects}
-	if eff.Args != nil {
-		d.override = map[string]any(*eff.Args)
 	}
 	return d
 }
