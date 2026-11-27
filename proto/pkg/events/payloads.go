@@ -177,7 +177,7 @@ func LLMVisibilityOf(p EventPayload) LLMVisibility {
 		return typed.LLMVisibility
 	case AsyncTaskResultPayload:
 		return typed.LLMVisibility
-	case AsyncTaskMetaPayload:
+	case AsyncTaskLaunchResultPayload:
 		return typed.LLMVisibility
 	}
 	return ""
@@ -195,7 +195,7 @@ func TaskCausation(p EventPayload) (string, bool) {
 		return typed.CausationID, true
 	case AsyncTaskResultPayload:
 		return typed.CausationID, true
-	case AsyncTaskMetaPayload:
+	case AsyncTaskLaunchResultPayload:
 		return typed.CausationID, true
 	}
 	return "", false
@@ -343,14 +343,14 @@ func (AsyncTaskInputProvidedPayload) EventType() EventType {
 }
 func (AsyncTaskInputProvidedPayload) eventPayload() {}
 
-// AsyncTaskMetaPayload records what became of a task's launch: whether it was
+// AsyncTaskLaunchResultPayload records what became of a task's launch: whether it was
 // launched at all, and the reference the runner assigned it. It is written
 // once per invoke, after the controller returned, and settles the task when
 // the launch failed — ASYNC_TASK_RESULT is reserved for the outcome of work
 // that actually started. It is always written with None visibility: the
 // launch record is routing and replay metadata, never model-facing, and the
 // model sees the start as a synthesized call and result in the projection.
-type AsyncTaskMetaPayload struct {
+type AsyncTaskLaunchResultPayload struct {
 	CausationID string `json:"causation_id"`
 
 	// ExternalRef is the ID the task's runner assigned it, guaranteed
@@ -373,10 +373,10 @@ type AsyncTaskMetaPayload struct {
 	LLMVisibility LLMVisibility `json:"llm_visibility,omitempty"`
 }
 
-func (AsyncTaskMetaPayload) EventType() EventType {
-	return AsyncTaskMetaEventType
+func (AsyncTaskLaunchResultPayload) EventType() EventType {
+	return AsyncTaskLaunchResultEventType
 }
-func (AsyncTaskMetaPayload) eventPayload() {}
+func (AsyncTaskLaunchResultPayload) eventPayload() {}
 
 type ErrorPayload struct {
 	Message     string  `json:"message"`

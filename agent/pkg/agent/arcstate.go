@@ -69,10 +69,10 @@ func (a Agent) deriveArcState(state *agentState) (arcState, error) {
 	}
 
 	for _, task := range state.history.TasksOfArc(arc.ID) {
-		// A task with no meta and no settle is a launch not recorded yet. One
-		// with a result but no meta is a settled task from before meta events
+		// A task with no launch result and no settle is a launch not recorded yet. One
+		// with a result but no launch result is a settled task from before launch-result events
 		// existed, and is not relaunched.
-		if task.MetaSeq == nil && task.FinishedSeq == nil {
+		if task.LaunchSeq == nil && task.FinishedSeq == nil {
 			return ArcStateTaskLaunch, nil
 		}
 	}

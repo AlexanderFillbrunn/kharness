@@ -2025,7 +2025,7 @@ func TestRenderChatShowsATaskOpenedArc(t *testing.T) {
 	}
 }
 
-// A task start is logged as an invoke plus a meta event, not as tool-call
+// A task start is logged as an invoke plus a launch-result event, not as tool-call
 // events. The projection synthesizes the call and its result from the two, so
 // the model sees the start in the same shape it saw when starts were calls.
 func TestTaskStartProjectsAsCallAndResult(t *testing.T) {
@@ -2034,7 +2034,7 @@ func TestTaskStartProjectsAsCallAndResult(t *testing.T) {
 	log.assistant("arc-1", "m1", "starting")
 	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
 		TaskName: "auditor", Args: map[string]any{"namespace": "kube-system"}, MessageID: "m1", Actor: testActor})
-	log.add("meta-1", "task-1", events.AsyncTaskMetaEventType, events.AsyncTaskMetaPayload{
+	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
 		CausationID: "task-1", ExternalRef: "srv-9", Launched: true, LLMVisibility: events.LLMVisibilityNone})
 	log.assistant("arc-1", "m2", "done")
 
@@ -2065,14 +2065,14 @@ func TestTaskStartProjectsAsCallAndResult(t *testing.T) {
 
 // A launch recorded as failed projects as the call's error result. The
 // ASYNC_TASK_RESULT event is for work that started; a failed launch is settled
-// by its meta event and writes none.
+// by its launch-result event and writes none.
 func TestFailedLaunchProjectsAsErrorResult(t *testing.T) {
 	log := newLogger()
 	log.user("arc-1", "deploy")
 	log.assistant("arc-1", "m1", "starting")
 	log.add("task-1", "arc-1", events.AsyncTaskInvokeEventType, events.AsyncTaskInvokePayload{
 		TaskName: "deploy_task", MessageID: "m1", Actor: testActor})
-	log.add("meta-1", "task-1", events.AsyncTaskMetaEventType, events.AsyncTaskMetaPayload{
+	log.add("launchres-1", "task-1", events.AsyncTaskLaunchResultEventType, events.AsyncTaskLaunchResultPayload{
 		CausationID: "task-1", ExternalRef: "task-1", Launched: false, Error: "no runner", LLMVisibility: events.LLMVisibilityNone})
 	log.assistant("arc-1", "m2", "ok")
 

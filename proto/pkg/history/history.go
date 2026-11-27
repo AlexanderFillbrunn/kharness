@@ -207,7 +207,7 @@ type AsyncTask struct {
 	Result   any             `json:"result,omitempty"`
 
 	// ExternalRef is the ID the task's runner assigned it, recorded on the
-	// task's ASYNC_TASK_META event; empty until that event is folded. A
+	// task's ASYNC_TASK_LAUNCH_RESULT event; empty until that event is folded. A
 	// report or callback naming it routes to this task.
 	ExternalRef string `json:"external_ref,omitempty"`
 
@@ -215,20 +215,24 @@ type AsyncTask struct {
 	// event. Nil when the launch failed or the event is not folded yet.
 	Launch any `json:"launch,omitempty"`
 
-	// Launched says whether the launch succeeded; MetaSeq is the meta event's
-	// seq. MetaSeq nil means no launch was recorded yet: the task is starting
+	// Launched says whether the launch succeeded; LaunchSeq is the launch-result event's
+	// seq. LaunchSeq nil means no launch was recorded yet: the task is starting
 	// or its launch record was lost with a stopped run.
 	Launched bool `json:"launched,omitempty"`
-	MetaSeq  *int `json:"meta_seq,omitempty"`
+	LaunchSeq  *int `json:"meta_seq,omitempty"`
 
 	// DispatchedSeq is set when a run handed the launch to the controller,
-	// before the meta event came back. An invoke with a dispatch but no meta
+	// before the launch-result event came back. An invoke with a dispatch but no launch result
 	// is a launch whose fate a stopped run never recorded: it is not retried.
 	DispatchedSeq *int `json:"dispatched_seq,omitempty"`
 
 	// Interrupt is the human decision this task's start is held up for, if
 	// one was asked and is pending or resolved.
 	Interrupt *Interrupt `json:"-"`
+
+	// BlockedMessage is the guardrail's refusal, recorded when a policy
+	// blocked the launch; the launch-result event beside it settles the task.
+	BlockedMessage string `json:"blocked_message,omitempty"`
 
 	// Actor is who started the task, recorded on the invoke and copied
 	// forward onto every event the task emits. It records who started the
@@ -730,7 +734,7 @@ var applyFuncs = map[events.EventType]applyFunc{
 	events.AsyncTaskEventEventType:          (*History).applyAsyncTaskEvent,
 	events.AsyncTaskInputRequestedEventType: (*History).applyAsyncTaskInputRequested,
 	events.AsyncTaskInputProvidedEventType:  (*History).applyAsyncTaskInputProvided,
-	events.AsyncTaskMetaEventType:           (*History).applyAsyncTaskMeta,
+	events.AsyncTaskLaunchResultEventType:           (*History).applyAsyncTaskLaunchResult,
 	events.ErrorEventType:                   (*History).applyError,
 	events.GuardrailBlockedEventType:        (*History).applyGuardrailBlocked,
 	events.CancelEventType:                  (*History).applyCancel,
@@ -845,7 +849,7 @@ func (h *History) applyToolDispatched(ev *events.Event, state *FoldState) error 
 	tc, ok := state.toolCalls[pl.CausationID]
 	if !ok {
 		// A dispatch naming a task rather than a call marks the launch as
-		// handed off: the meta event that follows records how it ended.
+		// handed off: the launch-result event that follows records how it ended.
 		task, isTask := state.asyncTasks[pl.CausationID]
 		if !isTask {
 			return fmt.Errorf("no tool call with ID=%s found for tool dispatch", pl.CausationID)
@@ -1170,16 +1174,16 @@ func taskAskContent(task *AsyncTask, message string) string {
 		task.TaskName, task.ID, TaskInputToolName, TaskInputToolName, message)
 }
 
-// applyAsyncTaskMeta records the outcome of a task's launch: the external
-// reference the runner assigned and the runner's raw response. A meta event
+// applyAsyncTaskLaunchResult records the outcome of a task's launch: the external
+// reference the runner assigned and the runner's raw response. A launch-result event
 // saying the launch failed settles the task as failed — ASYNC_TASK_RESULT is
 // reserved for the outcome of work that actually started — so no later
 // report about the task is accepted. The event is written with None
 // visibility and correlates to the task, so it opens no arc.
-func (h *History) applyAsyncTaskMeta(ev *events.Event, state *FoldState) error {
-	pl, ok := ev.Payload.(events.AsyncTaskMetaPayload)
+func (h *History) applyAsyncTaskLaunchResult(ev *events.Event, state *FoldState) error {
+	pl, ok := ev.Payload.(events.AsyncTaskLaunchResultPayload)
 	if !ok {
-		return errors.New("expected payload type to be AsyncTaskMetaPayload")
+		return errors.New("expected payload type to be AsyncTaskLaunchResultPayload")
 	}
 	if !pl.LLMVisibility.Valid() {
 		return fmt.Errorf("async task meta for %s carries no valid visibility", pl.CausationID)
@@ -1188,14 +1192,14 @@ func (h *History) applyAsyncTaskMeta(ev *events.Event, state *FoldState) error {
 		return err
 	}
 	task := state.asyncTasks[pl.CausationID]
-	if task.MetaSeq != nil {
+	if task.LaunchSeq != nil {
 		// One launch record per invoke: the first sticks.
 		return nil
 	}
 	task.ExternalRef = pl.ExternalRef
 	task.Launch = pl.Launch
 	task.Launched = pl.Launched
-	task.MetaSeq = &ev.Seq
+	task.LaunchSeq = &ev.Seq
 	if !pl.Launched {
 		task.Result = pl.Error
 		task.FinishedAt = &ev.Timestamp
@@ -1382,7 +1386,15 @@ func (h *History) applyGuardrailBlocked(ev *events.Event, state *FoldState) erro
 	}
 	tc, ok := state.toolCalls[pl.CausationID]
 	if !ok {
-		return fmt.Errorf("no tool call with ID=%s found for tool call", pl.CausationID)
+		// A guardrail naming a task rather than a call refuses that task's
+		// launch: the message is recorded on the task, and the launch-result
+		// event written beside this one settles it.
+		task, isTask := state.asyncTasks[pl.CausationID]
+		if !isTask {
+			return fmt.Errorf("no tool call with ID=%s found for tool call", pl.CausationID)
+		}
+		task.BlockedMessage = pl.Message
+		return nil
 	}
 	if tc.Status != ToolCallStatusPending {
 		return nil

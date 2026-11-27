@@ -1016,10 +1016,10 @@ func modelTaskCall(task *AsyncTask) ModelToolCall {
 }
 
 // taskStartResult renders a task's launch as the tool result the model saw
-// for that call, synthesized from the task's meta event: the launch verdict
+// for that call, synthesized from the task's launch-result event: the launch verdict
 // and the task ID the later task tools take.
 func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolMessage {
-	if task.MetaSeq == nil {
+	if task.LaunchSeq == nil {
 		content := "[this task start has not been recorded as launched yet]"
 		if arcStopped {
 			if task.DispatchedSeq != nil {
@@ -1029,6 +1029,13 @@ func (p *projector) taskStartResult(task *AsyncTask, arcStopped bool) ModelToolM
 			}
 		}
 		return ModelToolMessage{ToolCallID: task.ID, Outcome: ModelToolOutcomePending, Content: content}
+	}
+	if task.BlockedMessage != "" {
+		return ModelToolMessage{
+			ToolCallID: task.ID,
+			Outcome:    ModelToolOutcomeBlocked,
+			Content:    refusalText("a policy refused this task start, without asking anyone", task.BlockedMessage),
+		}
 	}
 	if !task.Launched {
 		return ModelToolMessage{

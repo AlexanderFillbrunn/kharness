@@ -45,9 +45,9 @@ func TestTaskStateOfReadsOneTaskOutOfALog(t *testing.T) {
 	}
 	metaFailed := func(taskID string) *events.Event {
 		return &events.Event{
-			SessionID: testSessionID, ID: "meta-" + taskID, Seq: 3, Timestamp: at,
-			Typ: events.AsyncTaskMetaEventType, CorrelationID: &taskID,
-			Payload: events.AsyncTaskMetaPayload{CausationID: taskID, ExternalRef: taskID, Launched: false, Error: "no runner", LLMVisibility: events.LLMVisibilityNone},
+			SessionID: testSessionID, ID: "launchres-" + taskID, Seq: 3, Timestamp: at,
+			Typ: events.AsyncTaskLaunchResultEventType, CorrelationID: &taskID,
+			Payload: events.AsyncTaskLaunchResultPayload{CausationID: taskID, ExternalRef: taskID, Launched: false, Error: "no runner", LLMVisibility: events.LLMVisibilityNone},
 		}
 	}
 	otherSession := invoke("task-x", "auditor")
@@ -88,7 +88,7 @@ func TestTaskStateOfReadsOneTaskOutOfALog(t *testing.T) {
 		t.Errorf("failed task = %+v, want SETTLED FAILED", state)
 	}
 	if state := TaskStateOf(testSessionID, "task-e", log); !state.Settled || state.Status != events.TaskStatusFailed {
-		t.Errorf("launch-failed task = %+v, want SETTLED FAILED from its meta event", state)
+		t.Errorf("launch-failed task = %+v, want SETTLED FAILED from its launch-result event", state)
 	}
 	if state := TaskStateOf("another-session", "task-x", log); !state.Exists {
 		t.Error("the task of another session was not found in its own session")

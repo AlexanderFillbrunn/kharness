@@ -209,11 +209,11 @@ func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
 }
 
 // launchTasks starts every task of the arc whose launch is not recorded yet:
-// an invoke without a meta event. One round of the loop launches them in log
+// an invoke without a launch-result event. One round of the loop launches them in log
 // order, then the arc goes back to the model or closes.
 func (a Agent) launchTasks(ctx context.Context, state *agentState) error {
 	for _, task := range state.history.TasksOfArc(state.arc.ID) {
-		if task.MetaSeq != nil {
+		if task.LaunchSeq != nil {
 			continue
 		}
 		if err := a.launchTask(ctx, task, state); err != nil {
@@ -228,9 +228,9 @@ func (a Agent) launchTasks(ctx context.Context, state *agentState) error {
 }
 
 // launchTask runs one task's launch: the BeforeTaskStart decision, then the
-// controller's Start, then the meta event recording how the launch went. The
+// controller's Start, then the launch-result event recording how the launch went. The
 // dispatch is written before Start so a run that stops mid-launch leaves the
-// marker, and the meta event after Start so it says what became of the work.
+// marker, and the launch-result event after Start so it says what became of the work.
 func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *agentState) error {
 	// A previous run handed this launch off and stopped before recording it.
 	// The launch is not retried: whether the task took hold is not known.
@@ -246,7 +246,14 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 		return a.recordLaunch(ctx, task, nil, fmt.Errorf("the task policy failed, so the task was not started: %w", d.hookErr), state)
 	case d.block != nil:
 		state.logger.WarnContext(ctx, "task start blocked by policy", "task", task.ID, "kind", task.TaskName)
-		return a.recordLaunch(ctx, task, nil, errors.New(d.block.Message), state)
+		// The guardrail event names the task by its invoke ID; the
+		// launch-result event written beside it settles the task.
+		return a.recordLaunch(ctx, task, nil, errors.New(d.block.Message), state,
+			&events.Event{
+				Typ:           events.GuardrailBlockedEventType,
+				CorrelationID: &state.arc.ID,
+				Payload:       events.GuardrailBlockedPayload{CausationID: task.ID, Message: d.block.Message},
+			})
 	case d.ask != nil:
 		return a.raiseTaskAsk(ctx, task, d.ask, state)
 	case d.answer != nil:
@@ -284,12 +291,12 @@ func (a Agent) launchTask(ctx context.Context, task *history.AsyncTask, state *a
 	return a.recordLaunch(ctx, task, launch, err, state)
 }
 
-// recordLaunch writes the one meta event a launch produces: the launch
+// recordLaunch writes the one launch-result event a launch produces: the launch
 // verdict, the external reference the runner assigned (the task's own ID
 // where the runner assigned none), and the runner's raw response. A failed
 // launch settles the task — ASYNC_TASK_RESULT is reserved for work that
 // actually started — and no result event is written for it.
-func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, cause error, state *agentState) error {
+func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch *common.TaskLaunch, cause error, state *agentState, extra ...*events.Event) error {
 	externalRef := task.ID
 	var response any
 	if launch != nil {
@@ -302,10 +309,10 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 	if cause != nil {
 		errText = cause.Error()
 	}
-	meta := &events.Event{
-		Typ:           events.AsyncTaskMetaEventType,
+	launchResult := &events.Event{
+		Typ:           events.AsyncTaskLaunchResultEventType,
 		CorrelationID: &task.ID,
-		Payload: events.AsyncTaskMetaPayload{
+		Payload: events.AsyncTaskLaunchResultPayload{
 			CausationID:   task.ID,
 			ExternalRef:   externalRef,
 			Launched:      cause == nil,
@@ -314,7 +321,7 @@ func (a Agent) recordLaunch(ctx context.Context, task *history.AsyncTask, launch
 			LLMVisibility: events.LLMVisibilityNone,
 		},
 	}
-	if _, err := a.persistAndFold(ctx, state, meta); err != nil {
+	if _, err := a.persistAndFold(ctx, state, append(extra, launchResult)...); err != nil {
 		return err
 	}
 	if cause == nil {

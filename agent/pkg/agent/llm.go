@@ -275,7 +275,7 @@ func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, messag
 	})
 	for _, call := range reply.ToolCalls {
 		// A call that starts a task is recorded as the task's invoke, not as a
-		// tool call: the invoke carries the request, the meta event written at
+		// tool call: the invoke carries the request, the launch-result event written at
 		// launch carries the outcome, and the projection renders the call and
 		// its result to the model from the two.
 		if a.operation(call.ToolName) == opStart {

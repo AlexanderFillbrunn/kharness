@@ -57,7 +57,7 @@ func (s *sessionController) ProvideInput(ctx context.Context, ref TaskRef, reque
 
 // TaskLaunch is what a controller's Start returned for the invocation: what
 // the runner sent back when the work was handed to it. It is recorded in the
-// task's ASYNC_TASK_META event, not shown to the model.
+// task's ASYNC_TASK_LAUNCH_RESULT event, not shown to the model.
 type TaskLaunch struct {
 	// ExternalRef is the ID the runner assigned the task, for a runner that
 	// assigns its own. Empty means the runner took the caller's ref.ID as

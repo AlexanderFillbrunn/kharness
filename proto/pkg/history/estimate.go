@@ -64,7 +64,7 @@ func ProjectedText(ev *events.Event) string {
 		return pl.Message
 	case events.AsyncTaskInputProvidedPayload:
 		return pl.Message
-	case events.AsyncTaskMetaPayload:
+	case events.AsyncTaskLaunchResultPayload:
 		return pl.ExternalRef + " " + pl.Error + " " + resultText(pl.Launch)
 	case events.ErrorPayload:
 		return pl.Message
