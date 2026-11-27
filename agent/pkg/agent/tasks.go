@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
 
@@ -35,6 +36,132 @@ type TaskSource interface {
 
 	// The controller starts a kind by name and reaches a running task by ref.
 	common.TaskController
+}
+
+// combineTaskSets presents several task sets as one. When every set is a
+// TaskSource the combination is one too: Start routes by kind name and
+// Cancel/ProvideInput route to the source that started the task, the way
+// SelectTasks does for a definition's sources.
+func combineTaskSets(sets ...common.TaskSet) common.TaskSet {
+	var kept []common.TaskSet
+	var sources []TaskSource
+	allSources := true
+	for _, set := range sets {
+		if set == nil {
+			continue
+		}
+		kept = append(kept, set)
+		if src, ok := set.(TaskSource); ok {
+			sources = append(sources, src)
+		} else {
+			allSources = false
+		}
+	}
+	if allSources && len(sources) > 0 {
+		return &combinedTaskSources{sources: sources, byName: map[string]TaskSource{}, byTask: map[string]TaskSource{}}
+	}
+	return combinedTaskSet(kept)
+}
+
+type combinedTaskSet []common.TaskSet
+
+func (c combinedTaskSet) All() []common.TaskMetadata {
+	var all []common.TaskMetadata
+	for _, set := range c {
+		all = append(all, set.All()...)
+	}
+	return all
+}
+
+func (c combinedTaskSet) Get(name string) (common.TaskMetadata, bool) {
+	for _, set := range c {
+		if meta, ok := set.Get(name); ok {
+			return meta, true
+		}
+	}
+	return common.TaskMetadata{}, false
+}
+
+// combinedTaskSources is several TaskSources as one TaskSource.
+type combinedTaskSources struct {
+	sources []TaskSource
+	byName  map[string]TaskSource
+	mu      sync.Mutex
+	byTask  map[string]TaskSource
+}
+
+func (c *combinedTaskSources) All() []common.TaskMetadata {
+	var all []common.TaskMetadata
+	for _, src := range c.sources {
+		all = append(all, src.All()...)
+	}
+	return all
+}
+
+func (c *combinedTaskSources) Get(name string) (common.TaskMetadata, bool) {
+	for _, src := range c.sources {
+		if meta, ok := src.Get(name); ok {
+			return meta, true
+		}
+	}
+	return common.TaskMetadata{}, false
+}
+
+func (c *combinedTaskSources) Start(ctx context.Context, name string, ref common.TaskRef, args any) (*common.TaskLaunch, error) {
+	src, ok := c.sourceByName(name)
+	if !ok {
+		return nil, fmt.Errorf("task not held by any source: %s", name)
+	}
+	launch, err := src.Start(ctx, name, ref, args)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.byTask[ref.ID] = src
+	c.mu.Unlock()
+	return launch, nil
+}
+
+func (c *combinedTaskSources) Cancel(ctx context.Context, ref common.TaskRef, reason string) error {
+	src, err := c.sourceFor(ref)
+	if err != nil {
+		return err
+	}
+	return src.Cancel(ctx, ref, reason)
+}
+
+func (c *combinedTaskSources) ProvideInput(ctx context.Context, ref common.TaskRef, requestID, input string) error {
+	src, err := c.sourceFor(ref)
+	if err != nil {
+		return err
+	}
+	return src.ProvideInput(ctx, ref, requestID, input)
+}
+
+func (c *combinedTaskSources) sourceByName(name string) (TaskSource, bool) {
+	if src, ok := c.byName[name]; ok {
+		return src, true
+	}
+	for _, src := range c.sources {
+		if _, ok := src.Get(name); ok {
+			c.byName[name] = src
+			return src, true
+		}
+	}
+	return nil, false
+}
+
+func (c *combinedTaskSources) sourceFor(ref common.TaskRef) (TaskSource, error) {
+	c.mu.Lock()
+	src, ok := c.byTask[ref.ID]
+	c.mu.Unlock()
+	if ok {
+		return src, nil
+	}
+	if len(c.sources) == 1 {
+		return c.sources[0], nil
+	}
+	return nil, fmt.Errorf("task %s was not started by this agent", ref.ID)
 }
 
 // taskToolSet offers a task metadata set's kinds to the model, plus the two

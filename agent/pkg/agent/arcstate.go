@@ -14,12 +14,12 @@ var (
 type arcState int
 
 const (
-	ArcStateNone        arcState = iota
-	ArcStateLLM         arcState = iota
-	ArcStateToolCalls   arcState = iota
-	ArcStateTaskLaunch  arcState = iota
-	ArcStateDone        arcState = iota
-	ArcStateClose       arcState = iota
+	ArcStateNone       arcState = iota
+	ArcStateLLM        arcState = iota
+	ArcStateToolCalls  arcState = iota
+	ArcStateTaskLaunch arcState = iota
+	ArcStateDone       arcState = iota
+	ArcStateClose      arcState = iota
 )
 
 func (s arcState) String() string {

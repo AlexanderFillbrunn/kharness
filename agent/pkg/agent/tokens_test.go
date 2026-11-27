@@ -1,9 +1,9 @@
 package agent
 
 import (
-	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"context"
 	"errors"
+	"fillbrunn.ai/kube-agent/proto/pkg/common"
 	"testing"
 
 	"fillbrunn.ai/kube-agent/proto/pkg/events"
